@@ -34,11 +34,11 @@ real:
   # Active modules (receive motor commands)
   # action[i] is sent to module_ids[i]
   # Example: action[0] -> module 0, action[1] -> module 1, action[2] -> module 2
-  module_ids: [0, 1, 2]
+  module_ids: [5, 21, 16]
   
   # Sensor-only modules (no motor commands, just provide sensor data)
   # Useful for dedicated sensors like distance ranging modules
-  sensor_module_ids: []  # Example: [100] for a dedicated distance sensor
+  sensor_module_ids: [100]  # Example: [100] for a dedicated distance sensor
   
   # ---------------------------------------------------------------------------
   # Global State Sources
@@ -47,11 +47,11 @@ real:
   # Can reference any module from module_ids OR sensor_module_ids.
   sources:
     # Main IMU module for global quat/gyro (default: first module in module_ids)
-    main_imu: 0
+    main_imu: 5
     
     # Goal distance source module (default: null = per-module only)
     # Set to a module ID to use that module's goal_distance as the global value
-    # goal_distance: 100
+    goal_distance: 100
   
   # ---------------------------------------------------------------------------
   # Network Configuration

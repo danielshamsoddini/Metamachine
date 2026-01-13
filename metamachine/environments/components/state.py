@@ -55,6 +55,10 @@ class RawState:
     # Goal distance (from distance sensor)
     goal_distance: float = -1.0  # Global goal distance (-1 = no reading)
     goal_distances: np.ndarray = field(default_factory=lambda: np.zeros(1))  # Per-module
+    
+    # Special/external quaternion (from external tracking sensor)
+    # This is a quaternion from a specific sensor module, used for ground-truth tracking
+    special_quat: np.ndarray = field(default_factory=lambda: np.array([0, 0, 0, 1]))
 
     def __init__(self, num_dof: int = 1) -> None:
         """Initialize RawState with specified number of degrees of freedom."""
@@ -63,6 +67,7 @@ class RawState:
         self.quat = np.zeros(4)
         self.quats = []
         self.goal_distance = -1.0
+        self.special_quat = np.array([0, 0, 0, 1])  # Identity quaternion
 
         # Velocities
         self.vel_body = np.zeros(3)

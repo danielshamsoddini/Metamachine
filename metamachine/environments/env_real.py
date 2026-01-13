@@ -63,6 +63,14 @@ except ImportError:
         RLDashboard = None
         RLDashboardConfig = None
 
+# Import Cybergear error decoder (optional, for human-readable error messages)
+try:
+    from capybarish.devices import CybergearErrorDecoder
+    CYBERGEAR_DECODER_AVAILABLE = True
+except ImportError:
+    CybergearErrorDecoder = None
+    CYBERGEAR_DECODER_AVAILABLE = False
+
 
 def sanitize_dict(d: dict) -> dict:
     """Sanitize dictionary for JSON serialization."""
@@ -214,6 +222,14 @@ class RealMetaMachine(Base):
                 f"goal_distance module {self.goal_distance_module_id} not in module_ids or sensor_module_ids"
             )
         
+        # Special quaternion source module (for external tracking, e.g., ground-truth orientation)
+        # This allows getting orientation from a separate sensor module (e.g., for bearing estimation)
+        self.special_quat_module_id: Optional[int] = sources_cfg.get("special_quat", None)
+        if self.special_quat_module_id is not None and self.special_quat_module_id not in self.all_expected_module_ids:
+            raise ValueError(
+                f"special_quat module {self.special_quat_module_id} not in module_ids or sensor_module_ids"
+            )
+        
         # Network configuration
         self.listen_port = real_cfg.get("listen_port", self.DEFAULT_LISTEN_PORT)
         self.command_port = real_cfg.get("command_port", self.DEFAULT_COMMAND_PORT)
@@ -222,7 +238,7 @@ class RealMetaMachine(Base):
         # Control parameters
         self.kp_default = cfg.control.get("kp", 10.0)
         self.kd_default = cfg.control.get("kd", 0.5)
-        self.enable_filter = real_cfg.get("enable_filter", True)
+        self.enable_filter = real_cfg.get("enable_filter", False)
         
         # Dashboard configuration
         self.enable_dashboard = real_cfg.get("enable_dashboard", True)
@@ -305,6 +321,8 @@ class RealMetaMachine(Base):
             print(f"  Goal distance: module {self.goal_distance_module_id}")
         else:
             print(f"  Goal distance: per-module only (no global source)")
+        if self.special_quat_module_id is not None:
+            print(f"  Special quat: module {self.special_quat_module_id}")
         print("=" * 60)
         print("\nAction -> Module mapping:")
         for i, mod_id in enumerate(self.expected_module_ids):
@@ -452,7 +470,9 @@ class RealMetaMachine(Base):
                     fullscreen=self.dashboard_fullscreen,
                     capture_prints=self.dashboard_capture_prints,
                 )
-                self.dashboard = RLDashboard(config)
+                # Use Cybergear error decoder for human-readable error messages
+                error_decoder = CybergearErrorDecoder() if CYBERGEAR_DECODER_AVAILABLE else None
+                self.dashboard = RLDashboard(config, error_decoder=error_decoder)
                 
                 # Set expected modules for tracking
                 self.dashboard.set_expected_modules(
@@ -549,7 +569,12 @@ class RealMetaMachine(Base):
         
         motor = msg.motor if hasattr(msg, 'motor') else None
         
-        # Build error string
+        # Get motor error/mode/driver_error from the new data structure
+        motor_error = getattr(motor, 'motor_error', 0) if motor else 0
+        motor_mode = getattr(motor, 'motor_mode', 0) if motor else 0
+        driver_error = getattr(motor, 'driver_error', 0) if motor else 0
+        
+        # Build error string from reset reasons (legacy)
         error_str = ""
         if hasattr(msg, 'error') and msg.error:
             err = msg.error
@@ -576,7 +601,7 @@ class RealMetaMachine(Base):
                 action_idx = self.expected_module_ids.index(module_id)
             except ValueError:
                 action_idx = -1
-            name = f"M{module_id}→A{action_idx}"
+            name = f"M{module_id} → A{action_idx}"
             if is_main_imu:
                 name += "★"  # Marker for main IMU
             if is_goal_dist_source:
@@ -585,7 +610,7 @@ class RealMetaMachine(Base):
         # Get goal distance (show in dashboard if >= 0)
         goal_distance = getattr(msg, 'goal_distance', -1.0)
         
-        # Determine mode display
+        # Determine mode display based on motor_mode (0=Reset/Off, 1=Calibration, 2=Active/On)
         if is_sensor_module:
             mode = "Sensor"
         else:
@@ -603,6 +628,9 @@ class RealMetaMachine(Base):
             switch=self.motor_enabled if not is_sensor_module else False,
             error=error_str,
             distance=goal_distance if goal_distance >= 0 else -1.0,
+            motor_error=motor_error,
+            motor_mode=motor_mode,
+            driver_error=driver_error,
         )
 
     def all_modules_connected(self) -> bool:
@@ -616,11 +644,13 @@ class RealMetaMachine(Base):
     def ready(self) -> bool:
         """Check if the robot system is ready for control.
         
-        The system is ready when all expected modules (active + sensor) are 
-        connected and actively sending data.
+        The system is ready when:
+        1. All expected modules (active + sensor) are connected
+        2. All modules are actively sending data
+        3. All active motor modules are ON (motor_mode == 2)
         
         Returns:
-            bool: True if all expected modules are active
+            bool: True if all expected modules are active and motors are ON
         """
         # Check all expected modules are connected
         if not self.all_modules_connected():
@@ -632,6 +662,15 @@ class RealMetaMachine(Base):
             ip = self.module_to_ip.get(module_id)
             if ip not in active_ips:
                 return False
+        
+        # Check all active motor modules are ON (motor_mode == 2)
+        # motor_mode: 0=Reset/Off, 1=Calibration, 2=Active/On
+        for module_id in self.expected_module_ids:
+            if module_id in self.module_data:
+                motor = self.module_data[module_id].motor
+                motor_mode = getattr(motor, 'motor_mode', 0) if motor else 0
+                if motor_mode != 2:  # Not in Active/On mode
+                    return False
         
         return True
 
@@ -773,6 +812,11 @@ class RealMetaMachine(Base):
         if self.goal_distance_module_id is not None:
             global_goal_distance = self._get_module_goal_distance(self.goal_distance_module_id)
         
+        # Special quaternion from configured module (for external tracking)
+        special_quat = np.array([0, 0, 0, 1])  # Identity quaternion by default
+        if self.special_quat_module_id is not None:
+            special_quat = self._get_module_quat(self.special_quat_module_id)
+        
         self.observable_data = {
             # Joint state (ordered by action index)
             "dof_pos": dof_pos,
@@ -792,12 +836,16 @@ class RealMetaMachine(Base):
             # Global goal distance (from configured source, if any)
             "goal_distance": global_goal_distance,
             
+            # Special quaternion (from external tracking sensor)
+            "special_quat": special_quat,
+            
             # Metadata
             "timestamp": time.time(),
             "module_order": self.expected_module_ids,
             "sensor_modules": self.sensor_module_ids,
             "main_imu_module": self.main_imu_module_id,
             "goal_distance_module": self.goal_distance_module_id,
+            "special_quat_module": self.special_quat_module_id,
         }
         
         # Update state.raw with observable data so observation components can read it
@@ -860,6 +908,26 @@ class RealMetaMachine(Base):
             data = self.module_data[module_id]
             return getattr(data, 'goal_distance', 0.0)
         return 0.0
+    
+    def _get_module_quat(self, module_id: int) -> np.ndarray:
+        """Get quaternion from a specific module.
+        
+        Args:
+            module_id: The module ID to get quaternion from
+            
+        Returns:
+            np.ndarray: Quaternion [x, y, z, w] (identity if not available)
+        """
+        if module_id in self.module_data:
+            data = self.module_data[module_id]
+            if hasattr(data, 'imu') and hasattr(data.imu, 'quaternion'):
+                return np.array([
+                    data.imu.quaternion.x,
+                    data.imu.quaternion.y,
+                    data.imu.quaternion.z,
+                    data.imu.quaternion.w
+                ])
+        return np.array([0, 0, 0, 1])  # Identity quaternion
 
     def _rotate_vector_by_quat(self, v: np.ndarray, q: np.ndarray) -> np.ndarray:
         """Rotate a vector by a quaternion."""
@@ -877,6 +945,10 @@ class RealMetaMachine(Base):
         """Update dashboard with performance metrics and status."""
         if self.dashboard is None:
             return
+        
+        # Update environment ready status
+        if hasattr(self.dashboard, 'set_env_ready'):
+            self.dashboard.set_env_ready(self.ready())
         
         # Common status updates for both dashboard types
         total_expected = len(self.expected_module_ids) + len(self.sensor_module_ids)
@@ -1205,7 +1277,7 @@ class RealMetaMachine(Base):
                     velocities=zeros,
                     kps=np.zeros(len(self.expected_module_ids)),
                     kds=np.zeros(len(self.expected_module_ids)),
-                    enable=False
+                    enable=self.motor_enabled
                 )
             
             # Print status periodically

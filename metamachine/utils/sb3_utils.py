@@ -924,6 +924,7 @@ def play_checkpoint(
         )
     """
     import numpy as np
+    import time
     
     # Load environment and model
     env, model, cfg = load_from_checkpoint(
@@ -940,12 +941,20 @@ def play_checkpoint(
     if disable_resampling:
         _disable_command_resampling(env)
     
+    # Determine if we need real-time playback
+    realtime_playback = render_mode == "viewer" and not real_robot
+    if realtime_playback:
+        # Get dt from environment
+        dt = getattr(env, 'dt', 0.05)  # Default to 0.05 if not available
+    
     print(f"\n{'=' * 60}")
     print(f"Playing Policy")
     print(f"{'=' * 60}")
     print(f"  Episodes: {'infinite' if num_episodes == 0 else num_episodes}")
     print(f"  Deterministic: {deterministic}")
     print(f"  Real robot: {real_robot}")
+    if realtime_playback:
+        print(f"  Real-time playback: ENABLED (dt={dt:.4f}s, {1/dt:.1f}Hz)")
     if commands:
         print(f"  Commands: {commands}")
     if disable_resampling:
@@ -972,11 +981,22 @@ def play_checkpoint(
             done = False
             
             while not done:
+                # Record step start time for real-time playback
+                if realtime_playback:
+                    step_start_time = time.time()
+                
                 action, _ = model.predict(obs, deterministic=deterministic)
                 obs, reward, terminated, truncated, info = env.step(action)
                 episode_reward += reward
                 episode_length += 1
                 done = terminated or truncated
+                
+                # Sleep to maintain real-time frequency
+                if realtime_playback:
+                    elapsed = time.time() - step_start_time
+                    sleep_time = max(0, dt - elapsed)
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
             
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)

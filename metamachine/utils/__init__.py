@@ -59,6 +59,8 @@ __all__ = [
     "MultiModelRunner",
     "load_multiple_models",
     "load_model_standalone",
+    # Training callbacks (optional, requires stable-baselines3)
+    "SB3TrainingProgressCallback",
 ]
 
 # SB3 utilities (optional import - only available if stable-baselines3 is installed)
@@ -104,3 +106,9 @@ except ImportError:
     MultiModelRunner = None
     load_multiple_models = None
     load_model_standalone = None
+
+# Training callbacks (optional import - requires stable-baselines3)
+try:
+    from .training_callbacks import SB3TrainingProgressCallback
+except ImportError:
+    SB3TrainingProgressCallback = None
