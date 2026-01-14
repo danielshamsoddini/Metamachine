@@ -590,7 +590,7 @@ class State:
         self.clip_observations = cfg.observation.clip_observations
         self.gravity_vec = np.array(cfg.observation.gravity_vec)
         self.forward_vec = np.array(cfg.observation.forward_vec)
-        self.projected_forward_vec = None
+        self.projected_forward_vec = np.array(cfg.observation.projected_forward_vec)
         self.dt = cfg.control.dt
 
         # State containers
@@ -1401,7 +1401,7 @@ class State:
             print("Warning: No projected gravities available")
 
         # Heading
-        forward = quat_apply(self.raw.quat, self.forward_vec)
+        forward = quat_apply(self.quats[0], self.projected_forward_vec)
         self.derived.heading = np.expand_dims(
             np.arctan2(forward[1], forward[0]), axis=0
         )

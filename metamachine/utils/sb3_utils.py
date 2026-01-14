@@ -50,6 +50,7 @@ __all__ = [
     "SB3Trainer",
     "load_from_checkpoint",
     "play_checkpoint",
+    "play_checkpoint_with_tracking",
     "continue_training",
     "compare_configs",
 ]
@@ -1693,3 +1694,335 @@ def _extract_checkpoint_steps(filename: str) -> Optional[int]:
     if not match:
         return None
     return int(match.group(1))
+
+
+def play_checkpoint_with_tracking(
+    log_dir: str,
+    checkpoint: Optional[str] = None,
+    num_episodes: int = 5,
+    render_mode: str = "viewer",
+    real_robot: bool = False,
+    deterministic: bool = True,
+    verbose: bool = True,
+    commands: Optional[dict] = None,
+    disable_resampling: bool = False,
+    cfg_real: Optional[dict] = None,
+    enable_realtime_plot: bool = False,
+    save_tracking_path: Optional[str] = None,
+    save_state_path: Optional[str] = None,
+    plot_update_interval: float = 0.05,
+    plot_history_length: int = 200,
+) -> dict:
+    """Play/evaluate a trained policy with joint tracking visualization.
+    
+    This is an extended version of play_checkpoint that adds real-time plotting
+    of actions, joint commands, and actual joint positions. Useful for reality
+    gap analysis and debugging tracking performance.
+    
+    Args:
+        log_dir: Path to the training log directory
+        checkpoint: Checkpoint to load (see load_from_checkpoint for options)
+        num_episodes: Number of episodes to run (0 = run forever)
+        render_mode: Render mode ("viewer", "mp4", "none")
+        real_robot: If True, deploy to real robot
+        deterministic: If True, use deterministic policy (no exploration noise)
+        verbose: If True, print episode statistics
+        commands: Optional dict of command values to set
+        disable_resampling: If True, disable automatic command resampling
+        cfg_real: Optional real robot configuration (e.g., {"module_ids": [5, 21, 27]})
+        enable_realtime_plot: If True, show real-time joint tracking plot
+        save_tracking_path: If provided, save joint tracking data to this file (.npz or .pkl)
+        save_state_path: If provided, save full state data for behavior analysis (.npz or .pkl)
+        plot_update_interval: Real-time plot update interval (seconds)
+        plot_history_length: Number of timesteps to show in real-time plot
+    
+    Returns:
+        dict: Statistics from the playback, including tracking data if saved
+    
+    Example:
+        # Play with real-time joint tracking visualization
+        play_checkpoint_with_tracking(
+            "./logs/my_experiment",
+            enable_realtime_plot=True,
+        )
+        
+        # Deploy to real robot with tracking and save data
+        play_checkpoint_with_tracking(
+            "./logs/my_experiment",
+            real_robot=True,
+            cfg_real={"module_ids": [5, 21, 27]},
+            enable_realtime_plot=True,
+            save_tracking_path="./tracking_data.npz",
+        )
+        
+        # Save full state for behavior analysis
+        play_checkpoint_with_tracking(
+            "./logs/my_experiment",
+            save_state_path="./state_data.pkl",
+        )
+    """
+    import numpy as np
+    import time
+    from .realtime_plotter import (
+        RealtimeJointPlotter,
+        JointTrackingLogger,
+        StateLogger,
+        create_joint_plotter_from_env,
+        create_joint_logger_from_env,
+        create_state_logger_from_env,
+    )
+    
+    # Load environment and model
+    env, model, cfg = load_from_checkpoint(
+        log_dir,
+        checkpoint=checkpoint,
+        render_mode=render_mode,
+        real_robot=real_robot,
+        cfg_real=cfg_real,
+    )
+    
+    if model is None:
+        raise ValueError("No model checkpoint found to play")
+    
+    # Disable command resampling if requested
+    if disable_resampling:
+        _disable_command_resampling(env)
+    
+    # Get default DOF positions from environment
+    default_dof_pos = _get_default_dof_pos(env)
+    
+    # Initialize tracking tools
+    plotter = None
+    logger = None
+    state_logger = None
+    
+    if enable_realtime_plot:
+        plotter = create_joint_plotter_from_env(env)
+        plotter.update_interval = plot_update_interval
+        plotter.history_length = plot_history_length
+        plotter.start()
+        
+    if save_tracking_path:
+        logger = create_joint_logger_from_env(env)
+        
+    if save_state_path:
+        state_logger = create_state_logger_from_env(env)
+    
+    # Determine if we need real-time playback
+    realtime_playback = render_mode == "viewer" and not real_robot
+    dt = getattr(env, 'dt', 0.05)
+    
+    print(f"\n{'=' * 60}")
+    print(f"Playing Policy with Joint Tracking")
+    print(f"{'=' * 60}")
+    print(f"  Episodes: {'infinite' if num_episodes == 0 else num_episodes}")
+    print(f"  Deterministic: {deterministic}")
+    print(f"  Real robot: {real_robot}")
+    print(f"  Real-time plot: {enable_realtime_plot}")
+    if save_tracking_path:
+        print(f"  Saving tracking to: {save_tracking_path}")
+    if save_state_path:
+        print(f"  Saving full state to: {save_state_path}")
+    if realtime_playback:
+        print(f"  Real-time playback: ENABLED (dt={dt:.4f}s, {1/dt:.1f}Hz)")
+    if commands:
+        print(f"  Commands: {commands}")
+    print(f"{'=' * 60}\n")
+    
+    # Run episodes
+    episode_rewards = []
+    episode_lengths = []
+    episode_count = 0
+    
+    try:
+        while num_episodes == 0 or episode_count < num_episodes:
+            obs, info = env.reset()
+            
+            # Reset loggers for new episode
+            if logger:
+                logger.reset()
+            if state_logger:
+                state_logger.reset(new_episode=True)
+            
+            # Set commands after reset if specified
+            if commands:
+                _set_commands(env, commands, verbose=verbose and episode_count == 0)
+                obs = _get_observation_with_commands(env)
+            
+            episode_reward = 0
+            episode_length = 0
+            done = False
+            
+            while not done:
+                # Record step start time for real-time playback
+                if realtime_playback:
+                    step_start_time = time.time()
+                
+                # Get action from policy
+                action, _ = model.predict(obs, deterministic=deterministic)
+                
+                # Execute step
+                obs, reward, terminated, truncated, info = env.step(action)
+                
+                # Get actual joint positions from environment
+                joint_positions = _get_joint_positions(env)
+                
+                # Compute joint commands (action + default offset)
+                joint_commands = action + default_dof_pos
+                
+                # Update tracking
+                if plotter:
+                    plotter.update(
+                        actions=action,
+                        joint_positions=joint_positions,
+                        joint_commands=joint_commands,
+                    )
+                    
+                if logger:
+                    logger.log(
+                        actions=action,
+                        joint_positions=joint_positions,
+                        joint_commands=joint_commands,
+                    )
+                
+                if state_logger:
+                    state_logger.log(
+                        action=action,
+                        obs=obs,
+                        reward=reward,
+                        info=info,
+                        env=env,
+                        joint_command=joint_commands,
+                    )
+                
+                episode_reward += reward
+                episode_length += 1
+                done = terminated or truncated
+                
+                # Sleep to maintain real-time frequency
+                if realtime_playback:
+                    elapsed = time.time() - step_start_time
+                    sleep_time = max(0, dt - elapsed)
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+            
+            episode_rewards.append(episode_reward)
+            episode_lengths.append(episode_length)
+            episode_count += 1
+            
+            if verbose:
+                print(f"Episode {episode_count}: Reward = {episode_reward:.2f}, "
+                      f"Length = {episode_length}")
+    
+    except KeyboardInterrupt:
+        print("\n[Interrupted]")
+    
+    finally:
+        # Stop plotter
+        if plotter:
+            plotter.stop()
+            
+        # Save tracking data
+        if logger and save_tracking_path:
+            logger.save(save_tracking_path)
+            # Also generate and save summary plot
+            summary_plot_path = save_tracking_path.rsplit('.', 1)[0] + '_summary.png'
+            try:
+                logger.plot_summary(save_path=summary_plot_path)
+            except Exception as e:
+                print(f"[Warning] Could not generate summary plot: {e}")
+        
+        # Save full state data
+        if state_logger and save_state_path:
+            state_logger.save(save_state_path)
+        
+        env.close()
+    
+    # Compute statistics
+    stats = {
+        "num_episodes": len(episode_rewards),
+        "mean_reward": np.mean(episode_rewards) if episode_rewards else 0,
+        "std_reward": np.std(episode_rewards) if episode_rewards else 0,
+        "min_reward": np.min(episode_rewards) if episode_rewards else 0,
+        "max_reward": np.max(episode_rewards) if episode_rewards else 0,
+        "mean_length": np.mean(episode_lengths) if episode_lengths else 0,
+        "episode_rewards": episode_rewards,
+        "episode_lengths": episode_lengths,
+        "commands": commands,
+        "tracking_saved": save_tracking_path,
+        "state_saved": save_state_path,
+    }
+    
+    if verbose and episode_rewards:
+        print(f"\n{'=' * 60}")
+        print(f"Summary ({len(episode_rewards)} episodes)")
+        print(f"{'=' * 60}")
+        print(f"  Mean Reward: {stats['mean_reward']:.2f} ± {stats['std_reward']:.2f}")
+        print(f"  Min/Max Reward: {stats['min_reward']:.2f} / {stats['max_reward']:.2f}")
+        print(f"  Mean Episode Length: {stats['mean_length']:.1f}")
+        if save_tracking_path:
+            print(f"  Tracking data saved to: {save_tracking_path}")
+        if save_state_path:
+            print(f"  State data saved to: {save_state_path}")
+        print(f"{'=' * 60}")
+    
+    return stats
+
+
+def _get_default_dof_pos(env) -> "np.ndarray":
+    """Extract default DOF positions from environment.
+    
+    Args:
+        env: MetaMachine environment
+        
+    Returns:
+        Default DOF positions array
+    """
+    import numpy as np
+    
+    # Try different paths to get default_dof_pos
+    if hasattr(env, 'default_dof_pos'):
+        return np.array(env.default_dof_pos)
+    elif hasattr(env, 'action_processor') and hasattr(env.action_processor, 'default_dof_pos'):
+        return np.array(env.action_processor.default_dof_pos)
+    elif hasattr(env, 'cfg') and hasattr(env.cfg, 'control'):
+        default = env.cfg.control.get('default_dof_pos', 0)
+        if isinstance(default, (list, np.ndarray)):
+            return np.array(default)
+        else:
+            num_actions = env.action_space.shape[0]
+            return np.full(num_actions, default)
+    else:
+        # Fallback to zeros
+        num_actions = env.action_space.shape[0]
+        return np.zeros(num_actions)
+
+
+def _get_joint_positions(env) -> "np.ndarray":
+    """Extract current joint positions from environment.
+    
+    Args:
+        env: MetaMachine environment
+        
+    Returns:
+        Current joint positions array
+    """
+    import numpy as np
+    
+    # Try different paths to get joint positions
+    if hasattr(env, 'state') and hasattr(env.state, 'dof_pos'):
+        return np.array(env.state.dof_pos)
+    elif hasattr(env, 'observable_data') and 'dof_pos' in env.observable_data:
+        return np.array(env.observable_data['dof_pos'])
+    elif hasattr(env, 'data'):
+        # MuJoCo simulation - get from qpos
+        if hasattr(env, 'joint_idx') and hasattr(env, 'model'):
+            return env.data.qpos[env.model.jnt_qposadr[env.joint_idx]]
+        else:
+            # Fallback - assume first N positions after base (7 for free joint)
+            num_actions = env.action_space.shape[0]
+            return env.data.qpos[7:7+num_actions]
+    else:
+        # Fallback to zeros
+        num_actions = env.action_space.shape[0]
+        return np.zeros(num_actions)

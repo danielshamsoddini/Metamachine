@@ -94,6 +94,8 @@ class TerrainBuilder:
             condim="6",
             friction="1.0 .0 .0",
             priority="1",
+            solref="0.04 2",
+            solimp="0.9 0.95 0.001"
         )
 
     def set_terrain(self, terrains, terrain_params=None) -> None:

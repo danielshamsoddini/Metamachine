@@ -23,7 +23,7 @@ limitations under the License.
 
 import os
 import time
-from typing import Optional
+from typing import Any, Optional, Tuple, Union
 
 import mujoco
 import numpy as np
@@ -32,6 +32,357 @@ from numpy import cos, sin
 # Local imports
 from .math_utils import quat_rotate_inverse, quaternion_to_euler2, wxyz_to_xyzw
 from .visual_utils import compile_xml, get_joint_pos_addr
+
+
+# =============================================================================
+# Scene Marker Utilities
+# =============================================================================
+
+def add_marker_to_scene(
+    scene: Any,
+    pos: np.ndarray,
+    geom_type: int = mujoco.mjtGeom.mjGEOM_SPHERE,
+    size: np.ndarray = None,
+    rgba: np.ndarray = None,
+    mat: np.ndarray = None,
+) -> int:
+    """Add a visual marker to a MuJoCo scene.
+    
+    This works with both passive viewer (user_scn) and EGL renderer (scene).
+    
+    Args:
+        scene: MuJoCo scene object (mjvScene). For passive viewer use viewer.user_scn,
+               for EGL renderer use renderer.scene.
+        pos: Position [x, y, z] of the marker.
+        geom_type: MuJoCo geometry type (default: SPHERE).
+                   Common types: mjGEOM_SPHERE, mjGEOM_CYLINDER, mjGEOM_BOX
+        size: Size parameters (depends on geom type).
+              - SPHERE: [radius, 0, 0]
+              - CYLINDER: [radius, half_height, 0]
+              - BOX: [half_x, half_y, half_z]
+        rgba: Color [r, g, b, a] in range [0, 1].
+        mat: 3x3 rotation matrix (flattened to 9 elements).
+    
+    Returns:
+        Index of the added geom.
+        
+    Example:
+        # Add a red sphere marker
+        add_marker_to_scene(
+            renderer.scene, 
+            pos=np.array([1.0, 0.5, 0.0]),
+            rgba=np.array([1.0, 0.0, 0.0, 0.8])
+        )
+        
+        # Add a green disc on the ground
+        add_ground_disc_marker(renderer.scene, pos_xy=[1.0, 0.5])
+    """
+    if size is None:
+        size = np.array([0.05, 0, 0])
+    if rgba is None:
+        rgba = np.array([1.0, 0.0, 0.0, 0.8], dtype=np.float32)
+    if mat is None:
+        mat = np.eye(3).flatten()
+    
+    geom_index = scene.ngeom
+    
+    if geom_index >= scene.maxgeom:
+        print(f"Warning: Scene geom limit reached ({scene.maxgeom})")
+        return -1
+    
+    mujoco.mjv_initGeom(
+        scene.geoms[geom_index],
+        type=geom_type,
+        size=np.asarray(size, dtype=np.float64),
+        pos=np.asarray(pos, dtype=np.float64),
+        mat=np.asarray(mat, dtype=np.float64).flatten(),
+        rgba=np.asarray(rgba, dtype=np.float32),
+    )
+    
+    scene.ngeom += 1
+    return geom_index
+
+
+def add_ground_disc_marker(
+    scene: Any,
+    pos_xy: Union[np.ndarray, Tuple[float, float]],
+    radius: float = 0.1,
+    height: float = 0.005,
+    color: Tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.8),
+    z_offset: float = 0.001,
+) -> int:
+    """Add a disc marker on the ground plane.
+    
+    Args:
+        scene: MuJoCo scene object.
+        pos_xy: 2D position [x, y] on the ground.
+        radius: Radius of the disc.
+        height: Height (thickness) of the disc.
+        color: RGBA color tuple.
+        z_offset: Small offset above ground to prevent z-fighting.
+        
+    Returns:
+        Index of the added geom.
+    """
+    pos_xy = np.asarray(pos_xy)
+    pos = np.array([pos_xy[0], pos_xy[1], z_offset])
+    size = np.array([radius, height / 2, 0])
+    
+    return add_marker_to_scene(
+        scene,
+        pos=pos,
+        geom_type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+        size=size,
+        rgba=np.array(color, dtype=np.float32),
+        mat=np.eye(3).flatten(),
+    )
+
+
+def add_sphere_marker(
+    scene: Any,
+    pos: np.ndarray,
+    radius: float = 0.05,
+    color: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.8),
+) -> int:
+    """Add a sphere marker at a given position.
+    
+    Args:
+        scene: MuJoCo scene object.
+        pos: 3D position [x, y, z].
+        radius: Radius of the sphere.
+        color: RGBA color tuple.
+        
+    Returns:
+        Index of the added geom.
+    """
+    return add_marker_to_scene(
+        scene,
+        pos=np.asarray(pos),
+        geom_type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        size=np.array([radius, 0, 0]),
+        rgba=np.array(color, dtype=np.float32),
+    )
+
+
+def add_line_marker(
+    scene: Any,
+    start: np.ndarray,
+    end: np.ndarray,
+    radius: float = 0.01,
+    color: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 0.8),
+) -> int:
+    """Add a line (cylinder) marker between two points.
+    
+    Args:
+        scene: MuJoCo scene object.
+        start: Starting position [x, y, z].
+        end: Ending position [x, y, z].
+        radius: Radius of the line (cylinder).
+        color: RGBA color tuple.
+        
+    Returns:
+        Index of the added geom.
+    """
+    start = np.asarray(start)
+    end = np.asarray(end)
+    
+    # Calculate length and direction
+    diff = end - start
+    length = np.linalg.norm(diff)
+    
+    if length < 1e-6:
+        return -1
+    
+    direction = diff / length
+    midpoint = (start + end) / 2
+    
+    # Calculate rotation matrix to align Z-axis with direction
+    z_axis = np.array([0, 0, 1])
+    
+    if np.allclose(np.abs(np.dot(direction, z_axis)), 1.0):
+        # Direction is parallel to Z-axis
+        rotation_matrix = np.eye(3)
+        if np.dot(direction, z_axis) < 0:
+            rotation_matrix[0, 0] = -1
+            rotation_matrix[2, 2] = -1
+    else:
+        v = np.cross(z_axis, direction)
+        s = np.linalg.norm(v)
+        c = np.dot(z_axis, direction)
+        
+        # Skew-symmetric matrix
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        
+        # Rodrigues' formula
+        rotation_matrix = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s**2 + 1e-8))
+    
+    return add_marker_to_scene(
+        scene,
+        pos=midpoint,
+        geom_type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+        size=np.array([radius, length / 2, 0]),
+        rgba=np.array(color, dtype=np.float32),
+        mat=rotation_matrix.flatten(),
+    )
+
+
+def add_ground_line_marker(
+    scene: Any,
+    start_xy: Union[np.ndarray, Tuple[float, float]],
+    end_xy: Union[np.ndarray, Tuple[float, float]],
+    radius: float = 0.01,
+    color: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 0.8),
+    z_offset: float = 0.02,
+) -> int:
+    """Add a line marker on the ground plane (projected from 2D coordinates).
+    
+    Args:
+        scene: MuJoCo scene object.
+        start_xy: Starting 2D position [x, y].
+        end_xy: Ending 2D position [x, y].
+        radius: Radius of the line.
+        color: RGBA color tuple.
+        z_offset: Height above ground plane.
+        
+    Returns:
+        Index of the added geom.
+    """
+    start = np.array([start_xy[0], start_xy[1], z_offset])
+    end = np.array([end_xy[0], end_xy[1], z_offset])
+    return add_line_marker(scene, start, end, radius, color)
+
+
+def add_ground_arrow_marker(
+    scene: Any,
+    start_xy: Union[np.ndarray, Tuple[float, float]],
+    direction_xy: Union[np.ndarray, Tuple[float, float]],
+    length: float = 0.5,
+    shaft_radius: float = 0.015,
+    head_radius: float = 0.04,
+    head_length: float = 0.08,
+    color: Tuple[float, float, float, float] = (0.0, 0.0, 1.0, 0.8),
+    z_offset: float = 0.02,
+) -> Tuple[int, int]:
+    """Add an arrow marker on the ground plane pointing in a 2D direction.
+    
+    The arrow consists of a shaft (cylinder) and a head (cone).
+    
+    Args:
+        scene: MuJoCo scene object.
+        start_xy: Starting 2D position [x, y].
+        direction_xy: 2D direction vector [dx, dy] (will be normalized).
+        length: Total length of the arrow (shaft + head).
+        shaft_radius: Radius of the shaft.
+        head_radius: Radius of the arrow head base.
+        head_length: Length of the arrow head.
+        color: RGBA color tuple.
+        z_offset: Height above ground plane.
+        
+    Returns:
+        Tuple of (shaft_geom_index, head_geom_index).
+    """
+    direction_xy = np.asarray(direction_xy, dtype=np.float64)
+    dir_norm = np.linalg.norm(direction_xy)
+    
+    if dir_norm < 1e-6:
+        return (-1, -1)
+    
+    direction_xy = direction_xy / dir_norm
+    
+    start = np.array([start_xy[0], start_xy[1], z_offset])
+    direction_3d = np.array([direction_xy[0], direction_xy[1], 0])
+    
+    shaft_length = length - head_length
+    shaft_end = start + direction_3d * shaft_length
+    
+    # Draw shaft
+    shaft_idx = add_line_marker(
+        scene, start, shaft_end, shaft_radius, color
+    )
+    
+    # Draw head (cone) - use a cylinder as approximation
+    head_start = shaft_end
+    head_end = head_start + direction_3d * head_length
+    head_mid = (head_start + head_end) / 2
+    
+    # Calculate rotation for the cone
+    z_axis = np.array([0, 0, 1])
+    if np.allclose(np.abs(np.dot(direction_3d, z_axis)), 1.0):
+        rotation_matrix = np.eye(3)
+    else:
+        v = np.cross(z_axis, direction_3d)
+        s = np.linalg.norm(v)
+        c = np.dot(z_axis, direction_3d)
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        rotation_matrix = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s**2 + 1e-8))
+    
+    # Use a cone-like shape (tapered cylinder approximation with a sphere at tip)
+    head_idx = add_marker_to_scene(
+        scene,
+        pos=head_mid,
+        geom_type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+        size=np.array([head_radius, head_length / 2, 0]),
+        rgba=np.array(color, dtype=np.float32),
+        mat=rotation_matrix.flatten(),
+    )
+    
+    return (shaft_idx, head_idx)
+
+
+def add_arrow_marker(
+    scene: Any,
+    start: np.ndarray,
+    direction: np.ndarray,
+    length: float = 0.3,
+    radius: float = 0.01,
+    color: Tuple[float, float, float, float] = (0.0, 0.0, 1.0, 0.8),
+) -> int:
+    """Add an arrow marker showing direction.
+    
+    Args:
+        scene: MuJoCo scene object.
+        start: Starting position [x, y, z].
+        direction: Unit direction vector [dx, dy, dz].
+        length: Length of the arrow.
+        radius: Radius of the arrow shaft.
+        color: RGBA color tuple.
+        
+    Returns:
+        Index of the added geom (shaft).
+    """
+    start = np.asarray(start)
+    direction = np.asarray(direction)
+    direction = direction / (np.linalg.norm(direction) + 1e-8)
+    
+    # Calculate midpoint and rotation
+    midpoint = start + direction * (length / 2)
+    
+    # Calculate rotation matrix to align Z-axis with direction
+    z_axis = np.array([0, 0, 1])
+    
+    if np.allclose(direction, z_axis) or np.allclose(direction, -z_axis):
+        rotation_matrix = np.eye(3)
+        if np.allclose(direction, -z_axis):
+            rotation_matrix[2, 2] = -1
+    else:
+        v = np.cross(z_axis, direction)
+        s = np.linalg.norm(v)
+        c = np.dot(z_axis, direction)
+        
+        # Skew-symmetric matrix
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        
+        # Rodrigues' formula
+        rotation_matrix = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s**2 + 1e-8))
+    
+    return add_marker_to_scene(
+        scene,
+        pos=midpoint,
+        geom_type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+        size=np.array([radius, length / 2, 0]),
+        rgba=np.array(color, dtype=np.float32),
+        mat=rotation_matrix.flatten(),
+    )
 
 DEFAULT_ROBOT_CONFIG = {
     "theta": 0.4625123,

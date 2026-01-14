@@ -48,6 +48,7 @@ __all__ = [
     "ProgressBarCallback",
     "load_from_checkpoint",
     "play_checkpoint",
+    "play_checkpoint_with_tracking",
     "continue_training",
     "compare_configs",
     # Policy runner utilities
@@ -61,6 +62,19 @@ __all__ = [
     "load_model_standalone",
     # Training callbacks (optional, requires stable-baselines3)
     "SB3TrainingProgressCallback",
+    # Real-time plotting utilities
+    "RealtimeJointPlotter",
+    "JointTrackingLogger",
+    "StateLogger",
+    "create_joint_plotter_from_env",
+    "create_joint_logger_from_env",
+    "create_state_logger_from_env",
+    # Rendering utilities for MuJoCo scene markers
+    "add_marker_to_scene",
+    "add_ground_disc_marker",
+    "add_sphere_marker",
+    "add_arrow_marker",
+    "render_line",
 ]
 
 # SB3 utilities (optional import - only available if stable-baselines3 is installed)
@@ -72,6 +86,7 @@ try:
         ProgressBarCallback,
         load_from_checkpoint,
         play_checkpoint,
+        play_checkpoint_with_tracking,
         continue_training,
         compare_configs,
     )
@@ -83,6 +98,7 @@ except ImportError:
     ProgressBarCallback = None
     load_from_checkpoint = None
     play_checkpoint = None
+    play_checkpoint_with_tracking = None
     continue_training = None
     compare_configs = None
 
@@ -112,3 +128,22 @@ try:
     from .training_callbacks import SB3TrainingProgressCallback
 except ImportError:
     SB3TrainingProgressCallback = None
+
+# Real-time plotting utilities
+from .realtime_plotter import (
+    RealtimeJointPlotter,
+    JointTrackingLogger,
+    StateLogger,
+    create_joint_plotter_from_env,
+    create_joint_logger_from_env,
+    create_state_logger_from_env,
+)
+
+# Rendering utilities for MuJoCo scene markers
+from .rendering import (
+    add_marker_to_scene,
+    add_ground_disc_marker,
+    add_sphere_marker,
+    add_arrow_marker,
+    render_line,
+)

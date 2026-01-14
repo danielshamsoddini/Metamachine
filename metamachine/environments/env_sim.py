@@ -1626,22 +1626,30 @@ class MetaMachine(Base, MujocoEnv):
             return
 
         friction_range = friction_cfg.get("range", [0.8, 1.2])
+        rolling_friction_range = friction_cfg.get("rolling_range", [0.15, 0.35])
 
         if is_number(friction_range[0]):
             # Single friction value
             friction = np.random.uniform(*friction_range)
             self.model.geom("floor").friction[0] = friction
             self.model.geom("floor").priority[0] = 10
+            roll_friction = np.random.uniform(*rolling_friction_range)
+            self.model.geom("floor").friction[1:3] = roll_friction
         else:
             # Separate friction for different components
             stick_friction = np.random.uniform(*friction_range[0])
             ball_friction = np.random.uniform(*friction_range[1])
+            roll_friction = np.random.uniform(*rolling_friction_range)
 
             self.model.geom("floor").priority[0] = 1
             for module_id in self.jointed_module_ids:
                 self.model.geom(f"left{module_id}").friction[0] = ball_friction
                 self.model.geom(f"right{module_id}").friction[0] = ball_friction
                 self.model.geom(f"stick{module_id}").friction[0] = stick_friction
+                
+                self.model.geom(f"left{module_id}").friction[1:3] = roll_friction
+                self.model.geom(f"right{module_id}").friction[1:3] = roll_friction
+                self.model.geom(f"stick{module_id}").friction[1:3] = roll_friction
 
                 for geom_name in [
                     f"left{module_id}",
@@ -1651,13 +1659,13 @@ class MetaMachine(Base, MujocoEnv):
                     self.model.geom(geom_name).priority[0] = 2
 
         # Rolling friction
-        rolling_cfg = friction_cfg.get("rolling", {})
-        if rolling_cfg.get("enabled", False):
-            rolling_range = rolling_cfg.get("range", [0.0001, 0.0005])
-            roll_friction = np.random.uniform(
-                rolling_range[0], rolling_range[1], size=2
-            )
-            self.model.geom("floor").friction[1:3] = roll_friction
+        # rolling_cfg = friction_cfg.get("rolling", {})
+        # if rolling_cfg.get("enabled", False):
+        #     rolling_range = rolling_cfg.get("range", [0.0001, 0.0005])
+        #     roll_friction = np.random.uniform(
+        #         rolling_range[0], rolling_range[1], size=2
+        #     )
+        #     self.model.geom("floor").friction[1:3] = roll_friction
 
     def _set_initial_state(self) -> None:
         """Set initial robot state with randomization."""
