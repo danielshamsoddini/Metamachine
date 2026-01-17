@@ -94,7 +94,7 @@ class TerrainBuilder:
             condim="6",
             friction="1.0 .0 .0",
             priority="1",
-            solref="0.04 2",
+            solref="0.03 2",
             solimp="0.9 0.95 0.001"
         )
 

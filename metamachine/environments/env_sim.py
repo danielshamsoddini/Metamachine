@@ -530,9 +530,80 @@ class MetaMachine(Base, MujocoEnv):
         self.video_frames: list[np.ndarray] = []
         self.egl_renderer: Optional[Union[str, Any]] = None
         self.recording_active = False
+        
+        # Callback lists for video customization
+        self._pre_render_callbacks: list = []  # Called after update_scene, before render
+        self._post_render_callbacks: list = []  # Called after frame capture, before overlay
+        self._frame_overlay_callbacks: list = []  # Called after metrics overlay
+        
         print(
             f"Video recording initialized. Recording every {self.video_record_interval} episodes."
         )
+    
+    def register_pre_render_callback(self, callback) -> None:
+        """Register a callback to be called before rendering each frame.
+        
+        The callback receives (renderer, data) and can add markers to the scene.
+        Called after update_scene() but before render().
+        
+        Example:
+            def add_target_marker(renderer, data):
+                from metamachine.utils.rendering import add_sphere_marker
+                add_sphere_marker(renderer.scene, pos=[1, 0, 0.1], rgba=[1, 0, 0, 0.8])
+            
+            env.register_pre_render_callback(add_target_marker)
+        """
+        if not hasattr(self, '_pre_render_callbacks'):
+            self._pre_render_callbacks = []
+        self._pre_render_callbacks.append(callback)
+    
+    def register_post_render_callback(self, callback) -> None:
+        """Register a callback to be called after rendering each frame.
+        
+        The callback receives (frame) and should return the modified frame.
+        Called after frame capture but before metrics overlay.
+        
+        Example:
+            def add_custom_drawing(frame):
+                cv2.circle(frame, (100, 100), 20, (0, 255, 0), -1)
+                return frame
+            
+            env.register_post_render_callback(add_custom_drawing)
+        """
+        if not hasattr(self, '_post_render_callbacks'):
+            self._post_render_callbacks = []
+        self._post_render_callbacks.append(callback)
+    
+    def register_frame_overlay_callback(self, callback) -> None:
+        """Register a callback to add overlays after the default metrics.
+        
+        The callback receives (frame) and should return the modified frame.
+        Called after _add_metrics_overlay().
+        
+        Example:
+            def add_bearing_info(frame):
+                cv2.putText(frame, "Bearing: 45°", (500, 30), ...)
+                return frame
+            
+            env.register_frame_overlay_callback(add_bearing_info)
+        """
+        if not hasattr(self, '_frame_overlay_callbacks'):
+            self._frame_overlay_callbacks = []
+        self._frame_overlay_callbacks.append(callback)
+    
+    def clear_video_callbacks(self) -> None:
+        """Clear all registered video callbacks."""
+        self._pre_render_callbacks = []
+        self._post_render_callbacks = []
+        self._frame_overlay_callbacks = []
+    
+    def get_current_renderer(self) -> Any:
+        """Get the current EGL renderer (creates one if needed).
+        
+        Returns:
+            The MuJoCo renderer object, or "synthetic" if EGL is unavailable.
+        """
+        return self._create_egl_renderer()
 
     def _create_egl_renderer(self) -> Any:
         """Create EGL renderer for direct rendering."""
@@ -623,7 +694,13 @@ class MetaMachine(Base, MujocoEnv):
         return frame
 
     def _capture_frame_egl(self) -> Optional[np.ndarray]:
-        """Capture frame using EGL renderer."""
+        """Capture frame using EGL renderer.
+        
+        This method supports registered callbacks for customization:
+        - pre_render_callbacks: Called after update_scene, before render (for 3D markers)
+        - post_render_callbacks: Called after capture, before overlay (for frame processing)
+        - frame_overlay_callbacks: Called after metrics overlay (for additional text/graphics)
+        """
         if self.render_mode != "mp4" or not self.recording_active:
             return None
 
@@ -635,12 +712,35 @@ class MetaMachine(Base, MujocoEnv):
         else:
             camera_id = getattr(self, "preferred_camera_id", -1)
             renderer.update_scene(self.data, camera=camera_id)
+            
+            # Call pre-render callbacks (for adding 3D markers to scene)
+            for callback in getattr(self, '_pre_render_callbacks', []):
+                try:
+                    callback(renderer, self.data)
+                except Exception as e:
+                    pass  # Silently ignore callback errors
+            
             pixels = renderer.render()
             frame = 1 - pixels
             frame = (frame * 255).astype(np.uint8)
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # Call post-render callbacks (for frame processing)
+        for callback in getattr(self, '_post_render_callbacks', []):
+            try:
+                frame = callback(frame)
+            except Exception as e:
+                pass  # Silently ignore callback errors
 
         frame = self._add_metrics_overlay(frame)
+        
+        # Call frame overlay callbacks (for additional overlays)
+        for callback in getattr(self, '_frame_overlay_callbacks', []):
+            try:
+                frame = callback(frame)
+            except Exception as e:
+                pass  # Silently ignore callback errors
+        
         self.video_frames.append(frame)
         return frame
 
@@ -1268,19 +1368,25 @@ class MetaMachine(Base, MujocoEnv):
     def _extract_core_state(self, qpos: np.ndarray, qvel: np.ndarray) -> dict[str, Any]:
         """Extract core robot state information."""
         # Position and orientation
-        self.pos_world = qpos[:3]
-        quat = wxyz_to_xyzw(qpos[3:7])
+        # self.pos_world = qpos[:3]
+        self.torso_node_id = self.cfg.observation.get("torso_node_id", 0)  # type: ignore 
+        torso_body_id = self.model.body(f"l{self.torso_node_id}").id
+
+        self.pos_world = self.data.xpos[torso_body_id]
+        quat = self.data.xquat[torso_body_id]
+        quat = wxyz_to_xyzw(quat)
 
         # Joint states
         dof_pos = qpos[self.model.jnt_qposadr[self.joint_idx]]
         dof_vel = qvel[self.model.jnt_dofadr[self.joint_idx]]
 
         # Velocities
-        vel_world = qvel[:3]
+        cvel = self.data.cvel[torso_body_id]
+        vel_world = cvel[3:]
         vel_body = quat_rotate_inverse(quat, vel_world)
-        ang_vel_body = qvel[3:6]
-        ang_vel_world = quat_rotate(quat, ang_vel_body)
-
+        ang_vel_world = cvel[:3]
+        ang_vel_body = quat_rotate_inverse(quat, ang_vel_world)
+        
         return {
             "pos_world": self.pos_world,
             "quat": quat,
@@ -1626,7 +1732,7 @@ class MetaMachine(Base, MujocoEnv):
             return
 
         friction_range = friction_cfg.get("range", [0.8, 1.2])
-        rolling_friction_range = friction_cfg.get("rolling_range", [0.15, 0.35])
+        rolling_friction_range = friction_cfg.get("rolling_range", [0.05, 0.4])
 
         if is_number(friction_range[0]):
             # Single friction value
