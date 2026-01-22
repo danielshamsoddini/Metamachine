@@ -134,11 +134,15 @@ observation:
         index_type: element         # Access as data[i]
       - name: gyros
         index_type: element
+      - name: dof_pos
+        index_type: slice
+        slice_size: 1
+      - name: dof_vel
+        index_type: slice
+        slice_size: 1
     
     # Global components (added once at the end, not per-module)
-    global_components:
-      - name: dof_pos
-      - name: dof_vel
+    global_components: []
       # - name: last_action
 
   # Observation processing
