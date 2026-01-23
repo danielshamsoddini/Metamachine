@@ -63,11 +63,16 @@ MODEL = ["three_modules_run_policy", "quadruped_run_policy"][1]  # Name of regis
 POLICY_PATH = None  # Path to local policy file (.pkl) - set MODEL to None if using this
 
 # Environment options
-CONFIG = ["example_three_modules", "basic_quadruped"][1]  # Environment configuration name
+# CONFIG: Environment configuration for running the policy (observation format for policy)
+# RECORDING_CONFIG: Configuration defining what observations to record (for training)
+#   - Use this when policy was trained with one config but you want to record 
+#     observations in a different format (e.g., modular observations for transformer)
+CONFIG = ["example_three_modules", "basic_quadruped"][1]  # Env config for policy
+RECORDING_CONFIG = "modular_quadruped"  # Config for observation extractors (or None to use CONFIG)
 N_MODULES = 5  # Number of modules in the robot
 
 # Parallelization options
-NUM_ENVS = 50  # Number of parallel environments
+NUM_ENVS = 10  # Number of parallel environments (reduced from 50 to avoid OOM)
 NUM_CPUS_PER_ENV = 0.2  # CPU resources per environment (fractional allows oversubscription)
 NUM_GPUS_PER_ENV = 0.0  # GPU resources per environment
 DEVICE = "cpu"  # Device for policy inference ("cuda:0" or "cpu")
@@ -99,6 +104,9 @@ StateSnapshot = None
 def create_custom_extractors(n_modules: int = N_MODULES) -> Dict[str, Callable]:
     """Create custom data extractors for recording additional information.
     
+    DEPRECATED: This function uses hardcoded observation structure.
+    Use create_config_driven_extractors() for alignment with config.
+    
     These extractors work with StateSnapshot objects from the vectorized environment.
     
     Args:
@@ -129,6 +137,77 @@ def create_custom_extractors(n_modules: int = N_MODULES) -> Dict[str, Callable]:
         extractors[f"module{i}"] = module_extractor
     
     return extractors
+
+
+def create_config_driven_extractors(cfg) -> Dict[str, Callable]:
+    """Create custom data extractors based on the modular observation config.
+    
+    This function reads the observation.modular config section to build extractors
+    that match exactly what the training expects, ensuring alignment between
+    data collection and inference.
+    
+    Args:
+        cfg: OmegaConf configuration with observation.modular settings.
+    
+    Returns:
+        Dictionary of extractor functions keyed by module name.
+    """
+    modular_cfg = getattr(cfg.observation, "modular", None)
+    if modular_cfg is None or not getattr(modular_cfg, "enabled", False):
+        raise ValueError(
+            "Config must have observation.modular.enabled: true for config-driven extractors"
+        )
+    
+    num_modules = getattr(modular_cfg, "num_modules", 5)
+    if num_modules == "auto":
+        num_modules = cfg.control.num_actions
+    
+    per_module_components = list(getattr(modular_cfg, "per_module_components", []))
+    
+    # Build component extractors based on config
+    def build_component_extractor(comp_spec, module_idx):
+        """Build extractor for a single component at a specific module index."""
+        name = comp_spec["name"] if isinstance(comp_spec, dict) else comp_spec
+        index_type = comp_spec.get("index_type", "element") if isinstance(comp_spec, dict) else "element"
+        slice_size = comp_spec.get("slice_size", 1) if isinstance(comp_spec, dict) else 1
+        
+        # Map component names to StateSnapshot attribute accessors
+        COMPONENT_MAP = {
+            "projected_gravities": lambda s, i: s.projected_gravities[i] if len(s.projected_gravities) > i else np.zeros(3),
+            "gyros": lambda s, i: s.gyros[i] if len(s.gyros) > i else np.zeros(3),
+            "accs": lambda s, i: s.accs[i] if len(s.accs) > i else np.zeros(3),
+            "quats": lambda s, i: s.quats[i] if len(s.quats) > i else np.zeros(4),
+            "dof_pos": lambda s, i, size=slice_size: s.dof_pos[i:i+size] if len(s.dof_pos) > i else np.zeros(size),
+            "dof_vel": lambda s, i, size=slice_size: s.dof_vel[i:i+size] if len(s.dof_vel) > i else np.zeros(size),
+        }
+        
+        if name not in COMPONENT_MAP:
+            raise ValueError(f"Unknown modular component: {name}. Available: {list(COMPONENT_MAP.keys())}")
+        
+        return COMPONENT_MAP[name]
+    
+    extractors = {}
+    
+    for i in range(num_modules):
+        # Build extractors for this module based on per_module_components
+        component_extractors = []
+        for comp_spec in per_module_components:
+            comp_spec_dict = comp_spec if isinstance(comp_spec, dict) else {"name": comp_spec}
+            extractor = build_component_extractor(comp_spec_dict, i)
+            component_extractors.append((comp_spec_dict, extractor))
+        
+        def module_extractor(state, idx=i, extractors_list=component_extractors):
+            """Extract per-module observation data based on config."""
+            parts = []
+            for comp_spec, extractor in extractors_list:
+                data = extractor(state, idx)
+                parts.append(np.asarray(data).flatten())
+            return np.concatenate(parts) if parts else np.array([])
+        
+        extractors[f"module{i}"] = module_extractor
+    
+    return extractors
+
 
 
 class BatchRolloutRecorder:
@@ -577,8 +656,27 @@ def main():
     
     print(f"Environment info: num_obs={vec_env.num_obs}, num_actions={vec_env.num_actions}, num_modules={vec_env.num_modules}")
     
-    # Create custom extractors based on actual number of modules
-    custom_extractors = create_custom_extractors(vec_env.num_modules)
+    # Create custom extractors based on recording config (may differ from env config)
+    # This allows running policy with one config (e.g., basic_quadruped) while
+    # recording modular observations for transformer training (modular_quadruped)
+    if RECORDING_CONFIG is not None:
+        print(f"\nUsing separate recording config: {RECORDING_CONFIG}")
+        recording_cfg = ConfigRegistry.create_from_name(RECORDING_CONFIG)
+    else:
+        recording_cfg = cfg
+    
+    try:
+        custom_extractors = create_config_driven_extractors(recording_cfg)
+        print(f"Using config-driven extractors (aligned with {RECORDING_CONFIG or CONFIG} modular config)")
+        # Print observation structure info for debugging
+        modular_cfg = getattr(recording_cfg.observation, "modular", None)
+        if modular_cfg and getattr(modular_cfg, "enabled", False):
+            per_module_comps = list(getattr(modular_cfg, "per_module_components", []))
+            print(f"Recording modular components: {[c.get('name', c) if isinstance(c, dict) else c for c in per_module_comps]}")
+    except ValueError as e:
+        print(f"Warning: {e}")
+        print(f"Falling back to hardcoded extractors (may cause training/inference mismatch!)")
+        custom_extractors = create_custom_extractors(vec_env.num_modules)
     
     # Create batch rollout recorder
     recorder = BatchRolloutRecorder(

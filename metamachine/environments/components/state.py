@@ -1742,6 +1742,145 @@ class State:
             "global_components": global_names,
         }
 
+    def get_dict_observation(self) -> dict:
+        """Get observation as a dictionary with per-module keys.
+        
+        Returns observations in the format expected by transformer policies:
+            {
+                'module0': np.ndarray of per-module observation,
+                'module1': np.ndarray of per-module observation,
+                ...
+                'global': np.ndarray of global observation (if any)
+            }
+        
+        This provides a unified API for both data collection and inference,
+        ensuring alignment between recorded data and policy input.
+        
+        Returns:
+            Dictionary mapping module names to observation arrays.
+            
+        Raises:
+            RuntimeError: If modular mode is not enabled.
+        """
+        if not self.modular_mode:
+            raise RuntimeError(
+                "get_dict_observation() requires modular mode to be enabled. "
+                "Set observation.modular.enabled: true in your config."
+            )
+        
+        result = {}
+        
+        # Determine which module indices to iterate over
+        if self.main_module_index is not None:
+            module_indices = [self.main_module_index]
+        else:
+            module_indices = range(self.num_modules)
+        
+        # Per-module observations
+        for module_idx in module_indices:
+            module_obs_parts = []
+            for component in self.modular_components:
+                try:
+                    data = component.get_data_for_module(self, module_idx)
+                    flattened_data = np.asarray(data).flatten()
+                    module_obs_parts.append(flattened_data)
+                except (IndexError, TypeError) as e:
+                    print(
+                        f"ERROR: Failed to get data for component '{component.name}' "
+                        f"at module index {module_idx}: {e}"
+                    )
+                    raise
+            
+            if module_obs_parts:
+                module_obs = np.concatenate(module_obs_parts)
+                module_obs = np.clip(module_obs, -self.clip_observations, self.clip_observations)
+                result[f"module{module_idx}"] = module_obs
+        
+        # Global observations (if any)
+        if self.global_components:
+            global_obs_parts = []
+            for component in self.global_components:
+                data = component.get_data(self)
+                flattened_data = np.asarray(data).flatten()
+                global_obs_parts.append(flattened_data)
+            
+            if global_obs_parts:
+                global_obs = np.concatenate(global_obs_parts)
+                global_obs = np.clip(global_obs, -self.clip_observations, self.clip_observations)
+                result["global"] = global_obs
+        
+        return result
+
+    def get_per_module_observation_size(self) -> int:
+        """Get the size of per-module observation vector.
+        
+        This is useful for parsing flat observation vectors into per-module
+        dictionaries during inference.
+        
+        Returns:
+            Size of each module's observation vector.
+            
+        Raises:
+            RuntimeError: If modular mode is not enabled.
+        """
+        if not self.modular_mode:
+            raise RuntimeError(
+                "get_per_module_observation_size() requires modular mode. "
+                "Set observation.modular.enabled: true in your config."
+            )
+        
+        info = self.get_modular_observation_info()
+        return info["per_module_obs_size"]
+
+    def flat_obs_to_dict(self, flat_obs: np.ndarray) -> dict:
+        """Convert a flat observation vector to dictionary format.
+        
+        This is the inverse of concatenating dict observations back to flat.
+        Useful for inference when you have the environment's flat observation
+        but need the per-module dictionary format.
+        
+        Args:
+            flat_obs: Flat observation vector from env.step() or env.reset()
+            
+        Returns:
+            Dictionary with module keys mapping to observation arrays.
+            
+        Raises:
+            RuntimeError: If modular mode is not enabled.
+            ValueError: If flat_obs size doesn't match expected size.
+        """
+        if not self.modular_mode:
+            raise RuntimeError(
+                "flat_obs_to_dict() requires modular mode. "
+                "Set observation.modular.enabled: true in your config."
+            )
+        
+        info = self.get_modular_observation_info()
+        per_module_size = info["per_module_obs_size"]
+        global_size = info["global_obs_size"]
+        num_modules = info["num_modules"]
+        
+        expected_size = per_module_size * num_modules + global_size
+        if len(flat_obs) != expected_size:
+            raise ValueError(
+                f"flat_obs size {len(flat_obs)} doesn't match expected {expected_size} "
+                f"({num_modules} modules × {per_module_size} + {global_size} global)"
+            )
+        
+        result = {}
+        offset = 0
+        
+        # Extract per-module observations
+        for i in range(num_modules):
+            result[f"module{i}"] = flat_obs[offset:offset + per_module_size].copy()
+            offset += per_module_size
+        
+        # Extract global observation if present
+        if global_size > 0:
+            result["global"] = flat_obs[offset:offset + global_size].copy()
+        
+        return result
+
     def get_custom_commands(self, command_type):
         """Get custom commands based on command type."""
         info = {}
