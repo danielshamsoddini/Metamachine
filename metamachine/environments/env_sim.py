@@ -1375,6 +1375,7 @@ class MetaMachine(Base, MujocoEnv):
         self.pos_world = self.data.xpos[torso_body_id]
         quat = self.data.xquat[torso_body_id]
         quat = wxyz_to_xyzw(quat)
+        pos_worlds = [self.data.xpos[i] for i in self.joint_body_idx]
 
         # Joint states
         dof_pos = qpos[self.model.jnt_qposadr[self.joint_idx]]
@@ -1389,6 +1390,7 @@ class MetaMachine(Base, MujocoEnv):
         
         return {
             "pos_world": self.pos_world,
+            "pos_worlds": pos_worlds,
             "quat": quat,
             "dof_pos": dof_pos,
             "dof_vel": dof_vel,
@@ -1732,7 +1734,8 @@ class MetaMachine(Base, MujocoEnv):
             return
 
         friction_range = friction_cfg.get("range", [0.8, 1.2])
-        rolling_friction_range = friction_cfg.get("rolling_range", [0.05, 0.4])
+        rolling_friction_range = friction_cfg.get("rolling_range", [0.1, 0.4])
+        detailed_range = friction_cfg.get("detailed_range", None)
 
         if is_number(friction_range[0]):
             # Single friction value
@@ -1740,29 +1743,49 @@ class MetaMachine(Base, MujocoEnv):
             self.model.geom("floor").friction[0] = friction
             self.model.geom("floor").priority[0] = 10
             roll_friction = np.random.uniform(*rolling_friction_range)
-            self.model.geom("floor").friction[1:3] = roll_friction
+            self.model.geom("floor").friction[2] = 0.05 # roll_friction
+            self.model.geom("floor").friction[1] = roll_friction
+            # print(f"Applied floor rolling friction: {roll_friction:.4f}")
         else:
             # Separate friction for different components
-            stick_friction = np.random.uniform(*friction_range[0])
-            ball_friction = np.random.uniform(*friction_range[1])
+            # TODO: This is buggy
+            stick_friction = np.random.uniform(*detailed_range[0])
+            ball_friction = np.random.uniform(*detailed_range[1])
             roll_friction = np.random.uniform(*rolling_friction_range)
 
-            self.model.geom("floor").priority[0] = 1
+            passive_component_geoms = [self.model.geom(i).name for i in range(self.model.ngeom)]
+            passive_component_geoms.remove("floor")
+
             for module_id in self.jointed_module_ids:
-                self.model.geom(f"left{module_id}").friction[0] = ball_friction
-                self.model.geom(f"right{module_id}").friction[0] = ball_friction
-                self.model.geom(f"stick{module_id}").friction[0] = stick_friction
+                self.model.geom(f"left{module_id}").friction[0] = 1
+                self.model.geom(f"right{module_id}").friction[0] = 1
+                # self.model.geom(f"stick{module_id}").friction[0] = stick_friction
                 
-                self.model.geom(f"left{module_id}").friction[1:3] = roll_friction
-                self.model.geom(f"right{module_id}").friction[1:3] = roll_friction
-                self.model.geom(f"stick{module_id}").friction[1:3] = roll_friction
+                self.model.geom(f"left{module_id}").friction[1] = 0.50
+                self.model.geom(f"right{module_id}").friction[1] = 0.50
+
+                self.model.geom(f"left{module_id}").friction[2] = roll_friction
+                self.model.geom(f"right{module_id}").friction[2] = roll_friction
+                # self.model.geom(f"stick{module_id}").friction[1:3] = roll_friction
 
                 for geom_name in [
                     f"left{module_id}",
                     f"right{module_id}",
-                    f"stick{module_id}",
+                    # f"stick{module_id}",
                 ]:
                     self.model.geom(geom_name).priority[0] = 2
+
+                passive_component_geoms.remove(f"left{module_id}")
+                passive_component_geoms.remove(f"right{module_id}")
+
+            # all other geoms except floor
+            for geom_name in passive_component_geoms:
+                self.model.geom(geom_name).friction[0] = 1
+                self.model.geom(geom_name).friction[1:3] = roll_friction
+                self.model.geom(geom_name).priority[0] = 2
+
+            
+            
 
         # Rolling friction
         # rolling_cfg = friction_cfg.get("rolling", {})
