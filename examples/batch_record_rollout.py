@@ -84,6 +84,10 @@ OUTPUT = "batch_rollouts.pkl"  # Output file path
 OUTPUT_FORMAT = "pkl"  # Output format: "npz", "pkl", or "hdf5"
 RECORDING_COMPONENTS = ["accurate_vel_world"]  # State components to record
 
+# Video recording options (for verification)
+RECORD_EXAMPLE_VIDEO = True  # Record an example episode video before/after batch recording
+EXAMPLE_VIDEO_STEPS = 500  # Number of steps for example video
+
 # Simulation options
 SEED = 42  # Random seed for reproducibility
 VERBOSE = True  # Print detailed information during recording
@@ -591,6 +595,112 @@ class StateSnapshotWrapper:
         return None
 
 
+def record_example_video(model, config_name: str, n_steps: int = 500, seed: int = 42):
+    """Record an example episode with video to verify trajectory quality.
+    
+    This runs a single environment (not parallelized) with video recording enabled
+    to visually verify that the policy is working correctly before batch collection.
+    
+    Args:
+        model: The loaded policy model (CrossQ).
+        config_name: Environment configuration name.
+        n_steps: Number of steps to record.
+        seed: Random seed for reproducibility.
+        
+    Returns:
+        dict with metrics (total_reward, distance, video_path)
+    """
+    import os
+    import time as time_module
+    from metamachine.environments.configs.config_registry import ConfigRegistry
+    from metamachine.environments.env_sim import MetaMachine
+    
+    print(f"\n{'=' * 60}")
+    print("RECORDING EXAMPLE VIDEO")
+    print(f"{'=' * 60}")
+    
+    # Create environment with video recording
+    cfg = ConfigRegistry.create_from_name(config_name)
+    cfg.simulation.render = True
+    cfg.simulation.render_mode = "mp4"
+    cfg.simulation.video_record_interval = 1  # Record every episode
+    
+    env = MetaMachine(cfg)
+    obs, _ = env.reset(seed=seed)
+    
+    # Get log directory
+    env_log_dir = getattr(env, '_log_dir', './logs')
+    print(f"Video will be saved to: {env_log_dir}")
+    print(f"Running {n_steps} steps...")
+    
+    # Run rollout
+    total_reward = 0.0
+    positions = []
+    
+    for step in range(n_steps):
+        t0 = time_module.time()
+        
+        # Get action from policy (same as batch recording)
+        action = model.predict(obs)
+        
+        # Step environment
+        obs, reward, done, truncated, info = env.step(action)
+        total_reward += reward
+        
+        # Record position
+        if hasattr(env, 'state'):
+            positions.append(env.state.raw.pos_world[:2].copy())
+        
+        # Maintain real-time for smoother video
+        elapsed = time_module.time() - t0
+        sleep_time = max(0, cfg.control.dt * 0.5 - elapsed)
+        if sleep_time > 0:
+            time_module.sleep(sleep_time)
+        
+        if done or truncated:
+            print(f"Episode ended at step {step}")
+            break
+    
+    # Calculate distance traveled
+    distance = 0.0
+    if len(positions) > 1:
+        import numpy as np
+        positions = np.array(positions)
+        distance = np.linalg.norm(positions[-1] - positions[0])
+    
+    # Close environment (saves video)
+    env.close()
+    
+    # Find the saved video
+    video_path = None
+    try:
+        import glob
+        video_files = glob.glob(os.path.join(env_log_dir, "episode_*.mp4"))
+        if video_files:
+            video_path = max(video_files, key=os.path.getmtime)
+            # Rename to indicate it's an example
+            new_name = os.path.join(env_log_dir, "example_rollout.mp4")
+            os.rename(video_path, new_name)
+            video_path = new_name
+            print(f"Video saved: {video_path}")
+    except Exception as e:
+        print(f"Warning: Could not find/rename video: {e}")
+    
+    print(f"\nExample rollout metrics:")
+    print(f"  Total reward: {total_reward:.2f}")
+    print(f"  Distance traveled: {distance:.3f}m")
+    print(f"  Steps completed: {step + 1}")
+    print(f"{'=' * 60}\n")
+    
+    return {
+        'total_reward': total_reward,
+        'distance': distance,
+        'steps': step + 1,
+        'video_path': video_path,
+        'log_dir': env_log_dir,
+    }
+
+
 def main():
     """Main function to record robot rollouts in parallel."""
     # Initialize checkpoint manager
@@ -638,6 +748,16 @@ def main():
     except Exception as e:
         print(f"Error loading policy: {e}")
         return
+    
+    # Record example video if enabled (before batch collection)
+    if RECORD_EXAMPLE_VIDEO:
+        example_metrics = record_example_video(
+            model, 
+            config_name=CONFIG, 
+            n_steps=EXAMPLE_VIDEO_STEPS,
+            seed=SEED
+        )
+        print("Proceeding with batch collection...")
     
     # Create vectorized environment
     print(f"\nCreating {NUM_ENVS} parallel environments with config: {CONFIG}")
