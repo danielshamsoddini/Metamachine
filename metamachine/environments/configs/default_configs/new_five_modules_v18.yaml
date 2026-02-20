@@ -1,0 +1,256 @@
+# Athletic Quadruped Configuration v18
+# Extreme Wide
+morphology:
+  robot_type: modular_legs
+  configuration: [ 0,5,0,0,
+                   0,8,0,0,
+                   0,13,0,0,
+                   0,16,0,0 ]
+  asset_file: null
+
+pose_optimization:
+  enabled: true
+  drop_steps: 100
+  move_steps: 500
+  optimization_type: "stablefast"
+  load_pose: null
+
+environment:
+  num_envs: 1
+  mode: sim
+  frozen_joints: null
+  theta: 0.610865
+
+control:
+  dt: 0.02
+  num_actions: 5
+  action_scale: 1.0
+  symmetric_limit: 0.8
+  custom_limits: null
+  motor_range: [-6, 6]
+  filter:
+    enabled: true
+    cutoff_freq: 6.0
+  filter_action: true
+  melter:
+    enabled: false
+    axis: 3
+  action_melter: false
+  action_melter_axis: 3
+  action_remap_type: null
+  control_mode: position
+  default_dof_pos: [0,0,0,0,0]
+  kp: 20.0
+  kd: 0.5
+  remapping:
+    enabled: false
+    remap_type: null
+    remap_params: null
+
+observation:
+  # Observation components (unified from both configs)
+  torso_node_id: 0         # Reference node for observations/rewards
+  
+  # ============================================================
+  # FLAT OBSERVATION MODE (default)
+  # ============================================================
+  # Standard observation: all components concatenated into single vector
+  # components:
+  #   - name: projected_gravity
+  #   - name: ang_vel_body
+  #   - name: dof_pos
+  #     transform: cos
+  #   - name: dof_vel
+  #   - name: last_action
+
+  # ============================================================
+  # MODULAR OBSERVATION MODE (optional)
+  # ============================================================
+  # Enable this section to create per-module observations like:
+  #   obs = []
+  #   for i in range(N_MODULES):
+  #       module_obs = np.concatenate([
+  #           s.projected_gravities[i],
+  #           s.gyros[i],
+  #           s.dof_pos[i:i+1],
+  #           s.dof_vel[i:i+1]
+  #       ])
+  #       obs.append(module_obs)
+  #   obs = np.concatenate(obs)
+  #
+  # ============================================================
+  # MAIN MODULE MODE (alternative)
+  # ============================================================
+  # Set main_module_index to create observation with only one module's 
+  # proprioceptive data + global data:
+  #   obs = np.concatenate([
+  #       s.projected_gravities[i],  # Only main module i
+  #       s.gyros[i],                 # Only main module i
+  #       s.dof_pos,                  # ALL (global)
+  #       s.dof_vel,                  # ALL (global)
+  #       s.last_action               # ALL (global)
+  #   ])
+  #
+  modular:
+    enabled: true
+    num_modules: 5          # Number of modules, or "auto" to detect from num_actions
+    main_module_index: null    # Use only this module for per_module_components (set to null to use all modules)
+    
+    # Per-module components (use main_module_index when set, otherwise repeated for each module)
+    per_module_components:
+      - name: projected_gravities   # List-type: use index_type: element
+        index_type: element         # Access as data[i]
+      - name: gyros
+        index_type: element
+      - name: dof_pos
+        index_type: slice
+        slice_size: 1
+      - name: dof_vel
+        index_type: slice
+        slice_size: 1
+    
+    # Global components (added once at the end, not per-module)
+    global_components: []
+      # - name: last_action
+
+  # Observation processing
+  clip_observations: 100.0 # Unified value
+  include_history_steps: 1
+
+  # Reference vectors for reward calculations
+  forward_vec: [1, 0, 0]
+  gravity_vec: [0, 0, -1]
+  projected_forward_vec: [.0, 0.894996814873533, 0.4460725292665206]
+  projected_upward_vec: [0, -0.4460725292665206, 0.894996814873533]
+
+  speed_calculation_steps: 100
+
+task:
+  reward_components:
+    - name: locomotion_efficiency
+      type: windowed_displacement_efficiency
+      weight: 2.0
+      params:
+        window_size: 50
+        speed_weight: 1.5
+        efficiency_weight: 3.0
+        use_weld_cluster: true
+        target_speed: 1.0
+    - name: orientation
+      type: orientation_reward
+      weight: 0.1
+      params:
+        target_quat: [1, 0, 0, 0]
+    - name: smooth_motion
+      type: action_rate
+      weight: -0.005
+    - name: move_penalty
+      type: stillness_penalty
+      weight: 2.0
+      params:
+        threshold: 0.2
+
+  termination_conditions:
+    termination_strategy: ballance_auto
+    max_episode_steps: 1000
+    height_threshold: 0.25
+
+  commands:
+    resampling_interval: 200
+    dimensions:
+      forward_speed:
+        type: uniform
+        range: [0.0, 1.2]
+        initial_value: 0.8
+      turn_rate:
+        type: uniform
+        range: [-1.0, 1.0]
+        initial_value: 0.0
+
+simulation:
+  mj_dt: 0.005
+  render: true
+  render_size: [1024, 720]
+  tn_constraint: true
+  latency_scheme: -1
+  auto_generate_assets: false
+  random_latency_scheme: false
+  broken_motors: null
+  pyramidal_cone: false
+  terrain: null
+  terrain_params: null
+  reset_terrain: false
+  reset_terrain_type: null
+  reset_terrain_params: null
+  socks: null
+  add_scaffold_walls: false
+  noisy_observations: false
+  noisy_actions: false
+  render_mode: 'mp4'
+  video_path: null
+  video_fps: null
+  video_record_interval: 100000
+  video_name_pattern: "episode_{episode}_quadruped_v18"
+
+initialization:
+  init_pos: [-0, 0, 0.45]
+  init_quat: [0.94141482, -0.33129125,  0.05890461, -0.02268241]
+  init_qpos: null
+  init_joint_pos: null
+  noisy_init: true
+  randomize_orientation: true
+  fully_randomize_orientation: false
+  randomize_ini_vel: true
+
+randomization:
+  mass:
+    enabled: false
+    percentage: 0.1
+    offset: 0
+  friction:
+    enabled: true
+    range: [0.8, 1.2]
+    detailed_range: [[0.8, 1.0], [0.3, 0.5]]
+    rolling:
+      enabled: false
+      range: [0.0001, 0.0005]
+  damping:
+    enabled: false
+    range: [0.02, 0.2]
+    armature_range: [0.01, 0.05]
+  action_noise:
+    enabled: false
+    std: 0.1
+  observation_noise:
+    enabled: false
+    std: 0.2
+  pd_controller:
+    enabled: false
+    kp_range: [15, 25]
+    kd_range: [0.3, 0.8]
+  external_torque:
+    enabled: false
+    range: [0, 4]
+    bodies: [2]
+  external_force:
+    enabled: false
+    interval: 10
+    ranges: [[0, 4]]
+    bodies: ['l0']
+    positions: [[0,0,0]]
+    directions: [[0,0,0]]
+    durations: [10]
+  assemble_error: false
+  dof_pos:
+    enabled: false
+    range: [-1, 1]
+  init_joint_pos:
+    enabled: true
+
+logging:
+  create_log_dir: true
+  data_dir: null
+  robot_data_dir: auto
+  log_raw_data: false
+  log_sa_data: false
+  print_data: false

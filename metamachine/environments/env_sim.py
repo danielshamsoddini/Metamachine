@@ -1864,17 +1864,18 @@ class MetaMachine(Base, MujocoEnv):
         # Joint position randomization
         randomization_cfg = getattr(self.cfg, "randomization", {})
         dof_cfg = randomization_cfg.get("init_joint_pos", {})
-        if dof_cfg.get("enabled", False):
-            clip_actions = self.cfg.control.symmetric_limit  # type: ignore
-            joint_noise = self.np_random.uniform(
-                -clip_actions, clip_actions, self.num_joint
-            )
-            self.init_qpos[self.model.jnt_qposadr[self.joint_idx]] = (
-                self.default_dof_pos + joint_noise
-            )
-            # TODO: consider frozen joints
-        else:
-            self.init_qpos[self.model.jnt_qposadr[self.joint_idx]] = self.init_joint_pos
+        # if dof_cfg.get("enabled", False):
+        #     clip_actions = self.cfg.control.symmetric_limit  # type: ignore
+        #     joint_noise = self.np_random.uniform(
+        #         -clip_actions, clip_actions, self.num_joint
+        #     )
+        #     self.init_qpos[self.model.jnt_qposadr[self.joint_idx]] = (
+        #         self.default_dof_pos + joint_noise
+        #     )
+        #     # TODO: consider frozen joints
+        # else:
+
+        self.init_qpos[self.model.jnt_qposadr[self.joint_idx]] = self.init_joint_pos
 
     def _apply_initial_noise(self) -> np.ndarray:
         """Apply initial position noise."""

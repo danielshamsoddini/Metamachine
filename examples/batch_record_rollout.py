@@ -46,6 +46,7 @@ Copyright 2025 Chen Yu <chenyu@u.northwestern.edu>
 
 import sys
 import time
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -61,26 +62,28 @@ from metamachine.utils.rollout_recorder import RolloutRecorder
 # Model loading options
 MODEL = ["three_modules_run_policy", "quadruped_run_policy"][1]  # Name of registered model
 POLICY_PATH = None  # Path to local policy file (.pkl) - set MODEL to None if using this
+LOG_DIR = "logs/20260203_172228m"
+USE_OPTIMIZED_POSE = True
 
 # Environment options
 # CONFIG: Environment configuration for running the policy (observation format for policy)
 # RECORDING_CONFIG: Configuration defining what observations to record (for training)
 #   - Use this when policy was trained with one config but you want to record 
 #     observations in a different format (e.g., modular observations for transformer)
-CONFIG = ["example_three_modules", "basic_quadruped"][1]  # Env config for policy
-RECORDING_CONFIG = "modular_quadruped"  # Config for observation extractors (or None to use CONFIG)
+CONFIG = None
+RECORDING_CONFIG = None
 N_MODULES = 5  # Number of modules in the robot
 
 # Parallelization options
-NUM_ENVS = 10  # Number of parallel environments (reduced from 50 to avoid OOM)
+NUM_ENVS = 8  # Number of parallel environments (increased for faster collection)
 NUM_CPUS_PER_ENV = 0.2  # CPU resources per environment (fractional allows oversubscription)
 NUM_GPUS_PER_ENV = 0.0  # GPU resources per environment
-DEVICE = "cpu"  # Device for policy inference ("cuda:0" or "cpu")
+DEVICE = "cuda:0"  # Device for policy inference ("cuda:0" or "cpu")
 
 # Recording options
-NUM_EPISODES = 1000  # Total number of episodes to record
+NUM_EPISODES = 8000
 MAX_STEPS = 1000  # Maximum steps per episode
-OUTPUT = "batch_rollouts.pkl"  # Output file path
+OUTPUT = "v1_expert_data.pkl"
 OUTPUT_FORMAT = "pkl"  # Output format: "npz", "pkl", or "hdf5"
 RECORDING_COMPONENTS = ["accurate_vel_world"]  # State components to record
 
@@ -595,7 +598,7 @@ class StateSnapshotWrapper:
         return None
 
 
-def record_example_video(model, config_name: str, n_steps: int = 500, seed: int = 42):
+def record_example_video(model, cfg, n_steps: int = 500, seed: int = 42):
     """Record an example episode with video to verify trajectory quality.
     
     This runs a single environment (not parallelized) with video recording enabled
@@ -603,7 +606,7 @@ def record_example_video(model, config_name: str, n_steps: int = 500, seed: int 
     
     Args:
         model: The loaded policy model (CrossQ).
-        config_name: Environment configuration name.
+        cfg: Environment configuration.
         n_steps: Number of steps to record.
         seed: Random seed for reproducibility.
         
@@ -619,8 +622,7 @@ def record_example_video(model, config_name: str, n_steps: int = 500, seed: int 
     print("RECORDING EXAMPLE VIDEO")
     print(f"{'=' * 60}")
     
-    # Create environment with video recording
-    cfg = ConfigRegistry.create_from_name(config_name)
+    # Update configuration for video recording
     cfg.simulation.render = True
     cfg.simulation.render_mode = "mp4"
     cfg.simulation.video_record_interval = 1  # Record every episode
@@ -641,7 +643,7 @@ def record_example_video(model, config_name: str, n_steps: int = 500, seed: int 
         t0 = time_module.time()
         
         # Get action from policy (same as batch recording)
-        action = model.predict(obs)
+        action, _ = model.predict(obs)
         
         # Step environment
         obs, reward, done, truncated, info = env.step(action)
@@ -726,42 +728,99 @@ def main():
     from metamachine.environments.configs.config_registry import ConfigRegistry
     from metamachine.environments.vec_env import RayVecMetaMachine, StateSnapshot
     
-    # Resolve model path
+    # Create environment configuration (may be overridden by LOG_DIR)
+    if CONFIG is not None:
+        if os.path.exists(CONFIG):
+            cfg = ConfigRegistry.create_from_file(CONFIG)
+        else:
+            cfg = ConfigRegistry.create_from_name(CONFIG)
+    else:
+        cfg = None
+
+    # Resolve model and config path
     try:
-        if POLICY_PATH:
+        if LOG_DIR:
+            from metamachine.utils.sb3_utils import load_from_checkpoint
+            log_path = Path(LOG_DIR)
+            if not log_path.exists():
+                print(f"Error: Log directory not found: {LOG_DIR}")
+                return
+            
+            # Use a dummy environment to load the model
+            from metamachine.environments.configs.config_registry import ConfigRegistry
+            from metamachine.environments.env_sim import MetaMachine
+            
+            # Load config from log dir
+            config_path = log_path / "config.yaml"
+            if not config_path.exists():
+                print(f"Error: config.yaml not found in {LOG_DIR}")
+                return
+            
+            print(f"Loading environment config from: {config_path}")
+            cfg = ConfigRegistry.create_from_file(str(config_path))
+            
+            # Optionally use existing optimized pose from log dir
+            optimized_pose_path = log_path / "optimized_pose.yaml"
+            if USE_OPTIMIZED_POSE and optimized_pose_path.exists():
+                print(f"Loading existing optimized pose from: {optimized_pose_path}")
+                cfg.pose_optimization.enabled = True
+                cfg.pose_optimization.load_pose = str(optimized_pose_path)
+            else:
+                cfg.pose_optimization.load_pose = None
+            
+            # Load model (final_model.zip by default)
+            print(f"Loading SB3 model from log directory: {LOG_DIR}")
+            temp_env = MetaMachine(cfg)
+            from metamachine.utils.sb3_utils import _load_sb3_model, _resolve_checkpoint_path
+            checkpoint_path = _resolve_checkpoint_path(log_path, "final")
+            if not checkpoint_path:
+                print(f"Error: No model found in {LOG_DIR}")
+                return
+            model = _load_sb3_model(checkpoint_path, temp_env, device=DEVICE)
+            temp_env.close()
+            print("SB3 Model loaded successfully!")
+            
+        elif POLICY_PATH:
             model_path = Path(POLICY_PATH)
             if not model_path.exists():
                 print(f"Error: Policy file not found: {POLICY_PATH}")
                 return
             print(f"Using local policy file: {model_path}")
+            
+            # Load the trained policy
+            print(f"\nLoading policy from: {model_path}")
+            try:
+                model = CrossQ.load_pkl(str(model_path), env=None, device=DEVICE)
+                print("Policy loaded successfully!")
+            except Exception as e:
+                print(f"Error loading policy: {e}")
+                return
         else:
             model_path = checkpoint_manager.get_checkpoint(MODEL)
+            # Load the trained policy
+            print(f"\nLoading policy from: {model_path}")
+            try:
+                model = CrossQ.load_pkl(str(model_path), env=None, device=DEVICE)
+                print("Policy loaded successfully!")
+            except Exception as e:
+                print(f"Error loading policy: {e}")
+                return
     except Exception as e:
         print(f"Error resolving model: {e}")
-        return
-    
-    # Load the trained policy
-    print(f"\nLoading policy from: {model_path}")
-    try:
-        model = CrossQ.load_pkl(str(model_path), env=None, device=DEVICE)
-        print("Policy loaded successfully!")
-    except Exception as e:
-        print(f"Error loading policy: {e}")
         return
     
     # Record example video if enabled (before batch collection)
     if RECORD_EXAMPLE_VIDEO:
         example_metrics = record_example_video(
             model, 
-            config_name=CONFIG, 
+            cfg=cfg, 
             n_steps=EXAMPLE_VIDEO_STEPS,
             seed=SEED
         )
         print("Proceeding with batch collection...")
     
     # Create vectorized environment
-    print(f"\nCreating {NUM_ENVS} parallel environments with config: {CONFIG}")
-    cfg = ConfigRegistry.create_from_name(CONFIG)
+    print(f"\nCreating {NUM_ENVS} parallel environments")
     cfg.simulation.video_record_interval = None
     
     vec_env = RayVecMetaMachine(
@@ -830,7 +889,7 @@ def main():
     try:
         while recorder.num_episodes < NUM_EPISODES:
             # Policy inference (batch)
-            actions = model.predict(obs)
+            actions, _ = model.predict(obs)
             
             # Step all environments and get state snapshots
             next_obs, _, rewards, dones, infos, states = vec_env.step_with_states(actions)

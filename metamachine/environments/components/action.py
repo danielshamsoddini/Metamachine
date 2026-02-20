@@ -328,7 +328,8 @@ class ActionProcessor:
         # Action bounds and scaling
         self.scale = cfg.control.action_scale
         self.action_bounds = ActionBounds(
-            limit=cfg.control.symmetric_limit, custom_limits=cfg.control.custom_limits
+            limit=cfg.control.symmetric_limit,
+            custom_limits=cfg.control.get("custom_limits", None),
         )
 
         # Control settings

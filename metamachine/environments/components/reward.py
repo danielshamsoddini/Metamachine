@@ -461,6 +461,7 @@ class WindowedDisplacementEfficiencyComponent(RewardComponent):
         speed_weight = self.params.get("speed_weight", 1.0)
         efficiency_weight = self.params.get("efficiency_weight", 0.5)
         use_weld_cluster = self.params.get("use_weld_cluster", True)
+        target_speed = self.params.get("target_speed", 1.0)
         
         # Get current position
         if use_weld_cluster and state.mj_model is not None and state.mj_data is not None:
@@ -503,10 +504,19 @@ class WindowedDisplacementEfficiencyComponent(RewardComponent):
         speed = disp / time_elapsed if time_elapsed > 0 else 0.0
         
         # Efficiency = how straight / non-shaky the path is (0 to 1)
-        efficiency = disp / (path_len + 1e-6)
+        # Avoid high efficiency at very low movement (jitter)
+        if path_len < 1e-4:
+            efficiency = 0.0
+        else:
+            efficiency = disp / (path_len + 1e-6)
+        
+        # Normalize speed by target speed (clamped at 1.0)
+        speed_norm = np.clip(speed / target_speed, 0.0, 1.0)
         
         # Final reward: weighted combination of speed and efficiency
-        reward = speed_weight * speed + efficiency_weight * efficiency
+        # Crucially, efficiency is only rewarded if the robot is actually moving
+        # This prevents "standing still" or "vibrating in place" from getting efficiency reward
+        reward = speed_weight * speed_norm + efficiency_weight * efficiency * speed_norm
         
         return reward
 
@@ -625,6 +635,50 @@ class OneHotForwardComponent(RewardComponent):
         return np.exp(-lin_vel_error / tracking_sigma)
 
 
+class StillnessPenaltyComponent(RewardComponent):
+    """Penalizes when the forward velocity is below a threshold."""
+
+    def calculate(self, state, calculator) -> float:
+        threshold = self.params.get("threshold", 0.05)
+        # Get forward velocity in body frame
+        projected_forward_vel = np.dot(
+            state.accurate_vel_body, calculator.projected_forward_vec
+        )
+        if projected_forward_vel < threshold:
+            return -1.0
+        return 0.0
+
+
+class ConditionalGoStraightComponent(RewardComponent):
+    """Only rewards going straight if the robot is actually moving.
+    
+    Prevents reward hacking where the robot stands still to get free
+    'go straight' reward. Only gives directional stability reward when
+    forward velocity exceeds a minimum threshold.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        # Check if robot is moving forward
+        projected_forward_vel = np.dot(
+            state.accurate_vel_body, calculator.projected_forward_vec
+        )
+        min_speed = self.params.get("min_speed", 0.1)
+        
+        if projected_forward_vel < min_speed:
+            return 0.0  # No reward for directional stability if not moving
+        
+        # Normal go_straight logic (angular velocity tracking)
+        target_ang_vel = self.params.get("target_angular_velocity", 0.0)
+        tracking_sigma = self.params.get("tracking_sigma", 0.15)
+        
+        accurate_projected_gravity = quat_rotate_inverse(
+            state.accurate_quat, calculator.gravity_vec
+        )
+        projected_z_ang = np.dot(state.accurate_ang_vel_body, accurate_projected_gravity)
+        ang_vel_error = np.sum(np.square(target_ang_vel - projected_z_ang))
+        return np.exp(-ang_vel_error / tracking_sigma)
+
+
 # Component registry for easy lookup
 COMPONENT_REGISTRY = {
     "linear_velocity_tracking": LinearVelocityTrackingComponent,
@@ -650,6 +704,8 @@ COMPONENT_REGISTRY = {
     "windowed_displacement_efficiency": WindowedDisplacementEfficiencyComponent,
     "onehot_turning": OneHotTurningComponent,
     "onehot_forward": OneHotForwardComponent,
+    "stillness_penalty": StillnessPenaltyComponent,
+    "conditional_go_straight": ConditionalGoStraightComponent,
 }
 
 

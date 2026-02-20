@@ -200,7 +200,32 @@ def optimize_pose(
     seed: int = 0,
     log_dir: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Main pose optimization function."""
+    """Main pose optimization function.
+    
+    Args:
+        robot: Robot instance to optimize
+        drop_steps: Number of steps for initial drop simulation
+        move_steps: Number of steps for movement phase
+        optimization_type: Type of optimization. Options:
+            - "stablefast": Optimize for forward speed (default)
+            - "bigbase": Optimize for stable, wide base
+            - "hybrid": Two-stage optimization (bigbase -> stablefast)
+            - Other types: See calculate_optimization_score for full list
+        enable_progress_bar: Show progress bar
+        spine_assumption: Use spine-based local coordinates
+        seed: Random seed for reproducibility
+        log_dir: Directory to save optimization results
+    
+    Returns:
+        Dictionary with optimized pose parameters
+    """
+    
+    # Handle hybrid optimization (two-stage process)
+    if optimization_type == "hybrid":
+        return optimize_pose_hybrid(
+            robot, drop_steps, move_steps, enable_progress_bar, 
+            spine_assumption, seed, log_dir
+        )
 
     xml_string = robot.get_xml_string()
 
@@ -282,6 +307,138 @@ def optimize_pose(
         if enable_progress_bar:
             progress.stop()
 
+    return result
+
+
+def optimize_pose_hybrid(
+    robot: BaseRobot,
+    drop_steps: int = 150,
+    move_steps: int = 250,
+    enable_progress_bar: bool = True,
+    spine_assumption: bool = False,
+    seed: int = 0,
+    log_dir: Optional[str] = None,
+) -> dict[str, Any]:
+    """Two-stage hybrid pose optimization.
+    
+    Stage 1: Use bigbase to find a stable, wide-based configuration
+    Stage 2: From the best bigbase result, optimize for forward movement
+    
+    This combines the stability of bigbase with the mobility of stablefast.
+    """
+    print("[Hybrid Optimization] Stage 1: Finding stable base (bigbase)...")
+    
+    xml_string = robot.get_xml_string()
+    
+    # Stage 1: bigbase optimization (no movement)
+    mj_model, mjx_model, mjx_data, joint_geom_ids, joint_body_idx, joint_body_ids = (
+        setup_simulation(xml_string, seed)
+    )
+    
+    mjx_data, joint_pos, rand_key = initialize_batch_poses(
+        mjx_data, mj_model, seed, spine_assumption
+    )
+    
+    # Total steps for both stages
+    stage1_steps = drop_steps
+    stage2_steps = move_steps
+    total_steps = stage1_steps + stage2_steps
+    
+    progress = Progress()
+    task = progress.add_task("[cyan]Hybrid optimization (Stage 1/2)...", total=total_steps)
+    if enable_progress_bar:
+        progress.start()
+    
+    try:
+        # Stage 1: Drop simulation
+        mjx_data = run_drop_simulation(
+            mjx_model, mjx_data, joint_pos, stage1_steps, progress, task
+        )
+        
+        # Extract stable metrics
+        stable_qpos_stage1 = mjx_data.qpos.copy()
+        default_joint_pos_stage1 = joint_pos.copy()
+        
+        stable_metrics_stage1 = extract_stable_metrics(
+            mjx_data, mj_model, joint_geom_ids, joint_body_ids, spine_assumption
+        )
+        
+        # Score with bigbase criteria
+        movement_metrics_dummy = {
+            "avg_vel": jnp.zeros((mjx_data.qpos.shape[0], 2)),
+            "avg_speed": jnp.zeros(mjx_data.qpos.shape[0]),
+            "avg_projected_vel": jnp.zeros(mjx_data.qpos.shape[0]),
+            "fall_down": jnp.zeros(mjx_data.qpos.shape[0], dtype=bool),
+        }
+        
+        bigbase_score = calculate_optimization_score(
+            "bigbase", movement_metrics_dummy, stable_metrics_stage1, 0
+        )
+        
+        # Select top candidates from Stage 1 (e.g., top 10% or top 512)
+        top_k = min(512, max(1, mjx_data.qpos.shape[0] // 8))
+        top_indices = jnp.argsort(bigbase_score)[-top_k:]
+        
+        print(f"[Hybrid Optimization] Stage 1 complete. Top score: {jnp.max(bigbase_score):.3f}")
+        print(f"[Hybrid Optimization] Stage 2: Optimizing top {top_k} for movement (stablefast)...")
+        
+        # Stage 2: Movement optimization from best stable poses
+        mjx_data_top = jax.tree_map(lambda x: x[top_indices], mjx_data)
+        default_joint_pos_top = default_joint_pos_stage1[top_indices]
+        
+        # Run movement phase on selected poses
+        movement_metrics_stage2 = run_movement_phase(
+            mjx_model,
+            mjx_data_top,
+            default_joint_pos_top,
+            stage2_steps,
+            joint_body_idx,
+            spine_assumption,
+            stable_metrics_stage1.get("spine_local_forward"),
+            stable_metrics_stage1.get("spine_local_upward"),
+            stable_metrics_stage1.get("projected_upward"),
+            progress,
+            task,
+        )
+        
+        # Re-extract stable metrics for top candidates
+        stable_metrics_stage2 = {
+            k: v[top_indices] if isinstance(v, jnp.ndarray) else v
+            for k, v in stable_metrics_stage1.items()
+        }
+        
+        # Score with stablefast criteria
+        stablefast_score = calculate_optimization_score(
+            "stablefast", movement_metrics_stage2, stable_metrics_stage2, stage2_steps
+        )
+        
+        print(f"[Hybrid Optimization] Stage 2 complete. Top score: {jnp.max(stablefast_score):.3f}")
+        
+        # Extract best result from Stage 2
+        stable_qpos_top = mjx_data_top.qpos.copy()
+        
+        result = extract_best_result(
+            stablefast_score,
+            stable_qpos_top,
+            default_joint_pos_top,
+            movement_metrics_stage2,
+            stable_metrics_stage2,
+            spine_assumption,
+            log_dir,
+        )
+        
+        # Add hybrid-specific metadata
+        result["optimization_type"] = "hybrid"
+        result["stage1_score"] = float(jnp.max(bigbase_score))
+        result["stage2_score"] = float(jnp.max(stablefast_score))
+        
+    except KeyboardInterrupt:
+        print("\n\nHybrid optimization interrupted by user (Ctrl+C).")
+        raise
+    finally:
+        if enable_progress_bar:
+            progress.stop()
+    
     return result
 
 

@@ -1,4 +1,4 @@
-# Basic Quadruped Configuration
+# Basic Quadruped Configuration (Variation 2)
 #
 # This configuration defines a standard 4-legged robot setup for reinforcement
 # learning and simulation. It includes all necessary parameters for:
@@ -17,17 +17,17 @@
 morphology:
   robot_type: modular_legs    # Robot type (modular_legs for basic usage)
   configuration: [ 0,1,0,0,    # [Parent module ID, parent position ID, child position ID, rotation ID]
-               0,3,0,0,
-               0,13,0,0,
-               0,15,0,0 ]
+               0,2,0,0,
+               0,8,0,0,
+               0,13,0,0 ]
   asset_file: null
 
 pose_optimization:
-  enabled: false              # Disable pose optimization for basic usage
+  enabled: true              # Disable pose optimization for basic usage
   drop_steps: 100        #
   move_steps: 500
   optimization_type: "stablefast"
-  load_pose: false
+  load_pose: null
 
 
 environment:
@@ -251,8 +251,8 @@ simulation:
   # Video configuration (only used when render_mode: 'mp4')
   video_path: null
   video_fps: null
-  video_record_interval: 100  # Record every 3rd episode
-  video_name_pattern: "episode_{episode}_quadruped"  # Name pattern with episode number
+  video_record_interval: 100 # Record every 100000 episodes
+  video_name_pattern: "episode_{episode}_quadruped_v2"  # Name pattern with episode number
 
 # Initialization Settings
 initialization:
@@ -336,3 +336,4 @@ logging:
   log_raw_data: false
   log_sa_data: false
   print_data: false
+

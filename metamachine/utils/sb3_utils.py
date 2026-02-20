@@ -742,6 +742,18 @@ def load_from_checkpoint(
         cfg.simulation.render = render_mode != "none"
         # Disable video recording during playback
         cfg.simulation.video_record_interval = 0
+
+    # Automatically load optimized pose if it exists in the log directory
+    optimized_pose_path = log_path / "optimized_pose.yaml"
+    if optimized_pose_path.exists():
+        if not hasattr(cfg, "pose_optimization"):
+            cfg.pose_optimization = OmegaConf.create(
+                {"enabled": True, "load_pose": str(optimized_pose_path)}
+            )
+        else:
+            cfg.pose_optimization.enabled = True
+            cfg.pose_optimization.load_pose = str(optimized_pose_path)
+        print(f"[Checkpoint] Found optimized_pose.yaml, enabling pose loading")
     
     # Create environment
     if real_robot:
@@ -1516,6 +1528,18 @@ def continue_training(
     cfg.simulation.render_mode = render_mode
     cfg.simulation.render = render_mode != "none"
     cfg.simulation.video_record_interval = 100 if render_mode == "mp4" else 0
+
+    # Automatically load optimized pose if it exists in the log directory
+    optimized_pose_path = log_path / "optimized_pose.yaml"
+    if optimized_pose_path.exists():
+        if not hasattr(cfg, "pose_optimization"):
+            cfg.pose_optimization = OmegaConf.create(
+                {"enabled": True, "load_pose": str(optimized_pose_path)}
+            )
+        else:
+            cfg.pose_optimization.enabled = True
+            cfg.pose_optimization.load_pose = str(optimized_pose_path)
+        print(f"[Config] Found optimized_pose.yaml, enabling pose loading")
     
     # Generate experiment name
     if exp_name is None:

@@ -1,4 +1,4 @@
-# Basic Quadruped Configuration
+# Basic Quadruped Configuration (Variation 6)
 #
 # This configuration defines a standard 4-legged robot setup for reinforcement
 # learning and simulation. It includes all necessary parameters for:
@@ -16,18 +16,18 @@
 
 morphology:
   robot_type: modular_legs    # Robot type (modular_legs for basic usage)
-  configuration: [ 0,1,0,0,    # [Parent module ID, parent position ID, child position ID, rotation ID]
-               0,3,0,0,
-               0,13,0,0,
-               0,15,0,0 ]
+  configuration: [ 0,3,0,0,    # [Parent module ID, parent position ID, child position ID, rotation ID]
+                   0,4,0,0,
+                   0,14,0,0,
+                   0,15,0,0 ]
   asset_file: null
 
 pose_optimization:
-  enabled: false              # Disable pose optimization for basic usage
+  enabled: true              # Disable pose optimization for basic usage
   drop_steps: 100        #
   move_steps: 500
   optimization_type: "stablefast"
-  load_pose: false
+  load_pose: null
 
 
 environment:
@@ -67,7 +67,7 @@ control:
 
   # Control mode settings
   control_mode: position
-  default_dof_pos: [0,-1.,1.,1.,-1.]       # Keep for backward compatibility
+  default_dof_pos: [0,0,0,0,0]       # Keep for backward compatibility
 
   # PD Controller parameters
   kp: 8.0                  # Proportional gain
@@ -77,6 +77,50 @@ control:
     enabled: false         # Disable remapping by default
     remap_type: null       # No remapping type specified
     remap_params: null     # No remap parameters specified
+
+  # ============================================================
+  # PER-JOINT CONTROL MODE (for mixed position/velocity control)
+  # ============================================================
+  # This feature allows different joints to use different control modes.
+  # Useful for robots with wheels (velocity-controlled) and legs (position-controlled).
+  #
+  # When a joint is configured as a "wheel":
+  #   - Its kp is set to 0 (no position tracking)
+  #   - Its kd is set higher (for velocity control)
+  #   - The action for that joint is interpreted as velocity target
+  #
+  # per_joint_control:
+  #   enabled: false          # Enable per-joint control modes
+  #   
+  #   # Wheel joints configuration (velocity-controlled joints)
+  #   # These joints will have kp=0 and use velocity control
+  #   wheel_joints:
+  #     indices: []           # Joint indices that are wheels, e.g., [2, 4]
+  #     kd: 2.0               # kd for wheel joints (higher for velocity control)
+  #     default_velocity: 0.0 # Default target velocity when action is 0
+  #     action_scale: 1.0     # Optional: different action scale for wheel joints
+  #   
+  #   # Alternative: Fine-grained per-joint configuration
+  #   # If specified, these override global kp/kd and wheel_joints config
+  #   # per_joint_kp: [8.0, 8.0, 0.0, 8.0, 0.0]    # kp per joint
+  #   # per_joint_kd: [0.2, 0.2, 2.0, 0.2, 2.0]    # kd per joint
+  #   # per_joint_mode: ["position", "position", "velocity", "position", "velocity"]
+  #   per_joint_kp: null
+  #   per_joint_kd: null
+  #   per_joint_mode: null
+
+  # ============================================================
+  # OBSERVATION MASKING (for joints without full encoder data)
+  # ============================================================
+  # Useful for wheel joints where position encoder data may be unavailable
+  # or meaningless (continuous rotation). Allows excluding specific joints
+  # from dof_pos and/or dof_vel observations.
+  #
+  # obs_masking:
+  #   enabled: false          # Enable observation masking
+  #   exclude_joints:
+  #     dof_pos: []           # Joint indices to exclude from dof_pos, e.g., [2, 4]
+  #     dof_vel: []           # Joint indices to exclude from dof_vel
 
 # State Observation
 observation:
@@ -161,29 +205,32 @@ observation:
 task:
   # Reward components (unified structure with both styles)
   reward_components:
-    - name: forward_velocity
-      type: linear_velocity_tracking
-      weight: 0.7
+    - name: locomotion_efficiency
+      type: windowed_displacement_efficiency
+      weight: 1.5
       params:
-        target_velocity: 0.6
-        tracking_sigma: 0.15
+        window_size: 100
+        speed_weight: 1.0
+        efficiency_weight: 2.0
+        use_weld_cluster: true
 
-    - name: go_straight
-      type: angular_velocity_tracking
-      weight: 0.3
+    - name: orientation
+      type: orientation_reward
+      weight: 0.05
+
+    - name: smooth_motion
+      type: action_rate
+      weight: -0.01
+
+    - name: move_penalty
+      type: stillness_penalty
+      weight: 0.2
       params:
-        target_angular_velocity: 0.0
-        tracking_sigma: 0.15
+        threshold: 0.1
 
     # - name: energy_penalty
     #   type: action_rate
     #   weight: -0.01
-
-    - name: move_penalty
-      type: stillness_penalty
-      weight: 0.1
-      params:
-        threshold: 0.1
     # Alternative detailed reward structure (commented for basic usage)
     # - name: "velocity_tracking"
     #   type: "linear_velocity_tracking"
@@ -251,8 +298,8 @@ simulation:
   # Video configuration (only used when render_mode: 'mp4')
   video_path: null
   video_fps: null
-  video_record_interval: 100  # Record every 3rd episode
-  video_name_pattern: "episode_{episode}_quadruped"  # Name pattern with episode number
+  video_record_interval: 100000  # Record every 100000 episodes
+  video_name_pattern: "episode_{episode}_quadruped_v6"  # Name pattern with episode number
 
 # Initialization Settings
 initialization:
