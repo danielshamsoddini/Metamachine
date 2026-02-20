@@ -161,22 +161,25 @@ class RobotMorphology:
             RobotMorphology instance
         """
 
-        if isinstance(seq[0], int):
-            if not seq:
-                return cls()
+        if seq:
+            if isinstance(seq[0], int):
+                if not seq:
+                    return cls()
 
-            if len(seq) % 4 != 0:
-                raise ValueError(
-                    f"Sequence length must be a multiple of 4, got {len(seq)}"
-                )
+                if len(seq) % 4 != 0:
+                    raise ValueError(
+                        f"Sequence length must be a multiple of 4, got {len(seq)}"
+                    )
 
-            connections = []
-            for i in range(0, len(seq), 4):
-                connections.append(ModuleConnection.from_sequence(seq[i : i + 4]))
-        elif isinstance(seq[0], ModuleConnection):
-            connections = seq
+                connections = []
+                for i in range(0, len(seq), 4):
+                    connections.append(ModuleConnection.from_sequence(seq[i : i + 4]))
+            elif isinstance(seq[0], ModuleConnection):
+                connections = seq
+            else:
+                raise ValueError(f"Invalid sequence type: {type(seq[0])}")
         else:
-            raise ValueError(f"Invalid sequence type: {type(seq[0])}")
+            connections = []
 
         return cls(connections)
 

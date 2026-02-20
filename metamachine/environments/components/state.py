@@ -168,11 +168,15 @@ class DerivedState:
     projected_gravities: np.ndarray = field(default_factory=lambda: np.zeros((1, 3)))
     heading: np.ndarray = field(default_factory=lambda: np.zeros(1))
     speed: np.ndarray = field(default_factory=lambda: np.zeros(1))
+    local_vel_xy: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    yaw_rate: np.ndarray = field(default_factory=lambda: np.zeros(1))
 
     def __init__(self, num_dof: int = 1) -> None:
         """Initialize DerivedState with specified number of degrees of freedom."""
         self.projected_gravities = np.zeros((num_dof, 3))
         self.projected_gravity = np.zeros(3)
+        self.local_vel_xy = np.zeros(2)
+        self.yaw_rate = np.zeros(1)
 
     def __post_init__(self) -> None:
         """Store initial shapes for validation."""
@@ -526,6 +530,8 @@ class State:
         "height": lambda s: s.derived.height,
         "heading": lambda s: s.derived.heading,
         "speed": lambda s: s.derived.speed,
+        "local_vel_xy": lambda s: s.derived.local_vel_xy,
+        "yaw_rate": lambda s: s.derived.yaw_rate,
         # Simulation-specific components (will return None if not available)
         "mj_data": lambda s: getattr(s, "mj_data", None),
         "mj_model": lambda s: getattr(s, "mj_model", None),
@@ -1405,6 +1411,26 @@ class State:
         self.derived.heading = np.expand_dims(
             np.arctan2(forward[1], forward[0]), axis=0
         )
+
+        # Local planar velocity (in heading-aligned frame, not body frame)
+        heading = float(self.derived.heading[0])
+        forward_xy = np.array([np.cos(heading), np.sin(heading)], dtype=np.float32)
+        right_xy = np.array([-forward_xy[1], forward_xy[0]], dtype=np.float32)
+        vel_world = self.accurate.vel_world if self.accurate.vel_world is not None else self.raw.vel_world
+        vel_world = np.asarray(vel_world) if vel_world is not None else np.zeros(3)
+        vel_xy = vel_world[:2]
+        local_vx = float(np.dot(vel_xy, forward_xy))
+        local_vy = float(np.dot(vel_xy, right_xy))
+        self.derived.local_vel_xy = np.array([local_vx, local_vy], dtype=np.float32)
+
+        # Yaw rate around gravity-aligned up axis
+        ang_vel_body = self.accurate.ang_vel_body if self.accurate.ang_vel_body is not None else self.raw.ang_vel_body
+        if self.accurate.quat is not None:
+            projected_gravity = quat_rotate_inverse(self.accurate.quat, self.gravity_vec)
+        else:
+            projected_gravity = self.derived.projected_gravity
+        yaw_rate = float(np.dot(-projected_gravity, np.asarray(ang_vel_body)))
+        self.derived.yaw_rate = np.array([yaw_rate], dtype=np.float32)
 
         # Speed (using position history)
         if len(self.pos_history) >= 2:

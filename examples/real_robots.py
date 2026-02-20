@@ -11,6 +11,7 @@ Features:
 - Supports passive sensor modules (e.g., dedicated distance sensors)
 - Configurable global state sources (main IMU, goal distance)
 - Optional Rich dashboard for real-time monitoring
+- Optional MuJoCo viewer to visualize robot orientation in real-time
 - Multi-model support for A/B testing and comparison
 - Keyboard controls: e=enable, d=disable, r=restart, c=calibrate, q=quit
 
@@ -23,6 +24,11 @@ Usage:
     
     # With sinusoidal test motion
     python examples/real_robots.py --test-motion
+    
+    # With MuJoCo viewer (shows robot orientation from IMU)
+    python examples/real_robots.py --viewer
+    python examples/real_robots.py --test-motion --viewer
+    python examples/real_robots.py --log-dir logs/experiment --viewer
     
     # Load and run a trained policy
     python examples/real_robots.py --policy path/to/policy.pt
@@ -103,11 +109,18 @@ Examples:
     # Run sinusoidal test motion
     python real_robots.py --test-motion --amplitude 0.5 --frequency 0.3
     
+    # Run with MuJoCo viewer (visualize robot orientation)
+    python real_robots.py --viewer
+    python real_robots.py --test-motion --viewer
+    
     # Run with trained policy
     python real_robots.py --policy logs/experiment/policy.pt
     
     # Load from training log with custom module IDs
     python real_robots.py --log-dir logs/20251228_223556l_lego_tripod --module-ids 5 21 16
+    
+    # Load from training log with viewer
+    python real_robots.py --log-dir logs/experiment --module-ids 5 21 16 --viewer
     
     # Load from training log with sensor modules
     python real_robots.py --log-dir logs/experiment --module-ids 5 21 16 --sensor-module-ids 100
@@ -220,6 +233,19 @@ Keyboard Controls (during operation):
         type=float,
         default=None,
         help="Run duration in seconds (None = run until quit)"
+    )
+    
+    parser.add_argument(
+        "--viewer",
+        action="store_true",
+        help="Enable MuJoCo viewer to visualize robot orientation in real-time"
+    )
+    
+    parser.add_argument(
+        "--viewer-config",
+        type=str,
+        default=None,
+        help="Config for viewer simulation (uses real robot config if not specified)"
     )
     
     return parser.parse_args()
@@ -622,6 +648,157 @@ def run_idle(env, duration: float = None):
 
 
 # =============================================================================
+# Viewer-Enhanced Run Functions
+# =============================================================================
+
+def run_sinusoidal_test_with_viewer(env, amplitude: float, frequency: float, 
+                                     duration: float = None, viewer_config=None):
+    """Run sinusoidal test motion with viewer."""
+    from metamachine.utils.viewer_utils import run_with_viewer
+    
+    num_actions = env.action_space.shape[0]
+    start_time = time.time()
+    
+    def action_fn(obs, step_count):
+        elapsed = time.time() - start_time
+        phase = 2 * np.pi * frequency * elapsed
+        
+        # Create action with phase offset per motor for gait-like motion
+        action = np.zeros(num_actions)
+        for i in range(num_actions):
+            phase_offset = (2 * np.pi * i) / num_actions
+            action[i] = amplitude * np.sin(phase + phase_offset)
+        
+        return action
+    
+    print(f"Sinusoidal Test: amplitude={amplitude}, frequency={frequency}")
+    run_with_viewer(env, action_fn, duration, viewer_config)
+
+
+def run_policy_with_viewer(env, policy, duration: float = None, viewer_config=None):
+    """Run PyTorch policy with viewer."""
+    import torch
+    from metamachine.utils.viewer_utils import run_with_viewer
+    
+    def action_fn(obs, step_count):
+        with torch.no_grad():
+            obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
+            action = policy(obs_tensor)
+            if hasattr(action, 'numpy'):
+                action = action.numpy()
+            action = action.squeeze()
+        return action
+    
+    print("Running trained policy with viewer")
+    run_with_viewer(env, action_fn, duration, viewer_config)
+
+
+def run_sb3_policy_with_viewer(env, model, duration: float = None, 
+                                deterministic: bool = True, viewer_config=None):
+    """Run SB3 policy with viewer."""
+    from metamachine.utils.viewer_utils import run_with_viewer
+    
+    def action_fn(obs, step_count):
+        action, _ = model.predict(obs, deterministic=deterministic)
+        return action
+    
+    print(f"Running SB3 policy with viewer (deterministic={deterministic})")
+    run_with_viewer(env, action_fn, duration, viewer_config)
+
+
+def run_sb3_policy_multi_with_viewer(env, runner, duration: float = None,
+                                      deterministic: bool = True, viewer_config=None):
+    """Run multiple SB3 policies with viewer and runtime switching."""
+    from metamachine.utils.viewer_utils import run_with_viewer
+    
+    # Register model runner with environment for keyboard handling
+    env.model_runner = runner
+    
+    # Update dashboard with initial model info
+    if hasattr(env, '_update_dashboard_model'):
+        env._update_dashboard_model()
+    
+    def action_fn(obs, step_count):
+        action, _ = runner.predict(obs, deterministic=deterministic)
+        return action
+    
+    print(f"Running multi-model policy with viewer (models={runner.num_models})")
+    try:
+        run_with_viewer(env, action_fn, duration, viewer_config)
+    finally:
+        env.model_runner = None
+
+
+def run_idle_with_viewer(env, duration: float = None, viewer_config=None):
+    """Run in idle mode with viewer (no automatic motion)."""
+    from metamachine.utils.viewer_utils import run_with_viewer
+    
+    num_actions = env.action_space.shape[0]
+    
+    def action_fn(obs, step_count):
+        return np.zeros(num_actions)
+    
+    print("Idle mode with viewer - monitoring orientation only")
+    run_with_viewer(env, action_fn, duration, viewer_config)
+
+
+def run_idle(env, duration: float = None):
+    """Run in idle mode - just monitor modules without motion.
+    
+    Useful for testing connectivity and calibration.
+    """
+    print("\n" + "=" * 60)
+    print("Idle Mode - Monitoring Only")
+    print("=" * 60)
+    print("  Motors will not move automatically")
+    print("  Use this mode for connectivity testing and calibration")
+    print("=" * 60)
+    print("\nControls:")
+    print("  e - Enable motors")
+    print("  d - Disable motors")
+    print("  r - Restart motors")
+    print("  c - Calibrate motors")
+    print("  s - Print status")
+    print("  q - Quit")
+    
+    # Reset environment
+    obs, info = env.reset()
+    
+    start_time = time.time()
+    step_count = 0
+    
+    try:
+        while True:
+            elapsed = time.time() - start_time
+            
+            if duration is not None and elapsed >= duration:
+                print(f"\n[Done] Reached duration limit ({duration}s)")
+                break
+            
+            # Send zero action to maintain communication
+            num_actions = env.action_space.shape[0]
+            action = np.zeros(num_actions)
+            
+            obs, reward, done, truncated, info = env.step(action)
+            step_count += 1
+            
+            # Handle special keyboard input for status
+            if hasattr(env, 'input_key') and env.input_key == 's':
+                env.print_status()
+                env.input_key = ""
+            
+            if done or truncated:
+                obs, info = env.reset()
+    
+    except KeyboardInterrupt:
+        print("\n[Interrupted]")
+    
+    finally:
+        elapsed = time.time() - start_time
+        print(f"\nIdle mode ended: {step_count} steps in {elapsed:.1f}s")
+
+
+# =============================================================================
 # Main Entry Point
 # =============================================================================
 
@@ -682,7 +859,16 @@ def main():
                 return
             
             try:
-                run_sb3_policy_multi(env, runner, duration=args.duration)
+                if args.viewer:
+                    # Use viewer-enhanced version
+                    run_sb3_policy_multi_with_viewer(
+                        env, runner, 
+                        duration=args.duration,
+                        viewer_config=args.viewer_config
+                    )
+                else:
+                    # Standard version without viewer
+                    run_sb3_policy_multi(env, runner, duration=args.duration)
             finally:
                 print("\nCleaning up...")
                 env.close()
@@ -721,11 +907,24 @@ def main():
                     cfg.real.enable_dashboard = False
             
             try:
-                if model is not None:
-                    run_sb3_policy(env, model, duration=args.duration)
+                if args.viewer:
+                    # Use viewer-enhanced version
+                    if model is not None:
+                        run_sb3_policy_with_viewer(
+                            env, model, 
+                            duration=args.duration,
+                            viewer_config=args.viewer_config
+                        )
+                    else:
+                        print("No model found in log directory. Running idle mode with viewer.")
+                        run_idle_with_viewer(env, duration=args.duration, viewer_config=args.viewer_config)
                 else:
-                    print("No model found in log directory. Running idle mode.")
-                    run_idle(env, duration=args.duration)
+                    # Standard version without viewer
+                    if model is not None:
+                        run_sb3_policy(env, model, duration=args.duration)
+                    else:
+                        print("No model found in log directory. Running idle mode.")
+                        run_idle(env, duration=args.duration)
             finally:
                 print("\nCleaning up...")
                 env.close()
@@ -752,25 +951,43 @@ def main():
     try:
         if args.test_motion:
             # Run sinusoidal test motion
-            run_sinusoidal_test(
-                env,
-                amplitude=args.amplitude,
-                frequency=args.frequency,
-                duration=args.duration
-            )
+            if args.viewer:
+                run_sinusoidal_test_with_viewer(
+                    env,
+                    amplitude=args.amplitude,
+                    frequency=args.frequency,
+                    duration=args.duration,
+                    viewer_config=args.viewer_config
+                )
+            else:
+                run_sinusoidal_test(
+                    env,
+                    amplitude=args.amplitude,
+                    frequency=args.frequency,
+                    duration=args.duration
+                )
         
         elif args.policy:
             # Load and run policy
             policy = load_policy(args.policy, env)
             if policy is not None:
-                run_policy(env, policy, duration=args.duration)
+                if args.viewer:
+                    run_policy_with_viewer(env, policy, duration=args.duration, viewer_config=args.viewer_config)
+                else:
+                    run_policy(env, policy, duration=args.duration)
             else:
                 print("Failed to load policy. Running idle mode instead.")
-                run_idle(env, duration=args.duration)
+                if args.viewer:
+                    run_idle_with_viewer(env, duration=args.duration, viewer_config=args.viewer_config)
+                else:
+                    run_idle(env, duration=args.duration)
         
         else:
             # Run idle mode (monitoring only)
-            run_idle(env, duration=args.duration)
+            if args.viewer:
+                run_idle_with_viewer(env, duration=args.duration, viewer_config=args.viewer_config)
+            else:
+                run_idle(env, duration=args.duration)
     
     finally:
         # Cleanup

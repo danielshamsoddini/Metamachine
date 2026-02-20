@@ -625,6 +625,107 @@ class OneHotForwardComponent(RewardComponent):
         return np.exp(-lin_vel_error / tracking_sigma)
 
 
+class StateCoveringIntrinsicRewardComponent(RewardComponent):
+    """
+    Intrinsic reward for state-covering skill discovery via RND.
+    
+    This component loads a pre-trained RNDCollection (trained on rollouts from
+    existing policies) and computes an intrinsic reward that encourages the
+    new policy to visit states different from all existing policies.
+    
+    Based on the ReST (Recurrent Skill Training) approach:
+        reward = -log( (1/K) * sum_k exp(-alpha * rnd_error_k) )
+    
+    Where rnd_error_k is the RND prediction error for policy k.
+    - When the current state is similar to states visited by existing policies,
+      the RND error is LOW → reward is LOW (discouraged)
+    - When the current state is novel (not visited by any existing policy),
+      the RND error is HIGH → reward is HIGH (encouraged)
+    
+    Parameters (in params dict):
+        rnd_collection_dir: Path to the saved RNDCollection directory (required)
+        device: Device for RND inference (default: "cpu")
+        reward_scale: Multiplier for the intrinsic reward (default: 1.0)
+        reward_clip: Maximum reward value for clipping (default: 10.0)
+    
+    Example YAML configuration:
+        - name: state_covering
+          type: state_covering_intrinsic
+          weight: 1.0
+          params:
+            rnd_collection_dir: "rnd_models"
+            device: "cpu"
+            reward_scale: 1.0
+            reward_clip: 10.0
+    """
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self._rnd_collection = None
+        self._obs_dim = None
+
+    def _ensure_loaded(self) -> None:
+        """Lazy-load the RND collection on first use."""
+        if self._rnd_collection is not None:
+            return
+
+        from ...utils.rnd import RNDCollection
+
+        rnd_dir = self.params.get("rnd_collection_dir")
+        if rnd_dir is None:
+            raise ValueError(
+                "StateCoveringIntrinsicRewardComponent requires "
+                "'rnd_collection_dir' parameter pointing to a saved RNDCollection."
+            )
+
+        device = self.params.get("device", "cpu")
+        self._rnd_collection = RNDCollection.load(rnd_dir, device=device)
+        self._obs_dim = self._rnd_collection.obs_dim
+        print(f"[StateCovering] Loaded RNDCollection with "
+              f"{self._rnd_collection.num_policies} policies, "
+              f"obs_dim={self._obs_dim}")
+
+    def calculate(self, state, calculator) -> float:
+        """Calculate intrinsic reward based on state novelty.
+        
+        Uses the full (stacked) observation from the environment to compute
+        the RND-based intrinsic reward.
+        """
+        self._ensure_loaded()
+
+        import torch
+
+        # Get the current observation from the state
+        # Use the raw observation (before history stacking) for RND
+        obs = state._construct_observation()
+        obs_tensor = torch.tensor(
+            obs, dtype=torch.float32
+        ).unsqueeze(0)
+
+        # Handle dimension mismatch (e.g., if observation stacking is used)
+        if obs_tensor.shape[-1] > self._obs_dim:
+            # Take only the last obs_dim elements (most recent frame)
+            obs_tensor = obs_tensor[:, -self._obs_dim:]
+        elif obs_tensor.shape[-1] < self._obs_dim:
+            # Pad with zeros if needed
+            padding = torch.zeros(1, self._obs_dim - obs_tensor.shape[-1])
+            obs_tensor = torch.cat([obs_tensor, padding], dim=-1)
+
+        reward = self._rnd_collection.get_intrinsic_reward(obs_tensor)
+        reward_val = reward.item()
+
+        # Apply scaling and clipping
+        reward_scale = self.params.get("reward_scale", 1.0)
+        reward_clip = self.params.get("reward_clip", 10.0)
+        reward_val = np.clip(reward_val * reward_scale, -reward_clip, reward_clip)
+
+        return reward_val
+
+    def reset(self) -> None:
+        """Reset is a no-op for this component (RND collection persists)."""
+        pass
+
+
 # Component registry for easy lookup
 COMPONENT_REGISTRY = {
     "linear_velocity_tracking": LinearVelocityTrackingComponent,
@@ -650,6 +751,7 @@ COMPONENT_REGISTRY = {
     "windowed_displacement_efficiency": WindowedDisplacementEfficiencyComponent,
     "onehot_turning": OneHotTurningComponent,
     "onehot_forward": OneHotForwardComponent,
+    "state_covering_intrinsic": StateCoveringIntrinsicRewardComponent,
 }
 
 
