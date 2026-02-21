@@ -118,7 +118,10 @@ def compute_world_pose(body_chain):
     # Start from the root and work down (reverse order)
     for body in reversed(body_chain):
         pos, quat = parse_pos_quat(body)
-        world_pos, world_quat = transform_pose(world_pos, world_quat, pos, quat)
+        # transform_pose(pos, quat, parent_pos, parent_quat) computes:
+        #   world_pos = parent_pos + R_parent @ pos
+        # So we pass the body's local pos/quat first, then the current world frame as parent.
+        world_pos, world_quat = transform_pose(pos, quat, world_pos, world_quat)
     
     return world_pos, world_quat
 
