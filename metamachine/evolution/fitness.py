@@ -117,32 +117,46 @@ class FitnessComponent(ABC):
 
 class DisplacementFitnessComponent(FitnessComponent):
     """
-    Measures how far the robot's centre of mass travels during an open-loop
-    sinusoidal oscillation trial.
+    Measures how far the robot's centre of mass travels during a simulation
+    trial.
 
-    This is the primary locomotion fitness used by ``evolve_lego_robots.py``.
-    It requires a ``cfg_fn`` parameter — a callable that builds a headless
-    MetaMachine OmegaConf config from a ``graph_dict``.  This keeps all
-    robot- and plugin-specific environment setup out of the public codebase.
+    This is the primary locomotion fitness component.  It is **robot-agnostic**:
+    all robot-specific behaviour is injected through three callbacks:
+
+    ``cfg_fn(genome) -> cfg``
+        Builds a MetaMachine OmegaConf config from the full genome dict.
+        **Required**.
+
+    ``action_fn(genome, t, num_actions) -> ndarray``  *(optional)*
+        Returns the action vector at simulation time *t*.  Defaults to zero
+        actions (suitable for pose-optimised robots).
+
+    ``num_actions_fn(genome) -> int``  *(optional)*
+        Returns the number of actuated joints.  Defaults to reading
+        ``cfg.control.num_actions`` from the built config.
 
     Parameters (passed as keyword args or via ``params`` dict):
-        cfg_fn:            ``cfg_fn(graph_dict) -> cfg`` (required).  Builds
-                           the MetaMachine config for a given serialised graph.
-                           Typically ``create_config_from_graph_dict`` from
-                           the plugin script.
+        cfg_fn:            ``cfg_fn(genome) -> cfg`` (required).
+        action_fn:         Optional action callback.
+        num_actions_fn:    Optional action-count callback.
         eval_steps (int):  Number of simulation steps (default: 500).
         dt (float):        Control timestep in seconds (default: 0.05).
         early_stop (bool): Stop the trial if the episode terminates early
                            (default: True).
 
-    Example (programmatic):
-        from metamachine.evolution.fitness import DisplacementFitnessComponent
-        from my_plugin.evolve import create_config_from_graph_dict
-
+    Example (modular legs — zero actions, pose-optimised):
         comp = DisplacementFitnessComponent(
-            "displacement",
-            weight=1.0,
-            cfg_fn=create_config_from_graph_dict,
+            "displacement", weight=1.0,
+            cfg_fn=create_config_from_morphology,
+            eval_steps=500,
+        )
+
+    Example (lego — sinusoidal oscillation):
+        comp = DisplacementFitnessComponent(
+            "displacement", weight=1.0,
+            cfg_fn=lego_cfg_fn,
+            action_fn=lego_action_fn,
+            num_actions_fn=lego_num_actions_fn,
             eval_steps=500,
         )
     """
@@ -154,14 +168,17 @@ class DisplacementFitnessComponent(FitnessComponent):
         if cfg_fn is None:
             raise ValueError(
                 "DisplacementFitnessComponent requires a 'cfg_fn' parameter: "
-                "a callable that builds a MetaMachine config from a graph_dict."
+                "a callable that builds a MetaMachine config from a genome dict."
             )
         eval_steps = self.params.get("eval_steps", 500)
         dt = self.params.get("dt", 0.05)
         early_stop = self.params.get("early_stop", True)
+        action_fn = self.params.get("action_fn", None)
+        num_actions_fn = self.params.get("num_actions_fn", None)
         return run_displacement_trial(
             genome, cfg_fn=cfg_fn,
             eval_steps=eval_steps, dt=dt, early_stop=early_stop,
+            action_fn=action_fn, num_actions_fn=num_actions_fn,
         )
 
 

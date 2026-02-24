@@ -166,6 +166,41 @@ class GenomeConstraint(ABC):
 # Built-in constraints
 # =============================================================================
 
+class MinModulesConstraint(GenomeConstraint):
+    """
+    Reject genomes with fewer than ``min_modules`` modules.
+
+    Works with modular-leg genomes where ``genome["morphology"]`` is a flat
+    int list with groups of 4 per connection.
+
+    Parameters:
+        min_modules (int): Minimum number of modules (connections) required.
+
+    Example::
+        MinModulesConstraint(min_modules=3)
+    """
+
+    def __init__(self, min_modules: int, hard: bool = True) -> None:
+        super().__init__(name=f"min_modules>={min_modules}", hard=hard)
+        self.min_modules = min_modules
+
+    def check(self, genome: dict, cfg_fn: Optional[Callable] = None) -> ConstraintResult:
+        morphology = genome.get("morphology", [])
+        actual = len(morphology) // 4
+        if actual >= self.min_modules:
+            return ConstraintResult(satisfied=True)
+        violation = float(self.min_modules - actual)
+        return ConstraintResult(
+            satisfied=False,
+            violation=violation,
+            message=(
+                f"min_modules: has {actual} module(s), "
+                f"need >= {self.min_modules}"
+            ),
+            details={"actual_modules": actual, "required": self.min_modules},
+        )
+
+
 class MinBallsConstraint(GenomeConstraint):
     """
     Reject genomes with fewer than ``min_balls`` active (non-passive) ball joints.
@@ -244,19 +279,26 @@ class JointUtilityConstraint(GenomeConstraint):
     Reject genomes that contain "useless" joints — joints whose actuation
     produces no observable movement of the robot's centre of mass.
 
-    For each active ball joint *j*, a short simulation trial is run in which
-    *only* joint *j* is driven with a sine wave while all other joints are
-    held at zero.  If the resulting COM displacement is below
-    ``movement_threshold`` metres, the joint is declared useless and the
-    genome is rejected.
+    For each joint *j*, a short simulation trial is run in which *only*
+    joint *j* is driven with a sine wave while all other joints are held at
+    zero.  If the resulting COM displacement is below ``movement_threshold``
+    metres, the joint is declared useless and the genome is rejected.
 
-    This constraint requires a ``cfg_fn`` callable (same contract as
-    ``DisplacementFitnessComponent``) to build the simulation environment.
+    This constraint is **robot-agnostic**.  Robot-specific behaviour is
+    injected through callbacks:
+
+    ``cfg_fn(genome) -> cfg``
+        Builds a MetaMachine OmegaConf config from the full genome dict.
+        **Required** (supplied at construction or at call-time).
+
+    ``num_actions_fn(genome) -> int``  *(optional)*
+        Returns the number of actuated joints.  When ``None``, the value
+        is read from ``cfg.control.num_actions``.
 
     Parameters:
-        cfg_fn (Callable):       ``cfg_fn(graph_dict) -> cfg``; builds the
-                                 MetaMachine OmegaConf config.  Can be supplied
-                                 here or at call-time via ``check(..., cfg_fn=...)``.
+        cfg_fn (Callable):       ``cfg_fn(genome) -> cfg``.
+        num_actions_fn (Callable, optional):
+                                 ``num_actions_fn(genome) -> int``.
         movement_threshold (float):
                                  Minimum XY displacement (metres) required for
                                  a joint to be considered useful.
@@ -275,18 +317,24 @@ class JointUtilityConstraint(GenomeConstraint):
                                  failing. Default: 0 (any useless joint fails).
         hard (bool):             Whether this is a hard constraint (default True).
 
-    Example::
+    Example (modular legs)::
         JointUtilityConstraint(
-            cfg_fn=create_config_from_graph_dict,
+            cfg_fn=create_config_from_morphology,
             movement_threshold=0.005,
-            probe_steps=100,
-            settle_steps=50,
+        )
+
+    Example (lego legs)::
+        JointUtilityConstraint(
+            cfg_fn=lego_cfg_fn,
+            num_actions_fn=lambda g: graph_num_balls(g["graph_dict"]),
+            movement_threshold=0.005,
         )
     """
 
     def __init__(
         self,
         cfg_fn: Optional[Callable] = None,
+        num_actions_fn: Optional[Callable] = None,
         movement_threshold: float = 0.005,
         probe_steps: int = 100,
         settle_steps: int = 50,
@@ -298,6 +346,7 @@ class JointUtilityConstraint(GenomeConstraint):
     ) -> None:
         super().__init__(name="joint_utility", hard=hard)
         self._cfg_fn = cfg_fn
+        self._num_actions_fn = num_actions_fn
         self.movement_threshold = movement_threshold
         self.probe_steps = probe_steps
         self.settle_steps = settle_steps
@@ -323,6 +372,7 @@ class JointUtilityConstraint(GenomeConstraint):
         useless = _probe_joint_utility(
             genome=genome,
             cfg_fn=effective_cfg_fn,
+            num_actions_fn=self._num_actions_fn,
             movement_threshold=self.movement_threshold,
             probe_steps=self.probe_steps,
             settle_steps=self.settle_steps,
@@ -356,6 +406,7 @@ class JointUtilityConstraint(GenomeConstraint):
 def _probe_joint_utility(
     genome: dict,
     cfg_fn: Callable,
+    num_actions_fn: Optional[Callable],
     movement_threshold: float,
     probe_steps: int,
     settle_steps: int,
@@ -364,26 +415,31 @@ def _probe_joint_utility(
     probe_frequency: float,
 ) -> list[int]:
     """
-    For each active joint, run a short isolated probe simulation and return
-    the list of joint indices that produce less than ``movement_threshold``
+    For each joint, run a short isolated probe simulation and return the
+    list of joint indices that produce less than ``movement_threshold``
     metres of COM displacement.
 
-    Each probe shares a single env creation to amortise startup cost when
-    possible; if env reset is available it is used, otherwise a new env is
-    created per joint.
+    The number of joints is determined by ``num_actions_fn(genome)`` when
+    provided, otherwise by building a config and reading
+    ``cfg.control.num_actions``.
 
     Returns:
         List of zero-based joint indices that are "useless".
     """
-    from metamachine.evolution.fitness_helpers import _graph_num_balls, _cleanup_tmpdir
+    from metamachine.evolution.fitness_helpers import _cleanup_tmpdir
 
     try:
         from metamachine.environments.env_sim import MetaMachine
     except ImportError as e:
         raise ImportError(f"JointUtilityConstraint requires MetaMachine: {e}") from e
 
-    graph_dict = genome["graph_dict"]
-    num_joints = _graph_num_balls(graph_dict)
+    # Determine number of joints
+    if num_actions_fn is not None:
+        num_joints = num_actions_fn(genome)
+    else:
+        # Build a config to read num_actions
+        cfg = cfg_fn(genome)
+        num_joints = getattr(getattr(cfg, "control", None), "num_actions", 0)
 
     if num_joints == 0:
         return []
@@ -392,7 +448,7 @@ def _probe_joint_utility(
 
     for joint_idx in range(num_joints):
         displacement = _probe_single_joint(
-            graph_dict=graph_dict,
+            genome=genome,
             joint_idx=joint_idx,
             num_joints=num_joints,
             cfg_fn=cfg_fn,
@@ -409,7 +465,7 @@ def _probe_joint_utility(
 
 
 def _probe_single_joint(
-    graph_dict: dict,
+    genome: dict,
     joint_idx: int,
     num_joints: int,
     cfg_fn: Callable,
@@ -435,7 +491,7 @@ def _probe_single_joint(
     from metamachine.environments.env_sim import MetaMachine
     from metamachine.evolution.fitness_helpers import _cleanup_tmpdir
 
-    cfg = cfg_fn(graph_dict)
+    cfg = cfg_fn(genome)
     tmpdir = getattr(cfg, "_eval_tmpdir", None)
 
     try:
@@ -632,6 +688,7 @@ class ConstraintChecker:
 # =============================================================================
 
 CONSTRAINT_REGISTRY: dict[str, type[GenomeConstraint]] = {
+    "min_modules": MinModulesConstraint,
     "min_balls": MinBallsConstraint,
     "min_legs": MinLegsConstraint,
     "joint_utility": JointUtilityConstraint,
@@ -677,6 +734,7 @@ __all__ = [
     # Base class
     "GenomeConstraint",
     # Built-ins
+    "MinModulesConstraint",
     "MinBallsConstraint",
     "MinLegsConstraint",
     "JointUtilityConstraint",
