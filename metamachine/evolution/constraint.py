@@ -31,6 +31,9 @@ Built-in constraints
 --------------------
 ``MinBallsConstraint``          — genome must have at least N active ball joints.
 ``MinLegsConstraint``           — genome must have at least N leg chains.
+``SelfCollisionConstraint``     — robot must have NO geometric self-intersections
+                                  when all joints are at zero.  Uses analytic
+                                  pairwise distance checks (not MuJoCo contacts).
 ``JointUtilityConstraint``      — every joint, when actuated alone, must produce
                                   measurable robot COM movement; joints that
                                   produce no movement are "useless" and the
@@ -274,6 +277,91 @@ class MinLegsConstraint(GenomeConstraint):
         )
 
 
+class SelfCollisionConstraint(GenomeConstraint):
+    """
+    Reject genomes whose robot has geometric self-intersection at zero pose.
+
+    This is a **lightweight, geometry-only** check: the MuJoCo model is
+    compiled from the morphology (via ``ModularLegs``), forward kinematics
+    is run with all joints at zero, and pairwise geom distances are
+    computed analytically.  No simulation stepping is needed.
+
+    Why geometry-based instead of MuJoCo contacts?
+    -----------------------------------------------
+    MuJoCo's contact engine automatically filters contacts between
+    parent–child bodies (``filterparent``) and **welded** bodies (those
+    without joints are merged into the first ancestor that has a joint for
+    collision purposes via ``body.weldid``).  In the modular-leg design many
+    bodies share the same ``weldid`` (e.g.  the left half-shell plus several
+    passive sticks are all welded to ``torso0``), so MuJoCo's broadphase
+    will never generate contacts between them — even when they geometrically
+    overlap.  A pure geometry distance check bypasses all of this.
+
+    Body naming convention for modular legs
+    ----------------------------------------
+    Bodies are named ``l{N}`` / ``r{N}`` (left/right halves of module *N*)
+    and ``passive{N}`` for connecting sticks.  Contacts between ``lN`` ↔
+    ``rN`` (same module) are considered valid assembly contacts and do **not**
+    count as self-collision.  Everything else is a real self-collision.
+
+    Parameters:
+        margin:        Extra distance tolerance (metres) before reporting
+                       overlap.  Default 0.0 (strict).  A small positive
+                       value (e.g. 0.005) can avoid flagging borderline
+                       near-tangent geometries.
+        hard:          Whether this is a hard constraint (default True).
+
+    Example::
+        SelfCollisionConstraint()
+    """
+
+    def __init__(
+        self,
+        margin: float = 0.0,
+        hard: bool = True,
+    ) -> None:
+        super().__init__(name="no_self_collision", hard=hard)
+        self.margin = margin
+
+    def check(self, genome: dict, cfg_fn: Optional[Callable] = None) -> ConstraintResult:
+        """
+        Build the robot model from morphology, set all joints to zero, and
+        check for geometric overlaps.
+        """
+        morphology = genome.get("morphology")
+        if morphology is None:
+            return ConstraintResult(
+                satisfied=False,
+                violation=float("inf"),
+                message="no_self_collision: genome has no 'morphology' key",
+            )
+
+        try:
+            n_collisions, details = _check_self_collision_at_zero(
+                morphology=morphology,
+                margin=self.margin,
+            )
+        except Exception as e:
+            return ConstraintResult(
+                satisfied=False,
+                violation=float("inf"),
+                message=f"no_self_collision: ERROR — {e}",
+                details={"traceback": traceback.format_exc()},
+            )
+
+        if n_collisions == 0:
+            return ConstraintResult(satisfied=True, details=details)
+
+        return ConstraintResult(
+            satisfied=False,
+            violation=float(n_collisions),
+            message=(
+                f"no_self_collision: {n_collisions} self-intersection(s) at zero pose"
+            ),
+            details=details,
+        )
+
+
 class JointUtilityConstraint(GenomeConstraint):
     """
     Reject genomes that contain "useless" joints — joints whose actuation
@@ -397,6 +485,282 @@ class JointUtilityConstraint(GenomeConstraint):
             ),
             details={"useless_joints": useless, "max_allowed": self.max_useless},
         )
+
+
+# =============================================================================
+# Self-collision check — internal implementation
+# =============================================================================
+
+def _check_self_collision_at_zero(
+    morphology: list[int],
+    margin: float = 0.0,
+) -> tuple[int, dict]:
+    """
+    Build a MuJoCo model directly from a morphology sequence, set all joints
+    to zero, compute forward kinematics, and check for geometric overlaps
+    between geoms that belong to different kinematic groups.
+
+    This uses a **pure geometry** approach rather than MuJoCo's contact
+    engine, because the modular-leg robot has many welded bodies (bodies
+    without joints are merged into the first ancestor with a joint via
+    ``body.weldid``).  MuJoCo never generates contacts between geoms whose
+    bodies share the same ``weldid``, even if they geometrically overlap.
+    The ``filterparent`` mechanism further suppresses contacts between
+    parent–child pairs.  As a result, MuJoCo's ``d.ncon`` is always 0 for
+    these robots regardless of pose, despite clear geometric intersections.
+
+    The geometry check works on the world-frame positions computed by
+    ``mj_forward`` and uses conservative bounding-sphere overlap tests:
+
+    - **Sphere** geoms: radius is ``size[0]``.
+    - **Capsule** geoms: modeled as a line segment of half-length ``size[1]``
+      with radius ``size[0]``.  The distance is computed as the closest point
+      between the capsule's axis and the other geom's centre (or axis for
+      capsule–capsule pairs).
+
+    Excluded pairs
+    ~~~~~~~~~~~~~~
+    - Same-body geoms (same ``bodyid``).
+    - ``lN`` ↔ ``rN`` pairs (left/right halves of the same module — these
+      are co-located by design and are valid assembly contacts).
+    - Geoms on the same body or on bodies sharing the same ``weldid``
+      (these are rigidly attached and cannot move apart, so overlaps are
+      part of the design, not collisions).
+
+    Returns:
+        ``(n_collisions, details_dict)`` — *n_collisions* is the total
+        number of overlapping geom pairs found, and *details_dict* contains
+        a list of colliding geom-name/body-name pairs for diagnostics.
+    """
+    import mujoco
+
+    from metamachine.robot_factory.modular_legs.constants import MESH_DICT_DRAFT
+    from metamachine.robot_factory.modular_legs.meta_designer import ModularLegs
+    from metamachine.utils.visual_utils import get_joint_pos_addr
+
+    # Build the model directly from morphology (no MetaMachine env needed).
+    # Use MESH_DICT_DRAFT (primitives: SPHERE, CAPSULE) so we don't depend
+    # on mesh files and get clean analytic collision geometry.
+    ml = ModularLegs(morphology=list(morphology), mesh_dict=MESH_DICT_DRAFT)
+    xml = ml.designer.builder.get_xml(fix_file_path=True)
+    m = mujoco.MjModel.from_xml_string(xml)
+    d = mujoco.MjData(m)
+
+    # Set robot in the air with all joints at zero
+    qpos = np.zeros(m.nq)
+    qpos[2] = 1.0  # height — above ground
+    qpos[3] = 1.0  # quaternion w-component
+    joint_addrs = get_joint_pos_addr(m)
+    qpos[joint_addrs] = 0.0
+
+    d.qpos[:] = qpos
+    d.qvel[:] = np.zeros(m.nv)
+    mujoco.mj_forward(m, d)
+
+    # ── Collect geom info ──────────────────────────────────────────────
+    # Skip the floor geom (body "world"), and internal non-collidable parts
+    # (battery, pcb, motor — already excluded by MESH_DICT_DRAFT which maps
+    # them to "NONE" so they don't appear).
+    geom_type_sphere = 2
+    geom_type_capsule = 3
+
+    class _GeomInfo:
+        __slots__ = ("idx", "gtype", "body_id", "body_name", "weld_id",
+                      "pos", "mat", "radius", "half_len", "name")
+
+    geoms: list[_GeomInfo] = []
+    for gi in range(m.ngeom):
+        g = m.geom(gi)
+        bid = int(g.bodyid[0])
+        bname = m.body(bid).name
+        if bname == "world":
+            continue
+        gtype = int(g.type)
+        if gtype not in (geom_type_sphere, geom_type_capsule):
+            continue  # skip plane, mesh-only, etc.
+        info = _GeomInfo()
+        info.idx = gi
+        info.gtype = gtype
+        info.body_id = bid
+        info.body_name = bname
+        info.weld_id = int(m.body(bid).weldid[0])
+        info.pos = d.geom_xpos[gi].copy()
+        info.mat = d.geom_xmat[gi].reshape(3, 3).copy()
+        info.radius = float(g.size[0])
+        info.half_len = float(g.size[1]) if gtype == geom_type_capsule else 0.0
+        info.name = g.name
+        geoms.append(info)
+
+    # ── Build set of adjacent weld-group pairs ─────────────────────────
+    # Two weld groups are "adjacent" if they are connected by a single joint.
+    # Geoms in adjacent weld groups naturally overlap at the joint boundary
+    # (ball plugs into stick) — this is structural, not a collision.
+    #
+    # For each joint, the joint body and its parent body belong to two
+    # (possibly different) weld groups.  Those weld groups are adjacent.
+    adjacent_weld_pairs: set[tuple[int, int]] = set()
+    for ji in range(m.njnt):
+        jbid = int(m.jnt_bodyid[ji])
+        pbid = int(m.body(jbid).parentid[0])
+        w1 = int(m.body(jbid).weldid[0])
+        w2 = int(m.body(pbid).weldid[0])
+        if w1 != w2:
+            pair = (min(w1, w2), max(w1, w2))
+            adjacent_weld_pairs.add(pair)
+
+    # ── Helper: extract module index from body name ────────────────────
+    def _module_idx(bname: str) -> Optional[int]:
+        """Return the module index from names like 'l3', 'r12'."""
+        if bname and bname[0] in ("l", "r"):
+            try:
+                return int(bname[1:])
+            except ValueError:
+                return None
+        return None
+
+    # ── Helper: closest distance between two geom bounding shapes ──────
+    def _geom_distance(a: _GeomInfo, b: _GeomInfo) -> float:
+        """
+        Compute the minimum distance between two geom bounding shapes.
+        Returns distance between surfaces (negative = overlap).
+        Supports sphere–sphere, sphere–capsule, and capsule–capsule.
+        """
+        if a.gtype == geom_type_sphere and b.gtype == geom_type_sphere:
+            d_centers = np.linalg.norm(a.pos - b.pos)
+            return d_centers - a.radius - b.radius
+
+        if a.gtype == geom_type_capsule and b.gtype == geom_type_capsule:
+            # Capsule–capsule: closest distance between two line segments
+            # Each capsule axis = mat @ [0, 0, 1] * half_len
+            axis_a = a.mat[:, 2] * a.half_len
+            axis_b = b.mat[:, 2] * b.half_len
+            d_seg = _segment_segment_dist(a.pos, axis_a, b.pos, axis_b)
+            return d_seg - a.radius - b.radius
+
+        # Sphere–capsule (ensure 'a' is the capsule)
+        if a.gtype == geom_type_sphere:
+            a, b = b, a
+        # a is capsule, b is sphere
+        axis_a = a.mat[:, 2] * a.half_len
+        d_pt = _point_segment_dist(b.pos, a.pos, axis_a)
+        return d_pt - a.radius - b.radius
+
+    # ── Pairwise overlap check ─────────────────────────────────────────
+    n_collisions = 0
+    colliding_pairs: list[tuple[str, str]] = []
+
+    for i in range(len(geoms)):
+        for j in range(i + 1, len(geoms)):
+            ga = geoms[i]
+            gb = geoms[j]
+
+            # Skip same body
+            if ga.body_id == gb.body_id:
+                continue
+
+            # Skip same weld group (rigidly attached, overlap by design)
+            if ga.weld_id == gb.weld_id:
+                continue
+
+            # Skip adjacent weld groups (connected by a single joint —
+            # ball-stick overlaps at joint boundaries are structural)
+            weld_pair = (min(ga.weld_id, gb.weld_id),
+                         max(ga.weld_id, gb.weld_id))
+            if weld_pair in adjacent_weld_pairs:
+                continue
+
+            # Skip lN <-> rN same-module pairs (assembly contacts)
+            mi = _module_idx(ga.body_name)
+            mj = _module_idx(gb.body_name)
+            if mi is not None and mj is not None and mi == mj:
+                # Same module's left/right halves — valid
+                continue
+
+            dist = _geom_distance(ga, gb)
+            if dist < -margin:
+                n_collisions += 1
+                colliding_pairs.append((
+                    f"{ga.name}({ga.body_name})",
+                    f"{gb.name}({gb.body_name})",
+                ))
+
+    return n_collisions, {
+        "n_collisions": n_collisions,
+        "colliding_pairs": colliding_pairs,
+    }
+
+
+def _segment_segment_dist(
+    p1: np.ndarray, d1: np.ndarray,
+    p2: np.ndarray, d2: np.ndarray,
+) -> float:
+    """
+    Minimum distance between two line segments.
+
+    Segment 1: from ``p1 - d1`` to ``p1 + d1`` (centre + half-axis).
+    Segment 2: from ``p2 - d2`` to ``p2 + d2``.
+
+    Uses the standard closest-points-on-two-segments algorithm.
+    """
+    a1 = p1 - d1
+    b1 = p1 + d1
+    a2 = p2 - d2
+    b2 = p2 + d2
+
+    u = b1 - a1
+    v = b2 - a2
+    w = a1 - a2
+
+    uu = np.dot(u, u)
+    uv = np.dot(u, v)
+    vv = np.dot(v, v)
+    uw = np.dot(u, w)
+    vw = np.dot(v, w)
+
+    denom = uu * vv - uv * uv
+    eps = 1e-12
+
+    if denom < eps:
+        # Parallel segments
+        s = 0.0
+        t = vw / vv if vv > eps else 0.0
+    else:
+        s = (uv * vw - vv * uw) / denom
+        t = (uu * vw - uv * uw) / denom
+
+    s = float(np.clip(s, 0.0, 1.0))
+    t = float(np.clip(t, 0.0, 1.0))
+
+    # Recompute to handle clamping
+    t_new = (uv * s + vw) / vv if vv > eps else 0.0
+    t_new = float(np.clip(t_new, 0.0, 1.0))
+    s_new = (uv * t_new - uw) / uu if uu > eps else 0.0
+    s_new = float(np.clip(s_new, 0.0, 1.0))
+
+    closest1 = a1 + s_new * u
+    closest2 = a2 + t_new * v
+    return float(np.linalg.norm(closest1 - closest2))
+
+
+def _point_segment_dist(
+    pt: np.ndarray,
+    seg_center: np.ndarray,
+    seg_half_axis: np.ndarray,
+) -> float:
+    """
+    Minimum distance from a point to a line segment.
+
+    Segment: from ``seg_center - seg_half_axis`` to ``seg_center + seg_half_axis``.
+    """
+    a = seg_center - seg_half_axis
+    b = seg_center + seg_half_axis
+    ab = b - a
+    ab_sq = np.dot(ab, ab)
+    if ab_sq < 1e-12:
+        return float(np.linalg.norm(pt - a))
+    t = float(np.clip(np.dot(pt - a, ab) / ab_sq, 0.0, 1.0))
+    closest = a + t * ab
+    return float(np.linalg.norm(pt - closest))
 
 
 # =============================================================================
@@ -691,6 +1055,7 @@ CONSTRAINT_REGISTRY: dict[str, type[GenomeConstraint]] = {
     "min_modules": MinModulesConstraint,
     "min_balls": MinBallsConstraint,
     "min_legs": MinLegsConstraint,
+    "no_self_collision": SelfCollisionConstraint,
     "joint_utility": JointUtilityConstraint,
 }
 
@@ -737,6 +1102,7 @@ __all__ = [
     "MinModulesConstraint",
     "MinBallsConstraint",
     "MinLegsConstraint",
+    "SelfCollisionConstraint",
     "JointUtilityConstraint",
     # Aggregator
     "ConstraintChecker",

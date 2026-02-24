@@ -59,6 +59,10 @@ def create_config_from_morphology(
     # Pose optimisation override
     if not pose_optimization:
         cfg.pose_optimization.enabled = False
+        # Without pose opt the optimizer won't set default_dof_pos, so zero
+        # it out to avoid the config's hardcoded joint offsets (e.g.
+        # [0, -1, 1, 1, -1]) biasing the oscillation controller.
+        cfg.control.default_dof_pos = [0.0] * cfg.control.num_actions
 
     if log_dir is not None:
         cfg.logging.data_dir = log_dir

@@ -40,7 +40,7 @@ Usage
 
     # With constraints
     python examples/evolve_modular_legs.py --pop-size 10 --generations 20 \\
-        --min-modules 3 --joint-utility
+        --min-modules 3 --joint-utility --no-self-collision
 
 Copyright 2026 Chen Yu <chenyu@u.northwestern.edu>
 Licensed under the Apache License, Version 2.0
@@ -383,6 +383,11 @@ Examples:
         default=100,
         help="Number of probe steps per joint",
     )
+    parser.add_argument(
+        "--no-self-collision",
+        action="store_true",
+        help="Reject robots that have self-contacts at zero joint positions",
+    )
 
     # Logging
     parser.add_argument("--log-dir", type=str, default=None)
@@ -440,6 +445,7 @@ def main():
     from metamachine.evolution import EvolutionEngine
     from metamachine.evolution.constraint import (
         ConstraintChecker, MinModulesConstraint, JointUtilityConstraint,
+        SelfCollisionConstraint,
     )
 
     # Set the module-level config name so modular_cfg_fn uses the right config
@@ -464,6 +470,8 @@ def main():
     constraints: list[Any] = []
     if args.min_modules > 0:
         constraints.append(MinModulesConstraint(min_modules=args.min_modules))
+    if args.no_self_collision:
+        constraints.append(SelfCollisionConstraint())
     if args.joint_utility:
         constraints.append(
             JointUtilityConstraint(
