@@ -224,7 +224,8 @@ def optimize_pose(
     try:
         # Run drop simulation
         mjx_data = run_drop_simulation(
-            mjx_model, mjx_data, joint_pos, drop_steps, progress, task
+            mjx_model, mjx_data, joint_pos, drop_steps, progress, task,
+            mj_model=mj_model,
         )
 
         # Extract stable state metrics
@@ -250,6 +251,7 @@ def optimize_pose(
                 stable_metrics.get("projected_upward"),
                 progress,
                 task,
+                mj_model=mj_model,
             )
         else:
             # Initialize default movement metrics for optimization types that don't use movement
@@ -370,9 +372,18 @@ def run_movement_phase(
     projected_upward: Optional[jnp.ndarray],
     progress: Progress,
     task: TaskID,
+    mj_model: mujoco.MjModel = None,
+    kp: float = 8.0,
+    kd: float = 0.2,
 ) -> dict[str, jnp.ndarray]:
-    """Run the movement phase simulation."""
+    """Run the movement phase simulation with PD control."""
     jit_step = jax.jit(jax.vmap(mjx.step, in_axes=(None, 0)))
+
+    # Setup PD control addresses if mj_model provided
+    if mj_model is not None:
+        joint_qpos_addr = jnp.array(get_joint_pos_addr(mj_model))
+        joint_idx = [mj_model.joint(f"joint{i}").id for i in range(mj_model.nu)]
+        joint_dof_addr = jnp.array(mj_model.jnt_dofadr[joint_idx])
 
     # Initialize tracking variables
     last_com_pos = mjx_data.xpos[:, joint_body_idx, :2].mean(axis=1)
@@ -384,7 +395,13 @@ def run_movement_phase(
         for i in range(move_steps):
             # Apply sinusoidal motion
             joint_pos_with_noise = default_joint_pos + jnp.sin(i / 10)
-            mjx_data = mjx_data.replace(ctrl=joint_pos_with_noise)
+            if mj_model is not None:
+                cur_pos = mjx_data.qpos[:, joint_qpos_addr]
+                cur_vel = mjx_data.qvel[:, joint_dof_addr]
+                torques = kp * (joint_pos_with_noise - cur_pos) + kd * (0.0 - cur_vel)
+                mjx_data = mjx_data.replace(ctrl=torques)
+            else:
+                mjx_data = mjx_data.replace(ctrl=joint_pos_with_noise)
             mjx_data = jit_step(mjx_model, mjx_data)
 
             # Measure global COM velocity
@@ -671,18 +688,48 @@ def run_drop_simulation(
     drop_steps: int,
     progress: Progress,
     task: TaskID,
+    mj_model: mujoco.MjModel = None,
+    kp: float = 8.0,
+    kd: float = 0.2,
 ) -> types.Data:
-    """Run the drop simulation phase."""
+    """Run the drop simulation phase with PD control.
+
+    Uses PD control (torque = kp*(target - pos) + kd*(0 - vel)) to hold
+    joints at the target positions, matching MetaMachine's control loop.
+    Requires mj_model for joint address lookup.
+    """
     jit_step = jax.jit(jax.vmap(mjx.step, in_axes=(None, 0)))
 
-    try:
-        for _i in range(drop_steps):
-            mjx_data = mjx_data.replace(ctrl=joint_pos)
-            mjx_data = jit_step(mjx_model, mjx_data)
-            progress.advance(task)
-    except KeyboardInterrupt:
-        print("\nDrop simulation interrupted by user.")
-        raise
+    if mj_model is not None:
+        joint_qpos_addr = jnp.array(get_joint_pos_addr(mj_model))
+        joint_idx = [mj_model.joint(f"joint{i}").id for i in range(mj_model.nu)]
+        joint_dof_addr = jnp.array(mj_model.jnt_dofadr[joint_idx])
+
+        @jax.jit
+        def pd_step(mjx_data, target_pos):
+            cur_pos = mjx_data.qpos[:, joint_qpos_addr]
+            cur_vel = mjx_data.qvel[:, joint_dof_addr]
+            torques = kp * (target_pos - cur_pos) + kd * (0.0 - cur_vel)
+            mjx_data = mjx_data.replace(ctrl=torques)
+            return jax.vmap(mjx.step, in_axes=(None, 0))(mjx_model, mjx_data)
+
+        try:
+            for _i in range(drop_steps):
+                mjx_data = pd_step(mjx_data, joint_pos)
+                progress.advance(task)
+        except KeyboardInterrupt:
+            print("\nDrop simulation interrupted by user.")
+            raise
+    else:
+        # Legacy: direct ctrl = joint_pos (only if mj_model not provided)
+        try:
+            for _i in range(drop_steps):
+                mjx_data = mjx_data.replace(ctrl=joint_pos)
+                mjx_data = jit_step(mjx_model, mjx_data)
+                progress.advance(task)
+        except KeyboardInterrupt:
+            print("\nDrop simulation interrupted by user.")
+            raise
 
     return mjx_data
 
