@@ -1170,6 +1170,14 @@ class RealMetaMachine(Base):
                         if val is not None and key not in used_components:
                             debug_components[f"raw_{key}"] = np.asarray(val).flatten()
                 
+                # Add quaternions for debugging/visibility (do not change policy obs dims)
+                if self.observable_data.get("quat") is not None:
+                    debug_components["quat_xyzw"] = np.asarray(self.observable_data["quat"]).flatten()
+                if self.observable_data.get("special_quat") is not None:
+                    debug_components["special_quat_xyzw"] = np.asarray(
+                        self.observable_data["special_quat"]
+                    ).flatten()
+
                 # Add main quat as roll/pitch/yaw for easier visualization
                 if 'quat' in self.observable_data:
                     quat = self.observable_data['quat']

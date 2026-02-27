@@ -508,6 +508,11 @@ class State:
 
     # Define available observation components
     OBSERVATION_COMPONENTS = {
+        # Orientation
+        # NOTE: For real robots, `raw.quat` comes from the configured main IMU module and
+        # is stored as [x, y, z, w] in `env_real.py`.
+        "quat": lambda s: s.raw.quat,
+        "special_quat": lambda s: s.raw.special_quat,
         "projected_gravity": lambda s: s.derived.projected_gravity,
         "projected_gravities": lambda s: s.derived.projected_gravities,
         "ang_vel_body": lambda s: s.raw.ang_vel_body,

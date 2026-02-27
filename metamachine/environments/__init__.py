@@ -30,8 +30,21 @@ Example:
 Copyright 2025 Chen Yu <chenyu@u.northwestern.edu>
 """
 
-from .env_sim import MetaMachine
+from typing import Optional
+
 from .base import Base
+
+# IMPORTANT:
+# Importing MuJoCo-backed simulation envs at module import time makes *any*
+# `import metamachine.environments...` crash on machines without a working MuJoCo
+# GL setup (e.g. macOS with MUJOCO_GL=egl). We therefore lazy-import `MetaMachine`
+# and only raise the underlying error if/when the user actually requests a sim env.
+_SIM_IMPORT_ERROR: Optional[Exception] = None
+try:
+    from .env_sim import MetaMachine  # type: ignore
+except Exception as e:  # MuJoCo can raise RuntimeError during import
+    MetaMachine = None  # type: ignore[assignment]
+    _SIM_IMPORT_ERROR = e
 
 # Optional import for real robot environment (requires capybarish)
 try:
@@ -84,6 +97,13 @@ def make_env(cfg, **kwargs):
     mode = cfg.environment.get("mode", "sim").lower()
     
     if mode == "sim" or mode == "simulation":
+        if MetaMachine is None:
+            raise RuntimeError(
+                "Simulation environment (MetaMachine) could not be imported. "
+                "This is usually due to a MuJoCo installation/GL backend issue. "
+                "Original error:\n"
+                f"{_SIM_IMPORT_ERROR}"
+            )
         return MetaMachine(cfg, **kwargs)
     
     elif mode == "real":

@@ -73,7 +73,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # Default config path
 DEFAULT_CONFIG = str(
     PROJECT_ROOT / "metamachine" / "environments" / "configs" / 
-    "default_configs" / "real_three_modules.yaml"
+    "default_configs" / "wheel.yaml"
 )
 
 
