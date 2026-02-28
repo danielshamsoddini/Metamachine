@@ -14,6 +14,8 @@ Features:
 - Optional MuJoCo viewer to visualize robot orientation in real-time
 - Multi-model support for A/B testing and comparison
 - Keyboard controls: e=enable, d=disable, r=restart, c=calibrate, q=quit
+- Balance mode (--balance): PID control to hold target theta
+- Calibration mode (--calibration): record sensor sweeps and balance-point data to JSON
 
 Usage:
     # Basic usage with default config
@@ -56,9 +58,11 @@ Licensed under the Apache License, Version 2.0
 """
 
 import argparse
+import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -124,6 +128,14 @@ Examples:
     
     # Load from training log with sensor modules
     python real_robots.py --log-dir logs/experiment --module-ids 5 21 16 --sensor-module-ids 100
+    
+    # Run balance mode (PID control at target theta; default from calibration)
+    python real_robots.py --balance
+    python real_robots.py --balance -b --target-theta -118 --kp 0.05 --duration 60
+    
+    # Run calibration mode (record sweeps and balance-point data)
+    python real_robots.py --calibration
+    python real_robots.py --calibration --calibration-output my_cal.json
     
     # Load MULTIPLE models for comparison (switch with , and . keys)
     python real_robots.py -L logs/baseline logs/improved logs/experimental \\
@@ -246,6 +258,92 @@ Keyboard Controls (during operation):
         type=str,
         default=None,
         help="Config for viewer simulation (uses real robot config if not specified)"
+    )
+    
+    # Balance mode (PID control to hold target theta)
+    parser.add_argument(
+        "--balance", "-b",
+        action="store_true",
+        help="Run balance mode: PID control to maintain target theta (use with --target-theta)"
+    )
+    parser.add_argument(
+        "--target-theta",
+        type=float,
+        default=-117.57,
+        help="Target theta in degrees for balance mode (default: -117.57, from calibration)"
+    )
+    parser.add_argument(
+        "--kp", type=float, default=0.035,
+        help="PID proportional gain for balance mode (lower = less overshoot/oscillation)"
+    )
+    parser.add_argument(
+        "--ki", type=float, default=0.005, help="PID integral gain for balance mode"
+    )
+    parser.add_argument(
+        "--kd", type=float, default=0.01,
+        help="PID derivative gain for balance mode (higher = more damping, less oscillation)"
+    )
+    parser.add_argument(
+        "--error-scale",
+        type=float,
+        default=15.0,
+        help="Tanh error scale in degrees for balance mode (linear region width)"
+    )
+    parser.add_argument(
+        "--near-balance-scale",
+        type=float,
+        default=15.0,
+        help="Degrees: scale down action when |error| < this (smaller action near balance)"
+    )
+    parser.add_argument(
+        "--near-balance-min-gain",
+        type=float,
+        default=0.25,
+        help="Minimum gain near balance (0–1); avoids zero action at exact balance"
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=2.5,
+        help="Max change in PID output per second (lower = smoother, less oscillation)"
+    )
+    parser.add_argument(
+        "--output-limit",
+        type=float,
+        default=0.5,
+        help="Max PID output magnitude (lower = gentler response)"
+    )
+    
+    # Outer position-hold loop
+    parser.add_argument(
+        "--no-position-hold",
+        action="store_true",
+        help="Disable outer position-hold loop (only inner balance PID)"
+    )
+    parser.add_argument(
+        "--pos-kp", type=float, default=0.3,
+        help="Outer loop P gain: degrees of theta offset per radian of wheel displacement"
+    )
+    parser.add_argument(
+        "--pos-kd", type=float, default=0.15,
+        help="Outer loop D gain: damping on wheel velocity"
+    )
+    parser.add_argument(
+        "--pos-max-theta", type=float, default=4.0,
+        help="Max theta offset (degrees) the outer position loop can apply"
+    )
+    
+    # Calibration mode (record sweeps and balance-point snapshots to JSON)
+    parser.add_argument(
+        "--calibration",
+        action="store_true",
+        help="Run calibration mode: record sensor sweeps and balance-point data to JSON"
+    )
+    parser.add_argument(
+        "--calibration-output",
+        type=str,
+        default=None,
+        help="Output JSON path for calibration data (default: calibration_YYYYMMDD_HHMMSS.json)"
     )
     
     return parser.parse_args()
@@ -742,60 +840,487 @@ def run_idle_with_viewer(env, duration: float = None, viewer_config=None):
     run_with_viewer(env, action_fn, duration, viewer_config)
 
 
-def run_idle(env, duration: float = None):
-    """Run in idle mode - just monitor modules without motion.
+def _snapshot_obs(env, obs_vector=None):
+    """Capture current sensor/state snapshot from env as JSON-serializable dict.
     
-    Useful for testing connectivity and calibration.
+    Caller should call env.step(np.zeros(n)) before this to refresh state.
+    """
+    out = {}
+    # Observable data (raw sensors)
+    if hasattr(env, 'observable_data') and env.observable_data:
+        for key in ["dof_pos", "dof_vel", "quat", "ang_vel_body", "projected_gravity"]:
+            if key in env.observable_data and env.observable_data[key] is not None:
+                arr = np.asarray(env.observable_data[key]).flatten()
+                out[key] = [float(x) for x in arr]
+    # Derived projected_gravity / theta from state
+    if hasattr(env, 'state') and hasattr(env.state, 'derived'):
+        if hasattr(env.state.derived, 'projected_gravity'):
+            pg = env.state.derived.projected_gravity
+            if pg is not None:
+                pg_arr = np.asarray(pg).flatten()
+                out["projected_gravity"] = [float(x) for x in pg_arr]
+                if len(pg_arr) >= 2:
+                    theta_rad = np.arctan2(float(pg_arr[1]), float(pg_arr[0]))
+                    out["theta_deg"] = float(np.degrees(theta_rad))
+    # Full observation vector if available
+    if obs_vector is not None:
+        out["obs"] = [float(x) for x in np.asarray(obs_vector).flatten()]
+    elif hasattr(env, 'state') and hasattr(env.state, 'get_observation'):
+        try:
+            o = env.state.get_observation(insert=False)
+            if o is not None:
+                out["obs"] = [float(x) for x in np.asarray(o).flatten()]
+        except Exception:
+            pass
+    return out
+
+
+class PIDController:
+    """Simple PID controller with output clamp, derivative limit, and rate limiting."""
+    
+    def __init__(self, kp: float = 0.04, ki: float = 0.005, kd: float = 0.03,
+                 output_limit: float = 0.6, derivative_limit: float = 50.0,
+                 rate_limit: float = 3.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.output_limit = output_limit
+        self.derivative_limit = derivative_limit
+        self.rate_limit = rate_limit
+        self.reset()
+    
+    def reset(self):
+        self.integral = 0.0
+        self.last_error = None
+        self.last_time = None
+        self.last_output = 0.0
+    
+    def update(self, error: float, current_time: float, external_derivative: float = None):
+        """Update PID. error is scaled (e.g. tanh-scaled). external_derivative is d(theta)/dt in deg/s for D-term."""
+        dt = 0.0
+        if self.last_time is not None:
+            dt = current_time - self.last_time
+        if dt <= 0:
+            dt = 1e-6
+        
+        self.integral += error * dt
+        # Anti-windup: clamp integral contribution
+        max_i = self.output_limit / max(self.ki, 1e-9)
+        self.integral = np.clip(self.integral, -max_i, max_i)
+        
+        if external_derivative is not None:
+            d_term = -self.kd * external_derivative
+        else:
+            d_term = 0.0
+            if self.last_error is not None:
+                d_term = self.kd * (error - self.last_error) / dt
+            d_term = np.clip(d_term, -self.derivative_limit, self.derivative_limit)
+        
+        self.last_error = error
+        self.last_time = current_time
+        
+        out = self.kp * error + self.ki * self.integral + d_term
+        out = np.clip(out, -self.output_limit, self.output_limit)
+        
+        # Rate limit
+        delta = out - self.last_output
+        max_delta = self.rate_limit * dt
+        delta = np.clip(delta, -max_delta, max_delta)
+        out = self.last_output + delta
+        self.last_output = out
+        return out
+
+
+def run_calibration(env, output_path: str = None):
+    """Run calibration mode to record sensor data for later analysis.
+    
+    Two phases:
+      Phase 1 (Sweep × 3): Slowly tilt the robot from one side → balance → other side.
+                            Records all obs continuously during each sweep.
+      Phase 2 (Balance-point × 3): Place robot at the balance position, press Enter
+                                    to capture a snapshot. Repeat 3 times.
+    
+    All data is saved to a JSON file.
+    
+    Args:
+        env: RealMetaMachine environment
+        output_path: Output JSON file path (auto-generated if None)
+    """
+    if output_path is None:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        output_path = f"calibration_{ts}.json"
+    
+    print("\n" + "=" * 60)
+    print("  CALIBRATION MODE")
+    print("=" * 60)
+    print()
+    print("Motors are auto-disabled during calibration (no motion).")
+    print()
+    print("This will record sensor readings in two phases:")
+    print()
+    print("  Phase 1 — Full sweep (×3)")
+    print("    Slowly tilt the robot: lying flat → upright → flat on other side")
+    print("    Press ENTER to start each sweep, press ENTER again to stop.")
+    print()
+    print("  Phase 2 — Balance-point capture (×3)")
+    print("    Hold the robot at the balance position and press ENTER to capture.")
+    print()
+    print(f"  Output file: {output_path}")
+    print("=" * 60)
+    
+    # Calibration mode: skip "motors ON" requirement so we don't need to press 'e', and force motors disabled
+    if hasattr(env, 'calibration_mode'):
+        env.calibration_mode = True
+    if hasattr(env, '_disable_motor'):
+        env._disable_motor()
+    
+    # Reset environment (will proceed once modules are connected; motors stay disabled)
+    obs, info = env.reset()
+    
+    # Ensure motors stay disabled after reset and for the rest of calibration
+    if hasattr(env, '_disable_motor'):
+        env._disable_motor()
+    num_actions = env.action_space.shape[0]
+    for _ in range(10):
+        env.step(np.zeros(num_actions))
+    
+    calibration_data = {
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "sweeps": [],
+        "balance_points": [],
+    }
+    
+    # ─────────────────────────────────────────────
+    # Phase 1: Full sweeps
+    # ─────────────────────────────────────────────
+    NUM_SWEEPS = 3
+    print(f"\n{'─' * 60}")
+    print("  PHASE 1: Full Sweeps")
+    print(f"{'─' * 60}")
+    
+    for sweep_idx in range(NUM_SWEEPS):
+        print(f"\n  Sweep {sweep_idx + 1}/{NUM_SWEEPS}")
+        print("  Position robot lying flat on one side.")
+        input("  Press ENTER to START recording (then slowly tilt through balance to the other side)... ")
+        
+        print("  Recording... (press ENTER to STOP)")
+        
+        sweep_samples = []
+        stop_event = threading.Event()
+        start_t = time.time()
+        sample_count = 0
+        
+        # Background thread waits for Enter key to signal stop
+        def _wait_for_enter():
+            sys.stdin.readline()
+            stop_event.set()
+        
+        input_thread = threading.Thread(target=_wait_for_enter, daemon=True)
+        input_thread.start()
+        
+        while not stop_event.is_set():
+            # Step env to get fresh sensor data, then capture snapshot
+            obs, _, _, _, _ = env.step(np.zeros(num_actions))
+            snap = _snapshot_obs(env, obs_vector=obs)
+            snap["sweep_elapsed"] = time.time() - start_t
+            sweep_samples.append(snap)
+            sample_count += 1
+            
+            # Show live theta
+            theta_str = f"{snap.get('theta_deg', '?'):.1f}°" if isinstance(snap.get('theta_deg'), (int, float)) else "?"
+            print(f"\r    Samples: {sample_count} | Theta: {theta_str}  ", end="", flush=True)
+        
+        elapsed = time.time() - start_t
+        print(f"\n  ✓ Sweep {sweep_idx + 1} done: {sample_count} samples in {elapsed:.1f}s")
+        
+        calibration_data["sweeps"].append({
+            "sweep_index": sweep_idx,
+            "num_samples": sample_count,
+            "duration_s": elapsed,
+            "samples": sweep_samples,
+        })
+    
+    # ─────────────────────────────────────────────
+    # Phase 2: Balance-point captures
+    # ─────────────────────────────────────────────
+    NUM_CAPTURES = 3
+    SETTLE_SAMPLES = 20  # Average over this many samples for stability
+    
+    print(f"\n{'─' * 60}")
+    print("  PHASE 2: Balance-Point Captures")
+    print(f"{'─' * 60}")
+    
+    for cap_idx in range(NUM_CAPTURES):
+        print(f"\n  Capture {cap_idx + 1}/{NUM_CAPTURES}")
+        print("  Hold the robot at the exact balance position.")
+        input("  Press ENTER to capture... ")
+        
+        print(f"    Averaging {SETTLE_SAMPLES} samples...", end="", flush=True)
+        
+        # Collect several samples and average for stability (step env for fresh data)
+        samples = []
+        for _ in range(SETTLE_SAMPLES):
+            obs, _, _, _, _ = env.step(np.zeros(num_actions))
+            snap = _snapshot_obs(env, obs_vector=obs)
+            samples.append(snap)
+        
+        # Compute averaged values
+        avg_snapshot = {"capture_index": cap_idx, "num_averaged": SETTLE_SAMPLES}
+        
+        # Average scalar/vector fields
+        for key in ["dof_pos", "dof_vel", "quat", "ang_vel_body", "projected_gravity", "obs"]:
+            vals = [s[key] for s in samples if key in s]
+            if vals:
+                avg_snapshot[key] = np.mean(vals, axis=0).tolist()
+                avg_snapshot[f"{key}_std"] = np.std(vals, axis=0).tolist()
+        
+        # Average theta
+        thetas = [s["theta_deg"] for s in samples if "theta_deg" in s]
+        if thetas:
+            avg_snapshot["theta_deg"] = float(np.mean(thetas))
+            avg_snapshot["theta_deg_std"] = float(np.std(thetas))
+            print(f"  θ = {avg_snapshot['theta_deg']:.2f}° ± {avg_snapshot['theta_deg_std']:.2f}°")
+        else:
+            print("  (no theta available)")
+        
+        # Also store all raw samples
+        avg_snapshot["raw_samples"] = samples
+        
+        calibration_data["balance_points"].append(avg_snapshot)
+    
+    # ─────────────────────────────────────────────
+    # Summary & Save
+    # ─────────────────────────────────────────────
+    print(f"\n{'─' * 60}")
+    print("  CALIBRATION SUMMARY")
+    print(f"{'─' * 60}")
+    
+    total_sweep_samples = sum(s["num_samples"] for s in calibration_data["sweeps"])
+    print(f"  Sweeps: {NUM_SWEEPS} ({total_sweep_samples} total samples)")
+    
+    bp_thetas = [bp["theta_deg"] for bp in calibration_data["balance_points"] if "theta_deg" in bp]
+    if bp_thetas:
+        mean_theta = np.mean(bp_thetas)
+        std_theta = np.std(bp_thetas)
+        print(f"  Balance points: {NUM_CAPTURES}")
+        print(f"  Mean balance θ: {mean_theta:.2f}° ± {std_theta:.2f}°")
+        calibration_data["balance_theta_mean"] = float(mean_theta)
+        calibration_data["balance_theta_std"] = float(std_theta)
+    
+    # Save to JSON (convert any numpy types for serialization)
+    def _json_default(obj):
+        if isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+    
+    with open(output_path, 'w') as f:
+        json.dump(calibration_data, f, indent=2, default=_json_default)
+    
+    print(f"\n  Saved to: {output_path}")
+    print(f"  File size: {os.path.getsize(output_path) / 1024:.1f} KB")
+    print("=" * 60)
+    print("\nCalibration complete! Use the balance_theta_mean as --target-theta.")
+    
+    # Leave calibration mode so normal enable/disable works again
+    if hasattr(env, 'calibration_mode'):
+        env.calibration_mode = False
+
+
+def run_balance(env, target_theta: float = -117.57, kp: float = 0.035,
+                ki: float = 0.003, kd: float = 0.06, error_scale: float = 15.0,
+                near_balance_scale: float = 5.0, near_balance_min_gain: float = 0.25,
+                rate_limit: float = 2.0, output_limit: float = 0.5,
+                pos_kp: float = 0.3, pos_kd: float = 0.15,
+                pos_max_theta: float = 4.0, position_hold: bool = True,
+                duration: float = None):
+    """Run balance mode with cascade PID control.
+    
+    Inner loop: PID on theta (tilt angle) to keep the robot balanced.
+    Outer loop: estimates linear position from wheel encoders and adjusts
+    the target theta to drive the robot back to its starting position.
+    
+    Outer loop output:
+      theta_offset = pos_kp * position_error + pos_kd * velocity
+      effective_target = base_target_theta + clamp(theta_offset, ±pos_max_theta)
+    
+    Position is estimated from wheel encoders (dof_pos). Since the two wheels
+    are mounted in opposite directions, forward displacement is:
+      position = (delta_dof_pos[0] - delta_dof_pos[1]) / 2
+    
+    Tuning for oscillation (do gradually, one change at a time):
+      1. Increase Kd (--kd): more damping, reduces swing. Try 0.08, 0.10, 0.12.
+      2. Decrease Kp (--kp): less aggressive correction. Try 0.03, 0.025.
+      3. Decrease Ki (--ki) or set 0: integral can cause overshoot. Try 0.002 or 0.
+      4. Lower --rate-limit: smoother output, less jerk. Try 1.5, 1.0.
+      5. Lower --output-limit: cap max motor command. Try 0.4.
+      6. Increase --near-balance-scale: softer near center. Try 8, 10.
+    
+    Tuning position hold:
+      - If robot drifts but doesn't return: increase --pos-kp (try 0.5, 0.8).
+      - If outer loop causes new oscillation: decrease --pos-kp, increase --pos-kd.
+      - --pos-max-theta caps the maximum theta offset (default 4°).
+      - Use --no-position-hold to disable and run inner loop only.
     """
     print("\n" + "=" * 60)
-    print("Idle Mode - Monitoring Only")
+    print("Balance Mode - Cascade PID Control")
     print("=" * 60)
-    print("  Motors will not move automatically")
-    print("  Use this mode for connectivity testing and calibration")
+    print(f"  Target theta: {target_theta}°")
+    print(f"  Inner PID: Kp={kp}, Ki={ki}, Kd={kd}")
+    print(f"  Error scale: {error_scale}° | Near-balance: scale={near_balance_scale}° min_gain={near_balance_min_gain}")
+    print(f"  Rate limit: {rate_limit}/s  Output limit: ±{output_limit}")
+    if position_hold:
+        print(f"  Outer position loop: pos_Kp={pos_kp}, pos_Kd={pos_kd}, max_offset=±{pos_max_theta}°")
+    else:
+        print(f"  Outer position loop: DISABLED")
+    print(f"  Duration: {'infinite' if duration is None else f'{duration}s'}")
     print("=" * 60)
-    print("\nControls:")
-    print("  e - Enable motors")
-    print("  d - Disable motors")
-    print("  r - Restart motors")
-    print("  c - Calibrate motors")
-    print("  s - Print status")
-    print("  q - Quit")
+    print("\nControls: e=enable, d=disable, r=restart, c=calibrate, q=quit")
+    
+    # Inner PID (balance)
+    pid = PIDController(kp=kp, ki=ki, kd=kd, output_limit=output_limit,
+                        derivative_limit=50.0, rate_limit=rate_limit)
     
     # Reset environment
     obs, info = env.reset()
+    pid.reset()
+    
+    # Outer loop state: integrate dof_vel to estimate displacement
+    integrated_pos = 0.0
+    last_outer_time = None
+    theta_offset = 0.0
     
     start_time = time.time()
     step_count = 0
     
     try:
         while True:
-            elapsed = time.time() - start_time
+            current_time = time.time()
+            elapsed = current_time - start_time
             
             if duration is not None and elapsed >= duration:
                 print(f"\n[Done] Reached duration limit ({duration}s)")
                 break
             
-            # Send zero action to maintain communication
+            # --- Read sensor data ---
+            current_theta = None
+            
+            if hasattr(env, 'state') and hasattr(env.state, 'derived'):
+                if hasattr(env.state.derived, 'projected_gravity'):
+                    pg = env.state.derived.projected_gravity
+                    if pg is not None:
+                        pg_arr = np.asarray(pg).flatten()
+                        if len(pg_arr) >= 2:
+                            theta_rad = np.arctan2(pg_arr[1], pg_arr[0])
+                            current_theta = np.degrees(theta_rad)
+            
+            if current_theta is None and hasattr(env, 'observable_data') and env.observable_data:
+                if 'quat' in env.observable_data:
+                    quat = env.observable_data['quat']
+                    if quat is not None:
+                        x, y, z, w = quat
+                        gx = 2 * (x * z - w * y)
+                        gy = 2 * (y * z + w * x)
+                        gz = w * w - x * x - y * y + z * z
+                        pg_arr = np.array([-gx, -gy, -gz])
+                        theta_rad = np.arctan2(pg_arr[1], pg_arr[0])
+                        current_theta = np.degrees(theta_rad)
+            
+            if current_theta is None:
+                if step_count % 50 == 0:
+                    print(f"\r[Step {step_count}] Waiting for IMU data...", end="", flush=True)
+                num_actions = env.action_space.shape[0]
+                obs, reward, done, truncated, info = env.step(np.zeros(num_actions))
+                step_count += 1
+                if done or truncated:
+                    obs, info = env.reset()
+                    pid.reset()
+                    init_dof_pos = None
+                continue
+            
+            # --- Outer loop: position hold by integrating dof_vel ---
+            theta_offset = 0.0
+            wheel_vel = 0.0
+            
+            if position_hold and hasattr(env, 'observable_data') and env.observable_data:
+                dof_vel = env.observable_data.get('dof_vel')
+                
+                if dof_vel is not None:
+                    dof_vel = np.asarray(dof_vel).flatten()
+                    # Net wheel velocity (both wheels mounted opposite)
+                    wheel_vel = (dof_vel[0] - dof_vel[1]) / 2.0
+                    
+                    # Integrate velocity to get displacement estimate
+                    if last_outer_time is not None:
+                        dt = current_time - last_outer_time
+                        if dt > 0:
+                            integrated_pos += wheel_vel * dt
+                    last_outer_time = current_time
+                    
+                    # PD on integrated position + velocity damping
+                    raw_offset = pos_kp * integrated_pos + pos_kd * wheel_vel
+                    theta_offset = np.clip(raw_offset, -pos_max_theta, pos_max_theta)
+            
+            effective_target = target_theta + theta_offset
+            
+            # --- Gyro for inner D-term ---
+            gyro_theta_rate = 0.0
+            if hasattr(env, 'observable_data') and env.observable_data:
+                ang_vel = env.observable_data.get('ang_vel_body')
+                if ang_vel is not None:
+                    ang_vel = np.asarray(ang_vel).flatten()
+                    gyro_theta_rate = np.degrees(ang_vel[0])
+            
+            # --- Inner loop: balance PID ---
+            raw_error = effective_target - current_theta
+            while raw_error > 180:
+                raw_error -= 360
+            while raw_error < -180:
+                raw_error += 360
+            
+            error = error_scale * np.tanh(raw_error / error_scale)
+            
+            abs_err = abs(raw_error)
+            ramp = 1.0 - (1.0 - near_balance_min_gain) * np.exp(-abs_err / max(1e-6, near_balance_scale))
+            error = error * ramp
+            
+            control_output = pid.update(error, current_time, external_derivative=gyro_theta_rate)
+            
+            # --- Apply to motors ---
             num_actions = env.action_space.shape[0]
             action = np.zeros(num_actions)
-            
+            action[0] = control_output
+            action[1] = -control_output
+
             obs, reward, done, truncated, info = env.step(action)
             step_count += 1
             
-            # Handle special keyboard input for status
-            if hasattr(env, 'input_key') and env.input_key == 's':
-                env.print_status()
-                env.input_key = ""
+            if step_count % 50 == 0:
+                pos_str = f"Pos: {integrated_pos:+.2f}rad v:{wheel_vel:+.2f} θoff: {theta_offset:+.1f}°" if position_hold else ""
+                print(f"\r[{step_count}] {elapsed:.0f}s | "
+                      f"θ:{current_theta:.1f}° tgt:{effective_target:.1f}° "
+                      f"err:{raw_error:+.1f}° ctrl:{control_output:+.3f} "
+                      f"gyro:{gyro_theta_rate:+.1f}°/s {pos_str}",
+                      end="", flush=True)
             
             if done or truncated:
+                print(f"\n[Episode ended] Done={done}, Truncated={truncated}")
                 obs, info = env.reset()
+                pid.reset()
+                integrated_pos = 0.0
+                last_outer_time = None
     
     except KeyboardInterrupt:
         print("\n[Interrupted]")
     
     finally:
+        num_actions = env.action_space.shape[0]
+        env.step(np.zeros(num_actions))
+        
         elapsed = time.time() - start_time
-        print(f"\nIdle mode ended: {step_count} steps in {elapsed:.1f}s")
+        print(f"\n\nBalance mode ended: {step_count} steps in {elapsed:.1f}s")
+
 
 
 # =============================================================================
@@ -949,6 +1474,28 @@ def main():
     env = create_environment(cfg)
     
     try:
+        if args.calibration:
+            run_calibration(env, output_path=args.calibration_output)
+            return
+        if args.balance:
+            run_balance(
+                env,
+                target_theta=args.target_theta,
+                kp=args.kp,
+                ki=args.ki,
+                kd=args.kd,
+                error_scale=args.error_scale,
+                near_balance_scale=args.near_balance_scale,
+                near_balance_min_gain=args.near_balance_min_gain,
+                rate_limit=args.rate_limit,
+                output_limit=args.output_limit,
+                pos_kp=args.pos_kp,
+                pos_kd=args.pos_kd,
+                pos_max_theta=args.pos_max_theta,
+                position_hold=not args.no_position_hold,
+                duration=args.duration,
+            )
+            return
         if args.test_motion:
             # Run sinusoidal test motion
             if args.viewer:

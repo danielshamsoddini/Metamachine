@@ -265,6 +265,7 @@ class RealMetaMachine(Base):
         
         # Control state
         self.motor_enabled = False
+        self.calibration_mode = False  # When True, skip motor-on requirement and force motors disabled
         self.last_motor_com_time = time.time()
         self.compute_time = 0.0
         self.send_dt = 0.0
@@ -662,6 +663,10 @@ class RealMetaMachine(Base):
             ip = self.module_to_ip.get(module_id)
             if ip not in active_ips:
                 return False
+        
+        # In calibration mode, only require modules connected and active (not motors ON)
+        if getattr(self, 'calibration_mode', False):
+            return True
         
         # Check all active motor modules are ON (motor_mode == 2)
         # motor_mode: 0=Reset/Off, 1=Calibration, 2=Active/On
@@ -1425,6 +1430,10 @@ class RealMetaMachine(Base):
         sent_count = 0
         current_time = time.time()
         
+        # In calibration mode always send disable so motors never turn on
+        if getattr(self, 'calibration_mode', False):
+            enable = False
+        
         # Send commands to each expected module in order
         for action_idx, module_id in enumerate(self.expected_module_ids):
             if module_id not in self.module_to_ip:
@@ -1512,9 +1521,10 @@ class RealMetaMachine(Base):
         if hasattr(self, 'kb') and self.kb.kbhit():
             self.input_key = self.kb.getch()
             
-            # Motor controls
+            # Motor controls (ignore enable when in calibration mode so motors stay disabled)
             if self.input_key == "e":
-                self._enable_motor()
+                if not getattr(self, 'calibration_mode', False):
+                    self._enable_motor()
             elif self.input_key == "d":
                 self._disable_motor()
             elif self.input_key == "r":

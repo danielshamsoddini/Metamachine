@@ -191,7 +191,7 @@ real:
 control:
   dt: 0.05                # Control timestep (20 Hz)
   num_actions: 2      # Number of actuated joints (must match len(module_ids))
-  action_scale: 2
+  action_scale: 2.5
   symmetric_limit: 200
   custom_limits: null
   motor_range: [-6, 6]
@@ -206,7 +206,7 @@ control:
     enabled: true
     wheel_joints:
       indices: [0, 1]       # Both joints are velocity-controlled wheels
-      kd: 8.0               # Velocity damping for wheels
+      kd: 12             # Velocity damping for wheels
       action_scale: 8     # Scale factor for wheel velocity commands
   
   # Observation masking for wheel joints (no encoder for wheel positions)
