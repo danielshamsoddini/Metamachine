@@ -625,6 +625,61 @@ class OneHotForwardComponent(RewardComponent):
         return np.exp(-lin_vel_error / tracking_sigma)
 
 
+class LocalXVelocityComponent(RewardComponent):
+    """
+    Simple forward reward based on body-frame local x velocity.
+
+    Encourages moving faster in +x direction, with clipping.
+
+    Parameters (in params dict):
+        clip_max: Max rewarded local x velocity in m/s (default: 2.0)
+        normalize: If True, scale reward to [0, 1] by dividing by clip_max
+                   (default: True)
+    """
+
+    def calculate(self, state, calculator) -> float:
+        clip_max = self.params.get("clip_max", 2.0)
+        normalize = self.params.get("normalize", True)
+
+        safe_clip_max = max(float(clip_max), 1e-6)
+        forward_x_vel = state.accurate_vel_body[0]
+        clipped_vel = np.clip(forward_x_vel, 0.0, safe_clip_max)
+
+        if normalize:
+            return clipped_vel / safe_clip_max
+        return clipped_vel
+
+
+class GlobalSpeedComponent(RewardComponent):
+    """
+    Direction-agnostic reward based on global/world-frame speed magnitude.
+
+    Encourages high speed regardless of movement direction, with clipping.
+
+    Parameters (in params dict):
+        clip_max: Max rewarded speed in m/s (default: 2.0)
+        normalize: If True, scale reward to [0, 1] by dividing by clip_max
+                   (default: True)
+    """
+
+    def calculate(self, state, calculator) -> float:
+        clip_max = self.params.get("clip_max", 2.0)
+        normalize = self.params.get("normalize", True)
+
+        safe_clip_max = max(float(clip_max), 1e-6)
+        vel_world = getattr(state, "accurate_vel_world", None)
+        if vel_world is None:
+            vel_world = getattr(state, "vel_world", np.zeros(3))
+
+        speed = np.linalg.norm(vel_world)
+        clipped_speed = np.clip(speed, 0.0, safe_clip_max)
+        # print(f"Global speed: {speed:.3f}, clipped: {clipped_speed:.3f}")
+
+        if normalize:
+            return clipped_speed / safe_clip_max
+        return clipped_speed
+
+
 class StateCoveringIntrinsicRewardComponent(RewardComponent):
     """
     Intrinsic reward for state-covering skill discovery via RND.
@@ -751,6 +806,8 @@ COMPONENT_REGISTRY = {
     "windowed_displacement_efficiency": WindowedDisplacementEfficiencyComponent,
     "onehot_turning": OneHotTurningComponent,
     "onehot_forward": OneHotForwardComponent,
+    "local_x_velocity": LocalXVelocityComponent,
+    "global_speed": GlobalSpeedComponent,
     "state_covering_intrinsic": StateCoveringIntrinsicRewardComponent,
 }
 

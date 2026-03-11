@@ -419,7 +419,7 @@ class MetaMachine(Base, MujocoEnv):
             np.random.choice(asset_files) if self.randomize_asset else asset_files
         )
 
-        xml_path = os.path.join(ROOT_DIR, "assets", "robots", asset_file)
+        xml_path = self._resolve_asset_xml_path(asset_file)
 
         # Initialize XML compiler with modifications
         self.xml_compiler = XMLCompiler(xml_path)
@@ -448,6 +448,37 @@ class MetaMachine(Base, MujocoEnv):
             self.mass_range = self.xml_compiler.get_mass_range(mass_percentage)
 
         self.xml_string = self.xml_compiler.get_string()
+
+    def _resolve_asset_xml_path(self, asset_file: Any) -> str:
+        """Resolve XML path from absolute path, repo-relative path, or built-in asset name."""
+        if asset_file is None:
+            raise ValueError("morphology.asset_file cannot be None when loading from asset")
+
+        asset_file_str = str(asset_file)
+        candidates = []
+
+        if os.path.isabs(asset_file_str):
+            candidates.append(asset_file_str)
+        else:
+            repo_root = os.path.dirname(ROOT_DIR)
+            candidates.extend(
+                [
+                    asset_file_str,  # relative to current working directory
+                    os.path.join(repo_root, asset_file_str),  # relative to repo root
+                    os.path.join(ROOT_DIR, asset_file_str),  # relative to metamachine package root
+                    os.path.join(ROOT_DIR, "assets", "robots", asset_file_str),  # legacy behavior
+                ]
+            )
+
+        for path in candidates:
+            abs_path = os.path.abspath(os.path.expanduser(path))
+            if os.path.exists(abs_path):
+                return abs_path
+
+        raise FileNotFoundError(
+            f"Could not find XML asset '{asset_file_str}'. Tried: "
+            + ", ".join(os.path.abspath(os.path.expanduser(p)) for p in candidates)
+        )
 
     def _setup_mujoco(self) -> None:
         """Setup MuJoCo environment."""
@@ -869,17 +900,12 @@ class MetaMachine(Base, MujocoEnv):
         """Setup robot model parameters after MuJoCo initialization."""
         self.num_joint = self.model.nu
 
-        # Extract joint module IDs
-        self.jointed_module_ids = sorted(
-            [
-                int(
-                    mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, j).replace(
-                        "joint", ""
-                    )
-                )
-                for j in self.model.actuator_trnid[:, 0]
-            ]
-        )
+        # Get actuator-driven joints (in actuator order for generic XML support)
+        actuator_joint_ids = [int(j) for j in self.model.actuator_trnid[:, 0]]
+        actuator_joint_names = [
+            mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, j)
+            for j in actuator_joint_ids
+        ]
 
         # Validate action space
         expected_joints = self.num_act * self.num_envs
@@ -888,19 +914,111 @@ class MetaMachine(Base, MujocoEnv):
                 f"Action space mismatch: expected {expected_joints}, got {self.num_joint}"
             )
 
-        # Setup joint and body indices
-        self.joint_idx = [
-            self.model.joint(f"joint{i}").id for i in self.jointed_module_ids
-        ]
-        self.joint_geom_idx = [
-            self.model.geom(f"left{i}").id for i in self.jointed_module_ids
-        ] + [self.model.geom(f"right{i}").id for i in self.jointed_module_ids]
-        self.joint_body_idx = [
-            self.model.geom(f"left{i}").bodyid.item() for i in self.jointed_module_ids
-        ]
+        # Try modular naming first (joint{module_id}), then fall back to generic joints.
+        self._uses_modular_joint_naming = False
+        parsed_module_ids = []
+        try:
+            for name in actuator_joint_names:
+                if name is None or not name.startswith("joint"):
+                    raise ValueError("Non-modular joint name detected")
+                parsed_module_ids.append(int(name.replace("joint", "")))
+
+            self.jointed_module_ids = sorted(parsed_module_ids)
+            self.joint_idx = [
+                self.model.joint(f"joint{i}").id for i in self.jointed_module_ids
+            ]
+            self.joint_geom_idx = [
+                self.model.geom(f"left{i}").id for i in self.jointed_module_ids
+            ] + [self.model.geom(f"right{i}").id for i in self.jointed_module_ids]
+            self.joint_body_idx = [
+                int(self.model.geom(f"left{i}").bodyid.item())
+                for i in self.jointed_module_ids
+            ]
+            self._uses_modular_joint_naming = True
+        except (ValueError, KeyError):
+            self.jointed_module_ids = []
+            self.joint_idx = actuator_joint_ids
+            joint_body_ids = [int(self.model.jnt_bodyid[j]) for j in self.joint_idx]
+            # Preserve order while de-duplicating
+            self.joint_body_idx = list(dict.fromkeys(joint_body_ids))
+            joint_body_set = set(self.joint_body_idx)
+            self.joint_geom_idx = [
+                geom_id
+                for geom_id in range(self.model.ngeom)
+                if int(self.model.geom_bodyid[geom_id]) in joint_body_set
+            ]
+
+        self.torso_body_id = self._resolve_torso_body_id()
+        self.floor_geom_ids = self._resolve_floor_geom_ids()
 
         # Setup PD gains with per-joint control support
         self._setup_pd_gains()
+
+    def _resolve_torso_body_id(self) -> int:
+        """Resolve torso body ID for both modular and generic XML models."""
+        torso_body_name = self.cfg.observation.get("torso_body_name", None)  # type: ignore
+        if torso_body_name is not None:
+            try:
+                return self.model.body(str(torso_body_name)).id
+            except KeyError:
+                print(
+                    f"Warning: torso_body_name '{torso_body_name}' not found. Falling back to auto torso body."
+                )
+
+        torso_node_id = self.cfg.observation.get("torso_node_id", 0)  # type: ignore
+        modular_name = f"l{torso_node_id}"
+        try:
+            return self.model.body(modular_name).id
+        except KeyError:
+            pass
+
+        if isinstance(torso_node_id, str):
+            try:
+                return self.model.body(torso_node_id).id
+            except KeyError:
+                pass
+
+        if getattr(self, "joint_body_idx", None):
+            return int(self.joint_body_idx[0])
+
+        # Fallback to first non-world body when available
+        return 1 if self.model.nbody > 1 else 0
+
+    def _resolve_floor_geom_ids(self) -> list[int]:
+        """Resolve floor geom IDs from config, with robust defaults."""
+        term_cfg = self.cfg.task.get("termination_conditions", {})  # type: ignore
+        configured_floor_names = term_cfg.get("floor_geom_names", None)
+
+        if configured_floor_names is None:
+            floor_names = ["floor"]
+            user_configured = False
+        elif isinstance(configured_floor_names, str):
+            floor_names = [configured_floor_names]
+            user_configured = True
+        else:
+            floor_names = list(configured_floor_names)
+            user_configured = True
+
+        floor_ids: set[int] = set()
+        for floor_name in floor_names:
+            try:
+                floor_ids.add(self.model.geom(str(floor_name)).id)
+            except KeyError:
+                if user_configured:
+                    print(f"Warning: floor geom '{floor_name}' not found in model.")
+
+        # Auto-detect plane geoms when default "floor" is not present.
+        if not floor_ids and not user_configured:
+            for geom_id in range(self.model.ngeom):
+                if self.model.geom(geom_id).type == mujoco.mjtGeom.mjGEOM_PLANE:
+                    floor_ids.add(geom_id)
+
+        # Legacy fallback
+        if not floor_ids and self.model.ngeom > 0:
+            floor_ids.add(0)
+            print("Warning: Falling back to geom id 0 as floor.")
+
+        return sorted(floor_ids)
 
     def _setup_pd_gains(self) -> None:
         """Setup PD gains with optional per-joint configuration.
@@ -1356,6 +1474,30 @@ class MetaMachine(Base, MujocoEnv):
         # Sensor data
         self._update_sensor_readings()
         sensor_data = self._extract_sensor_data()
+        sensor_module_count = len(self.joint_idx)
+        if sensor_module_count <= 0:
+            sensor_module_count = self.num_act
+        if sensor_module_count <= 0:
+            sensor_module_count = 1
+
+        if "quats" not in sensor_data or np.asarray(sensor_data["quats"]).size == 0:
+            # Generic XMLs may not define per-module IMU sensors.
+            sensor_data["quats"] = np.repeat(
+                state_data["quat"][None, :], sensor_module_count, axis=0
+            )
+
+        sensor_data["gyros"] = self._coerce_sensor_matrix(
+            sensor_data.get("gyros"),
+            rows=sensor_module_count,
+            cols=3,
+            fill_value=0.0,
+        )
+        sensor_data["accs"] = self._coerce_sensor_matrix(
+            sensor_data.get("accs"),
+            rows=sensor_module_count,
+            cols=3,
+            fill_value=0.0,
+        )
 
         # Extended data with noise handling
         extended_data = self._create_extended_state_data({**state_data, **sensor_data})
@@ -1368,9 +1510,7 @@ class MetaMachine(Base, MujocoEnv):
     def _extract_core_state(self, qpos: np.ndarray, qvel: np.ndarray) -> dict[str, Any]:
         """Extract core robot state information."""
         # Position and orientation
-        # self.pos_world = qpos[:3]
-        self.torso_node_id = self.cfg.observation.get("torso_node_id", 0)  # type: ignore 
-        torso_body_id = self.model.body(f"l{self.torso_node_id}").id
+        torso_body_id = self.torso_body_id
 
         self.pos_world = self.data.xpos[torso_body_id]
         quat = self.data.xquat[torso_body_id]
@@ -1404,6 +1544,9 @@ class MetaMachine(Base, MujocoEnv):
 
     def _update_sensor_readings(self) -> None:
         """Update all sensor readings from simulation."""
+        # Rebuild every step to avoid stale keys when sensors are absent.
+        self.sensors.clear()
+
         sensor_specs = [
             ("quat", 4),
             ("gyro", 3),
@@ -1428,7 +1571,9 @@ class MetaMachine(Base, MujocoEnv):
                         self.data.sensordata[start_addr : start_addr + size]
                     )
 
-                self.sensors[sensor_type] = np.array(sensor_data)
+                # Only keep non-empty sensor arrays. Generic XML assets may have no IMU sensors.
+                if sensor_data:
+                    self.sensors[sensor_type] = np.array(sensor_data)
             except (KeyError, IndexError):
                 continue
 
@@ -1446,6 +1591,35 @@ class MetaMachine(Base, MujocoEnv):
             sensor_data["accs"] = self.sensors["acc"]
 
         return sensor_data
+
+    def _coerce_sensor_matrix(
+        self,
+        data: Optional[np.ndarray],
+        rows: int,
+        cols: int,
+        fill_value: float = 0.0,
+    ) -> np.ndarray:
+        """Convert sensor data to fixed (rows, cols) shape via crop/pad/fill."""
+        out = np.full((rows, cols), fill_value, dtype=np.float32)
+        if data is None:
+            return out
+
+        arr = np.asarray(data, dtype=np.float32)
+        if arr.size == 0:
+            return out
+
+        if arr.ndim == 1:
+            if arr.shape[0] == cols:
+                arr = arr.reshape(1, cols)
+            else:
+                return out
+
+        if arr.ndim != 2 or arr.shape[1] != cols:
+            return out
+
+        n = min(rows, arr.shape[0])
+        out[:n] = arr[:n]
+        return out
 
     def _create_extended_state_data(self, base_data: dict[str, Any]) -> dict[str, Any]:
         """Create extended data with accurate versions and noise."""
@@ -1498,8 +1672,16 @@ class MetaMachine(Base, MujocoEnv):
 
     def _extract_contact_data(self) -> dict[str, Any]:
         """Extract contact information."""
-        contacts = [c.geom for c in self.data.contact]
-        floor_contacts = [c.geom for c in self.data.contact if 0 in c.geom]
+        floor_id_set = set(getattr(self, "floor_geom_ids", [0]))
+        contacts = [tuple(int(g) for g in c.geom) for c in self.data.contact]
+        floor_contacts = [
+            pair
+            for pair in contacts
+            if (pair[0] in floor_id_set) or (pair[1] in floor_id_set)
+        ]
+        non_floor_contact_geoms = {
+            geom for pair in floor_contacts for geom in pair if geom not in floor_id_set
+        }
 
         # Count joint-floor contacts
         joint_floor_count = sum(
@@ -1510,22 +1692,18 @@ class MetaMachine(Base, MujocoEnv):
         return {
             "contact_geoms": contacts,
             "num_jointfloor_contact": joint_floor_count,
-            "contact_floor_geoms": list(
-                {geom for pair in floor_contacts for geom in pair if geom != 0}
-            ),
+            "contact_floor_geoms": list(non_floor_contact_geoms),
             "contact_floor_socks": list(
                 {
                     geom
-                    for pair in floor_contacts
-                    for geom in pair
+                    for geom in non_floor_contact_geoms
                     if self.model.geom(geom).name.startswith("sock")
                 }
             ),
             "contact_floor_balls": list(
                 {
                     geom
-                    for pair in floor_contacts
-                    for geom in pair
+                    for geom in non_floor_contact_geoms
                     if (
                         self.model.geom(geom).name.startswith("left")
                         or self.model.geom(geom).name.startswith("right")
@@ -1734,7 +1912,7 @@ class MetaMachine(Base, MujocoEnv):
             return
 
         friction_range = friction_cfg.get("range", [0.8, 1.2])
-        rolling_friction_range = friction_cfg.get("rolling_range", [0.1, 0.4])
+        rolling_friction_range = friction_cfg.get("rolling_range", [0.0, 0.04])
         detailed_range = friction_cfg.get("detailed_range", None)
 
         if is_number(friction_range[0]):
@@ -1743,7 +1921,7 @@ class MetaMachine(Base, MujocoEnv):
             self.model.geom("floor").friction[0] = friction
             self.model.geom("floor").priority[0] = 10
             roll_friction = np.random.uniform(*rolling_friction_range)
-            self.model.geom("floor").friction[2] = 0.05 # roll_friction
+            self.model.geom("floor").friction[2] = 0 # 0.05 # roll_friction
             self.model.geom("floor").friction[1] = roll_friction
             # print(f"Applied floor rolling friction: {roll_friction:.4f}")
         else:

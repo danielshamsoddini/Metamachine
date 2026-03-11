@@ -275,6 +275,48 @@ def mutate_genome(genome: dict) -> dict:
     return genome
 
 
+def mutate_morphology(genome: dict) -> dict:
+    """Apply one random morphology-affecting mutation to a genome.
+
+    Unlike :func:`mutate_genome`, this function **always** changes the
+    morphology structure — it never falls through to the oscillation-only
+    branch (which would be a no-op once oscillation is stripped).  The
+    returned genome has no ``"oscillation"`` key.
+
+    Possible mutations:
+
+    1. **Prefix-tweak** (80 %): keep a random prefix of connections and
+       resample the remaining slots from that point onward.
+    2. **Full regeneration** (20 %): build a completely new random
+       morphology with the same module count.
+
+    Args:
+        genome: Modular-leg genome dict (must contain ``"morphology"``).
+
+    Returns:
+        New genome dict with mutated morphology and no oscillation key.
+    """
+    genome = copy.deepcopy(genome)
+    morphology = genome["morphology"]
+    num_modules = genome.get("num_modules", len(morphology) // 4)
+
+    if not morphology or random.random() >= 0.8:
+        # Full regeneration
+        genome["morphology"] = sample_morphology(num_modules=num_modules)
+    else:
+        # Prefix-tweak: keep prefix[0:idx], resample the rest
+        num_connections = len(morphology) // 4
+        idx = random.randint(0, num_connections - 1)
+        prefix = morphology[: idx * 4]
+        remaining = num_connections - idx
+        robot_designer = _replay_prefix(prefix)
+        new_tail = _extend_morphology(robot_designer, remaining)
+        genome["morphology"] = prefix + new_tail
+
+    genome.pop("oscillation", None)
+    return genome
+
+
 def crossover_genomes(g1: dict, g2: dict) -> dict:
     """Crossover two modular-leg genomes.
 

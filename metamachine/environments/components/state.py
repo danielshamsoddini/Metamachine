@@ -510,6 +510,7 @@ class State:
     OBSERVATION_COMPONENTS = {
         "projected_gravity": lambda s: s.derived.projected_gravity,
         "projected_gravities": lambda s: s.derived.projected_gravities,
+        "quat": lambda s: s.raw.quat,
         "ang_vel_body": lambda s: s.raw.ang_vel_body,
         "dof_pos": lambda s: s.raw.dof_pos,
         "dof_vel": lambda s: s.raw.dof_vel,

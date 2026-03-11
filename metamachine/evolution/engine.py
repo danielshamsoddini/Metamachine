@@ -208,6 +208,7 @@ class EvolutionEngine:
         verbose: bool = True,
         checkpoint_interval: int = 5,
         callback: Optional[Callable] = None,
+        evaluation_callback: Optional[Callable] = None,
     ) -> Individual:
         """
         Run the evolutionary loop.
@@ -218,6 +219,8 @@ class EvolutionEngine:
             verbose: Print progress.
             checkpoint_interval: Save checkpoint every N generations.
             callback: Called after each generation with (engine, gen_stats).
+            evaluation_callback: Called after each individual evaluation with
+                ``(engine, individual)``.
 
         Returns:
             Best individual found.
@@ -244,7 +247,11 @@ class EvolutionEngine:
         self.population = self.population[: self.population_size]
 
         # --- Evaluate initial population ---
-        self._evaluate_population(self.population, verbose=verbose)
+        self._evaluate_population(
+            self.population,
+            verbose=verbose,
+            evaluation_callback=evaluation_callback,
+        )
         self._update_best()
 
         if verbose:
@@ -266,7 +273,11 @@ class EvolutionEngine:
             offspring = self._create_offspring()
 
             # 2. Evaluate offspring
-            self._evaluate_population(offspring, verbose=verbose)
+            self._evaluate_population(
+                offspring,
+                verbose=verbose,
+                evaluation_callback=evaluation_callback,
+            )
 
             # 3. Survivor selection (μ+λ with elitism)
             self.population = self._select_survivors(offspring)
@@ -303,7 +314,10 @@ class EvolutionEngine:
     # -----------------------------------------------------------------
 
     def _evaluate_population(
-        self, pop: list[Individual], verbose: bool = False
+        self,
+        pop: list[Individual],
+        verbose: bool = False,
+        evaluation_callback: Optional[Callable] = None,
     ) -> None:
         """Evaluate fitness for all unevaluated individuals."""
         for i, ind in enumerate(pop):
@@ -320,6 +334,8 @@ class EvolutionEngine:
                     f"  [{tag}] Evaluated {i+1}/{len(pop)} "
                     f"(id={ind.id}) -> fitness={ind.fitness:.4f}"
                 )
+            if evaluation_callback:
+                evaluation_callback(self, ind)
 
     def _select_parent(self) -> Individual:
         """Select one parent from the current population."""

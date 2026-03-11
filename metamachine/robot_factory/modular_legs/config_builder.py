@@ -20,6 +20,7 @@ def create_config_from_morphology(
     config_name: str = "quadruped_pose_opt",
     render: bool = False,
     pose_optimization: bool = True,
+    keep_default_dof_pos: bool = False,
     log_dir: Optional[str] = None,
 ) -> object:
     """Build a headless MetaMachine config for a given morphology sequence.
@@ -36,6 +37,13 @@ def create_config_from_morphology(
         pose_optimization: Whether to enable MJX pose optimisation.  Set to
                      ``False`` to skip the (slow) optimisation step and use the
                      default joint positions as-is.
+        keep_default_dof_pos: When ``True`` and ``pose_optimization=False``,
+                     preserve the config's ``default_dof_pos`` value instead
+                     of zeroing it out.  Useful when the base config's joint
+                     offsets match the morphology being evaluated (e.g. the
+                     ``basic_quadruped`` config seeding a preset-based
+                     fast-evolution run).  Default ``False`` (zero out) to
+                     maintain backward-compatible behaviour.
         log_dir:     Optional log directory.
 
     Returns:
@@ -54,15 +62,16 @@ def create_config_from_morphology(
     # Disable randomisation for deterministic fitness
     cfg.initialization.randomize_orientation = False
     cfg.initialization.noisy_init = False
+    cfg.initialization.randomize_ini_vel = False
     cfg.randomization.init_joint_pos.enabled = False
 
     # Pose optimisation override
     if not pose_optimization:
         cfg.pose_optimization.enabled = False
-        # Without pose opt the optimizer won't set default_dof_pos, so zero
-        # it out to avoid the config's hardcoded joint offsets (e.g.
-        # [0, -1, 1, 1, -1]) biasing the oscillation controller.
-        cfg.control.default_dof_pos = [0.0] * cfg.control.num_actions
+        if not keep_default_dof_pos:
+            # Zero out hardcoded joint offsets (e.g. [0, -1, 1, 1, -1]) so
+            # they don't bias controllers that weren't designed for them.
+            cfg.control.default_dof_pos = [0.0] * cfg.control.num_actions
 
     if log_dir is not None:
         cfg.logging.data_dir = log_dir

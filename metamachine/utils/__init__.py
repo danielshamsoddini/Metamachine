@@ -75,6 +75,30 @@ __all__ = [
     "add_sphere_marker",
     "add_arrow_marker",
     "render_line",
+    # Bearing estimation utilities
+    "MultiPolicyBearingCollector",
+    "BearingEstimatorV3",
+    "BearingEstimatorRunner",
+    "BearingAugmentedConfig",
+    "BearingAugmentedPolicySwitchEnv",
+    # Chase visualization utilities
+    "add_chase_scene_markers",
+    "add_bearing_metrics_overlay",
+    "compute_bearing_from_pose",
+    "compute_forward_direction",
+    "draw_chase_frame_matplotlib",
+    # MJX utilities (optional, requires jax and mujoco-mjx)
+    "create_batched_env_fns",
+    "create_single_env_fns",
+    "warmup_jit",
+    "run_batched_rollout",
+    "run_single_rollout",
+    "render_mjx_trajectory",
+    "save_video",
+    "get_mjx_data_as_mujoco",
+    "print_mjx_info",
+    "zero_policy",
+    "random_policy",
 ]
 
 # SB3 utilities (optional import - only available if stable-baselines3 is installed)
@@ -147,3 +171,63 @@ from .rendering import (
     add_arrow_marker,
     render_line,
 )
+
+# Bearing estimation utilities (optional)
+try:
+    from .bearing_estimation import (
+        MultiPolicyBearingCollector,
+        BearingEstimatorV3,
+        BearingEstimatorRunner,
+        BearingAugmentedConfig,
+        BearingAugmentedPolicySwitchEnv,
+    )
+except ImportError:
+    MultiPolicyBearingCollector = None
+    BearingEstimatorV3 = None
+    BearingEstimatorRunner = None
+    BearingAugmentedConfig = None
+    BearingAugmentedPolicySwitchEnv = None
+
+# Chase visualization utilities
+try:
+    from .chase_visualization import (
+        add_chase_scene_markers,
+        add_bearing_metrics_overlay,
+        compute_bearing_from_pose,
+        compute_forward_direction,
+        draw_chase_frame_matplotlib,
+    )
+except ImportError:
+    add_chase_scene_markers = None
+    add_bearing_metrics_overlay = None
+    compute_bearing_from_pose = None
+    compute_forward_direction = None
+    draw_chase_frame_matplotlib = None
+
+# MJX utilities (optional - requires jax and mujoco-mjx)
+try:
+    from .mjx_utils import (
+        create_batched_env_fns,
+        create_single_env_fns,
+        warmup_jit,
+        run_batched_rollout,
+        run_single_rollout,
+        render_mjx_trajectory,
+        save_video,
+        get_mjx_data_as_mujoco,
+        print_mjx_info,
+        zero_policy,
+        random_policy,
+    )
+except ImportError:
+    create_batched_env_fns = None
+    create_single_env_fns = None
+    warmup_jit = None
+    run_batched_rollout = None
+    run_single_rollout = None
+    render_mjx_trajectory = None
+    save_video = None
+    get_mjx_data_as_mujoco = None
+    print_mjx_info = None
+    zero_policy = None
+    random_policy = None
