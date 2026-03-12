@@ -12,25 +12,17 @@ A simulation framework for modular robots, designed to accelerate research in ro
 
 ## Overview
 
-MetaMachine is a simulation framework for modular robotic systems. Currently featuring a **MuJoCo-based modular legs** implementation based on my [recent work](https://arxiv.org/abs/2505.00784) on reconfigurable legged metamachines, this framework will expand to support diverse modular robot architectures using various simulation backends throughout my PhD research.
+MetaMachine is a simulation framework for modular robotic systems. Currently featuring a **MuJoCo-based modular legs** implementation based on [Agile Legged Locomotion in Reconfigurable Modular Robots](https://modularlegs.github.io/), this framework will expand to support diverse modular robot architectures using various simulation backends throughout my PhD research.
 
 **Vision**: MetaMachine aims to become a cornerstone in the next-generation ecosystem for fast prototyping robot learning research systems, serving as both a robot learning and evolutionary robotics benchmark and comprehensive development platform.
 
 ## Current Implementation
 
-### 🦿 Modular Legs System
-Based on "[Reconfigurable legged metamachines that run on autonomous modular legs](https://arxiv.org/abs/2505.00784)" (arXiv:2505.00784):
+### Modular Legs System
+Based on "[Agile Legged Locomotion in Reconfigurable Modular Robots](https://modularlegs.github.io/)":
 - **Autonomous modular legs**: Single-degree-of-freedom jointed links that learn complex dynamic behaviors
 - **Reconfigurable metamachines**: Freely attachable modules forming meter-scale legged robots
 - **Dynamic locomotion**: Non-quasistatic movement through unstructured environments
-
-## Key Features
-
-- **🎯 Research-focused**: Designed for robot learning and evolutionary robotics research
-- **🔧 Modular architecture**: Extensible framework for diverse robot systems
-- **⚡ Physics simulation**: High-fidelity simulation (current: MuJoCo)
-- **🔬 Gymnasium-compatible**: Standard RL environment interface
-- **📊 Rich visualization**: Real-time rendering and video recording
 
 ## Quick Start
 
@@ -121,10 +113,10 @@ for step in range(1000):
 
 MetaMachine is actively being developed with plans to expand beyond modular legs:
 
-- **🚀 Current**: Modular legs implementation (based on arXiv:2505.00784)
-- **🔮 Upcoming**: Additional modular robot architectures during PhD research
-- **🎯 Long-term**: Comprehensive benchmark suite for robot learning and evolutionary robotics
-- **🌟 Vision**: Core component of next-gen robot learning research ecosystem
+- **Current**: Modular legs implementation (based on paper Agile legged locomotion in reconfigurable modular robots)
+- **Upcoming**: Additional modular robot architectures during PhD research
+- **Long-term**: Comprehensive benchmark suite for robot learning and evolutionary robotics
+- **Vision**: Core component of next-gen robot learning research ecosystem
 
 ## Project Structure
 
@@ -177,15 +169,6 @@ This is an active research project. Contributions, feedback, and collaborations 
    ```
 6. Submit a pull request
 
-### Release Status
-
-- 🚧 **MVP Release**: This is a Minimum Viable Product with core functionality
-- 🔄 **Active Development**: Package is under continuous development and improvement
-- 📦 **PyPI Available**: Regular releases published to PyPI as features are added
-- 🧪 **Research Focus**: Designed primarily for research applications
-- 📈 **Expanding**: More modular robot architectures and features being added regularly
-- 💬 **Feedback Welcome**: Community input helps guide development priorities
-
 ## Citation
 
 If you use MetaMachine in your research, please cite:
@@ -203,11 +186,15 @@ If you use MetaMachine in your research, please cite:
 For the modular legs implementation, please also cite:
 
 ```bibtex
-@article{yu2025reconfigurable,
-  title={Reconfigurable legged metamachines that run on autonomous modular legs},
+@article{yu2026agile,
+  title={Agile legged locomotion in reconfigurable modular robots},
   author={Yu, Chen and Matthews, David and Wang, Jingxian and Gu, Jing and Blackiston, Douglas and Rubenstein, Michael and Kriegman, Sam},
-  journal={arXiv preprint arXiv:2505.00784},
-  year={2025}
+  journal={Proceedings of the National Academy of Sciences},
+  volume={123},
+  number={10},
+  pages={e2519129123},
+  year={2026},
+  publisher={National Academy of Sciences}
 }
 ```
 
