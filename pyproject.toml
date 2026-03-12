@@ -10,7 +10,7 @@ authors = [
     { name = "Chen Yu", email = "chenyu@u.northwestern.edu" }
 ]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "Apache-2.0"
 keywords = ["robotics", "simulation", "modular robots", "physics simulation", "reinforcement learning", "evolutionary robotics", "robot evolution", "morphology"]
 classifiers = [
@@ -19,7 +19,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Physics",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -140,7 +139,7 @@ exclude_lines = [
 
 [tool.black]
 line-length = 88
-target-version = ['py39', 'py310', 'py311', 'py312']
+target-version = ['py310', 'py311', 'py312']
 
 [tool.isort]
 profile = "black"
@@ -151,7 +150,7 @@ line_length = 88
 # Ruff configuration (modern linter/formatter)
 [tool.ruff]
 line-length = 88
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = [
