@@ -32,6 +32,10 @@ from omegaconf import OmegaConf
 
 from .base import Base
 
+
+CONTROL_MODE_DIRECT_PD = 0
+CONTROL_MODE_ONBOARD_MODEL = 1
+
 # Import capybarish for ESP32 communication
 try:
     from capybarish.pubsub import NetworkServer, Rate
@@ -87,6 +91,18 @@ def sanitize_dict(d: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+def format_policy_error(policy_error: int) -> str:
+    """Return a short human-readable label for ESP32 policy faults."""
+    labels = {
+        0: "OK",
+        1: "POLICY LOAD",
+        2: "POLICY SANITY",
+        3: "POLICY NOHASH",
+        4: "POLICY HASH",
+    }
+    return labels.get(policy_error, f"POLICY ERR{policy_error}")
 
 
 class RealMetaMachine(Base):
@@ -260,6 +276,8 @@ class RealMetaMachine(Base):
         self.ip_to_module: Dict[str, int] = {}
         # Latest data from each module
         self.module_data: Dict[int, SensorData] = {}
+        self.module_policy_errors: Dict[int, int] = {}
+        self.policy_feedback_callback = None
         # Set of connected modules
         self.connected_modules: Set[int] = set()
         
@@ -443,6 +461,32 @@ class RealMetaMachine(Base):
             self.wheel_joint_indices = []
             self.wheel_action_scale = 1.0
 
+    def get_joint_offsets(self) -> np.ndarray:
+        """Return per-joint offsets aligned with expected_module_ids."""
+        num_actions = len(self.expected_module_ids)
+        default_dof_pos = self.cfg.control.get("default_dof_pos", None)
+
+        if default_dof_pos is None:
+            return np.zeros(num_actions, dtype=np.float32)
+
+        if np.isscalar(default_dof_pos):
+            return np.full(num_actions, float(default_dof_pos), dtype=np.float32)
+
+        offsets = np.asarray(default_dof_pos, dtype=np.float32).flatten()
+        if offsets.size == 0:
+            return np.zeros(num_actions, dtype=np.float32)
+        if offsets.size < num_actions:
+            fill_value = float(offsets[-1])
+            offsets = np.pad(
+                offsets,
+                (0, num_actions - offsets.size),
+                mode="constant",
+                constant_values=fill_value,
+            )
+        elif offsets.size > num_actions:
+            offsets = offsets[:num_actions]
+        return offsets.astype(np.float32, copy=False)
+
     def _init_dashboard(self) -> None:
         """Initialize the Rich dashboard for real-time monitoring.
         
@@ -552,10 +596,37 @@ class RealMetaMachine(Base):
         
         # Store latest data
         self.module_data[module_id] = msg
-        
+        self._handle_policy_feedback(module_id, msg)
+        if self.policy_feedback_callback is not None:
+            self.policy_feedback_callback(module_id, msg, time.time())
+
         # Update dashboard if enabled
         if self.dashboard is not None:
             self._update_dashboard_motor(module_id, msg, sender_ip)
+
+    def _handle_policy_feedback(self, module_id: int, msg: SensorData) -> None:
+        """Log policy hash/sanity/runtime validation changes from ESP32."""
+        policy_error = int(getattr(msg, "policy_error", 0))
+        previous_error = self.module_policy_errors.get(module_id)
+        if previous_error == policy_error:
+            return
+
+        self.module_policy_errors[module_id] = policy_error
+        policy_hash = int(getattr(msg, "policy_hash", 0))
+        policy_status = int(getattr(msg, "policy_status", 0))
+        if policy_error != 0:
+            self._dashboard_log(
+                f"Module {module_id} policy check failed: "
+                f"{format_policy_error(policy_error)} "
+                f"(error={policy_error} hash={policy_hash} status=0x{policy_status:02x})",
+                "error",
+            )
+        elif previous_error not in (None, 0):
+            self._dashboard_log(
+                f"Module {module_id} policy check recovered: "
+                f"hash={policy_hash} status=0x{policy_status:02x}",
+                "success",
+            )
 
     def _update_dashboard_motor(self, module_id: int, msg: SensorData, sender_ip: str) -> None:
         """Update dashboard with motor data.
@@ -581,6 +652,10 @@ class RealMetaMachine(Base):
             if hasattr(err, 'reset_reason0') and hasattr(err, 'reset_reason1'):
                 if err.reset_reason0 != 0 or err.reset_reason1 != 0:
                     error_str = f"Reset: {err.reset_reason0}/{err.reset_reason1}"
+        policy_error = int(getattr(msg, "policy_error", 0))
+        if policy_error != 0:
+            policy_str = format_policy_error(policy_error)
+            error_str = f"{error_str}; {policy_str}" if error_str else policy_str
         
         # Determine module type and build display name
         is_sensor_module = module_id in self.sensor_module_ids
@@ -1341,7 +1416,9 @@ class RealMetaMachine(Base):
         pos: np.ndarray, 
         vel: Optional[np.ndarray] = None, 
         kps: Optional[np.ndarray] = None, 
-        kds: Optional[np.ndarray] = None
+        kds: Optional[np.ndarray] = None,
+        command_context: Optional[np.ndarray] = None,
+        control_mode: int = CONTROL_MODE_DIRECT_PD,
     ) -> Dict[str, Any]:
         """Execute action on the real robot.
 
@@ -1350,6 +1427,9 @@ class RealMetaMachine(Base):
             vel: Velocity commands (rad/s, optional)
             kps: Position gains (optional)
             kds: Derivative gains (optional)
+            command_context: Optional 8-dim command context vector.
+                When provided, it is included in every MotorCommand.
+            control_mode: Firmware-side control mode selector.
 
         Note:
             pos[i] is sent to expected_module_ids[i]
@@ -1377,7 +1457,9 @@ class RealMetaMachine(Base):
             velocities=vel_target,
             kps=self.kps,
             kds=self.kds,
-            enable=self.motor_enabled
+            enable=self.motor_enabled,
+            command_context=command_context,
+            control_mode=control_mode,
         )
         self.cmd_count += sent
         
@@ -1407,15 +1489,35 @@ class RealMetaMachine(Base):
         velocities: np.ndarray,
         kps: np.ndarray,
         kds: np.ndarray,
-        enable: bool = True
+        enable: bool = True,
+        command_context: Optional[np.ndarray] = None,
+        control_mode: int = CONTROL_MODE_DIRECT_PD,
     ) -> int:
         """Send motor commands to all expected ESP32 modules.
         
         Commands are sent in the order defined by expected_module_ids:
             positions[i] -> expected_module_ids[i]
+        
+        Args:
+            positions: Target positions for each module (rad)
+            velocities: Target velocities for each module (rad/s)
+            kps: Proportional gains
+            kds: Derivative gains
+            enable: Whether to enable the motors (switch_=1)
+            command_context: Optional 8-dim command context vector.
+                Sent to all modules along with the command.
+                Zeros are sent when omitted.
+            control_mode: Firmware-side control mode selector.
         """
         sent_count = 0
         current_time = time.time()
+        # Transport expects a fixed 8-float context payload.
+        command_context_list = (
+            command_context.flatten()[:8].tolist()
+            if command_context is not None
+            else [0.0] * 8
+        )
+        joint_offsets = self.get_joint_offsets()
         
         # Send commands to each expected module in order
         for action_idx, module_id in enumerate(self.expected_module_ids):
@@ -1435,6 +1537,10 @@ class RealMetaMachine(Base):
                 calibrate=0,
                 restart=0,
                 timestamp=current_time,
+                control_mode=int(control_mode),
+                joint_offset=float(joint_offsets[action_idx]) if action_idx < len(joint_offsets) else 0.0,
+                joint_id=action_idx,
+                command_context=command_context_list,
             )
             
             if self.server.send_to(ip, cmd):
@@ -1451,10 +1557,7 @@ class RealMetaMachine(Base):
         zero_pos = np.zeros(num_actions)
         
         default_dof_pos = self.cfg.control.get("default_dof_pos", None)
-        if default_dof_pos is not None:
-            init_pos = np.array(default_dof_pos)
-        else:
-            init_pos = zero_pos
+        init_pos = self.get_joint_offsets() if default_dof_pos is not None else zero_pos
         
         self._send_motor_commands(
             positions=init_pos,
@@ -1916,6 +2019,10 @@ class RealMetaMachine(Base):
                 calibrate=0,
                 restart=0,
                 timestamp=current_time,
+                control_mode=CONTROL_MODE_DIRECT_PD,
+                joint_offset=0.0,
+                joint_id=-1,
+                command_context=[0.0] * 8,
             )
             self.server.send_to(ip, cmd)
 
@@ -1938,6 +2045,10 @@ class RealMetaMachine(Base):
                 calibrate=calibrate,
                 restart=restart,
                 timestamp=current_time,
+                control_mode=CONTROL_MODE_DIRECT_PD,
+                joint_offset=0.0,
+                joint_id=-1,
+                command_context=[0.0] * 8,
             )
             self.server.send_to(ip, cmd)
 

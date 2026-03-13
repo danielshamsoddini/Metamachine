@@ -57,11 +57,12 @@ from metamachine.utils.rollout_recorder import RolloutRecorder, StateSnapshot
 
 # Configuration - modify these variables to change behavior
 # Model loading options
-MODEL = "three_modules_run_policy"  # Name of registered model to load
+MODEL = ["three_modules_run_policy", "quadruped_run_policy"][1]  # Name of registered model to load
 POLICY_PATH = None  # Path to local policy file (.pkl)
 
-# Environment options  
-CONFIG = "example_three_modules"  # Environment configuration name
+# Environment options
+CONFIG = ["example_three_modules", "basic_quadruped"][1]  # Environment configuration name
+N_MODULES = 5 # 3  # Number of modules in the robot
 
 # Recording options
 NUM_EPISODES = 1000  # Number of episodes to record
@@ -96,7 +97,7 @@ def create_custom_extractors():
                                                 s.gyros[i],
                                                 s.dof_pos[i:i+1],
                                                 s.dof_vel[i:i+1]])
-        for i in range(3)
+        for i in range(N_MODULES)
     }
 
 
@@ -143,6 +144,7 @@ def main():
     # Create environment
     print(f"\nCreating environment with config: {CONFIG}")
     cfg = ConfigRegistry.create_from_name(CONFIG)
+    cfg.simulation.video_record_interval = None
     env = MetaMachine(cfg)
     env.render_mode = "viewer" if RENDER else "none"
 

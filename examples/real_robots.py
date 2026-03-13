@@ -29,6 +29,12 @@ Usage:
     python examples/real_robots.py --viewer
     python examples/real_robots.py --test-motion --viewer
     python examples/real_robots.py --log-dir logs/experiment --viewer
+
+    # Manual positioning mode (all kp/kd = 0)
+    python examples/real_robots.py --manual-position
+    python examples/real_robots.py --manual-position --viewer \
+        --config metamachine/environments/configs/default_configs/real_one_module.yaml \
+        --module-ids 23
     
     # Load and run a trained policy
     python examples/real_robots.py --policy path/to/policy.pt
@@ -112,6 +118,10 @@ Examples:
     # Run with MuJoCo viewer (visualize robot orientation)
     python real_robots.py --viewer
     python real_robots.py --test-motion --viewer
+
+    # Manual positioning mode (all kp/kd = 0)
+    python real_robots.py --manual-position
+    python real_robots.py --manual-position --viewer
     
     # Run with trained policy
     python real_robots.py --policy logs/experiment/policy.pt
@@ -247,8 +257,85 @@ Keyboard Controls (during operation):
         default=None,
         help="Config for viewer simulation (uses real robot config if not specified)"
     )
+
+    parser.add_argument(
+        "--manual-position",
+        action="store_true",
+        help="Manual positioning mode: set all kp/kd to 0 and run idle monitoring"
+    )
     
     return parser.parse_args()
+
+
+def build_cfg_real_overrides(args) -> dict:
+    """Build real-robot config overrides from CLI arguments."""
+    cfg_real_overrides = {}
+    if args.module_ids is not None:
+        cfg_real_overrides["module_ids"] = args.module_ids
+    if args.sensor_module_ids is not None:
+        cfg_real_overrides["sensor_module_ids"] = args.sensor_module_ids
+    if args.no_dashboard:
+        cfg_real_overrides["enable_dashboard"] = False
+    return cfg_real_overrides
+
+
+def apply_cfg_real_overrides(cfg, cfg_real_overrides: dict) -> None:
+    """Apply real-robot overrides to a loaded config.
+
+    Keeps dependent fields in sync so RealMetaMachine validation passes:
+    - control.num_actions matches len(real.module_ids)
+    - real.sources.main_imu / goal_distance stay within valid module IDs
+    """
+    if not cfg_real_overrides:
+        return
+
+    if not hasattr(cfg, "real") or cfg.real is None:
+        cfg.real = {}
+
+    for key, value in cfg_real_overrides.items():
+        setattr(cfg.real, key, value)
+
+    active_ids = list(cfg.real.get("module_ids", []))
+    sensor_ids = list(cfg.real.get("sensor_module_ids", []))
+
+    if active_ids:
+        # Keep action dimensionality consistent with active modules.
+        cfg.control.num_actions = len(active_ids)
+
+        # Keep default position vector shape aligned with num_actions.
+        default_dof_pos = cfg.control.get("default_dof_pos", None)
+        if isinstance(default_dof_pos, (list, tuple)):
+            default_dof_pos = list(default_dof_pos)
+            if len(default_dof_pos) != len(active_ids):
+                if len(default_dof_pos) == 0:
+                    cfg.control.default_dof_pos = [0.0] * len(active_ids)
+                elif len(default_dof_pos) > len(active_ids):
+                    cfg.control.default_dof_pos = default_dof_pos[:len(active_ids)]
+                else:
+                    fill_value = float(default_dof_pos[-1])
+                    cfg.control.default_dof_pos = default_dof_pos + [
+                        fill_value
+                    ] * (len(active_ids) - len(default_dof_pos))
+
+        all_ids = set(active_ids) | set(sensor_ids)
+        if "sources" not in cfg.real or cfg.real.sources is None:
+            cfg.real.sources = {}
+
+        main_imu_id = cfg.real.sources.get("main_imu", active_ids[0])
+        if main_imu_id not in all_ids:
+            cfg.real.sources.main_imu = active_ids[0]
+            print(
+                f"[Info] real.sources.main_imu={main_imu_id} is invalid after "
+                f"CLI overrides. Using {active_ids[0]}."
+            )
+
+        goal_distance_id = cfg.real.sources.get("goal_distance", None)
+        if goal_distance_id is not None and goal_distance_id not in all_ids:
+            cfg.real.sources.goal_distance = active_ids[0]
+            print(
+                f"[Info] real.sources.goal_distance={goal_distance_id} is invalid "
+                f"after CLI overrides. Using {active_ids[0]}."
+            )
 
 
 def load_config(config_path: str):
@@ -274,6 +361,32 @@ def create_environment(cfg):
     
     env = RealMetaMachine(cfg)
     return env
+
+
+def enable_manual_position_mode(env) -> None:
+    """Zero all PD gains so joints can be moved by hand."""
+    num_actions = len(getattr(env, "expected_module_ids", []))
+    if num_actions <= 0 and hasattr(env, "action_space"):
+        num_actions = int(env.action_space.shape[0])
+
+    zeros = np.zeros(num_actions, dtype=np.float32)
+
+    # Runtime gains used for regular step() command streaming.
+    env.kps = zeros.copy()
+    env.kds = zeros.copy()
+
+    # Default gains used by enable/special command packets.
+    env.kp_default = 0.0
+    env.kd_default = 0.0
+
+    # Keep config aligned for introspection/debugging.
+    if hasattr(env, "cfg") and hasattr(env.cfg, "control"):
+        env.cfg.control.kp = 0.0
+        env.cfg.control.kd = 0.0
+
+    print("\n[Mode] Manual positioning enabled")
+    print("  All kp/kd gains set to 0.0")
+    print("  Use 'e' to enable and move joints by hand")
 
 
 def load_policy(policy_path: str, env):
@@ -809,6 +922,7 @@ def main():
     
     # Parse arguments
     args = parse_args()
+    cfg_real_overrides = build_cfg_real_overrides(args)
     
     print("=" * 60)
     print("Real Robot Control - RealMetaMachine")
@@ -831,35 +945,31 @@ def main():
             if runner.num_policies == 0:
                 print("Error: No policies loaded successfully. Exiting.")
                 return
-            
-            # Build cfg_real overrides from CLI arguments
-            cfg_real_overrides = {}
-            if args.module_ids is not None:
-                cfg_real_overrides["module_ids"] = args.module_ids
-            if args.sensor_module_ids is not None:
-                cfg_real_overrides["sensor_module_ids"] = args.sensor_module_ids
-            if args.no_dashboard:
-                cfg_real_overrides["enable_dashboard"] = False
-            
+
             # Create real robot environment from first config
             if first_cfg is not None:
                 # Apply real robot overrides
-                if cfg_real_overrides:
-                    if not hasattr(first_cfg, 'real') or first_cfg.real is None:
-                        first_cfg.real = {}
-                    for key, value in cfg_real_overrides.items():
-                        setattr(first_cfg.real, key, value)
+                apply_cfg_real_overrides(first_cfg, cfg_real_overrides)
                 
                 # Force real mode
                 first_cfg.environment.mode = "real"
                 
                 env = create_environment(first_cfg)
+                if args.manual_position:
+                    enable_manual_position_mode(env)
             else:
                 print("Error: No config available. Exiting.")
                 return
             
             try:
-                if args.viewer:
+                if args.manual_position:
+                    if args.viewer:
+                        run_idle_with_viewer(
+                            env, duration=args.duration, viewer_config=args.viewer_config
+                        )
+                    else:
+                        run_idle(env, duration=args.duration)
+                elif args.viewer:
                     # Use viewer-enhanced version
                     run_sb3_policy_multi_with_viewer(
                         env, runner, 
@@ -884,22 +994,15 @@ def main():
         print(f"\nLoading from training log: {args.log_dir}")
         try:
             from metamachine.utils.sb3_utils import load_from_checkpoint
-            
-            # Build cfg_real overrides from CLI arguments
-            cfg_real_overrides = {}
-            if args.module_ids is not None:
-                cfg_real_overrides["module_ids"] = args.module_ids
-            if args.sensor_module_ids is not None:
-                cfg_real_overrides["sensor_module_ids"] = args.sensor_module_ids
-            if args.no_dashboard:
-                cfg_real_overrides["enable_dashboard"] = False
-            
+
             env, model, cfg = load_from_checkpoint(
                 args.log_dir,
                 checkpoint=args.checkpoint,
                 real_robot=True,
                 cfg_real=cfg_real_overrides if cfg_real_overrides else None
             )
+            if args.manual_position:
+                enable_manual_position_mode(env)
             
             # Override dashboard setting if requested (redundant but safe)
             if args.no_dashboard:
@@ -907,7 +1010,12 @@ def main():
                     cfg.real.enable_dashboard = False
             
             try:
-                if args.viewer:
+                if args.manual_position:
+                    if args.viewer:
+                        run_idle_with_viewer(env, duration=args.duration, viewer_config=args.viewer_config)
+                    else:
+                        run_idle(env, duration=args.duration)
+                elif args.viewer:
                     # Use viewer-enhanced version
                     if model is not None:
                         run_sb3_policy_with_viewer(
@@ -937,19 +1045,24 @@ def main():
     # Load configuration from file
     print(f"\nLoading config: {args.config}")
     cfg = load_config(args.config)
-    
-    # Override dashboard setting if requested
-    if args.no_dashboard:
-        if "real" not in cfg:
-            cfg.real = {}
-        cfg.real.enable_dashboard = False
+
+    # Apply CLI real-robot overrides (module IDs, sensor IDs, dashboard).
+    apply_cfg_real_overrides(cfg, cfg_real_overrides)
     
     # Create environment
     print("\nCreating RealMetaMachine environment...")
     env = create_environment(cfg)
+    if args.manual_position:
+        enable_manual_position_mode(env)
     
     try:
-        if args.test_motion:
+        if args.manual_position:
+            # Manual positioning always runs idle loop.
+            if args.viewer:
+                run_idle_with_viewer(env, duration=args.duration, viewer_config=args.viewer_config)
+            else:
+                run_idle(env, duration=args.duration)
+        elif args.test_motion:
             # Run sinusoidal test motion
             if args.viewer:
                 run_sinusoidal_test_with_viewer(

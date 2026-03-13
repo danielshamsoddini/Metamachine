@@ -21,8 +21,7 @@ environment:
 # =============================================================================
 morphology:
   robot_type: modular_legs
-  configuration: [0,1,0,0,    # Module connections for simulation
-                  0,3,0,0]
+  configuration: []
 
 # =============================================================================
 # Real Robot Hardware Configuration
@@ -33,11 +32,11 @@ real:
   # ---------------------------------------------------------------------------
   # Active modules (receive motor commands)
   # action[i] is sent to module_ids[i]
-  module_ids: [16]  # Example: module 1 is the only active module
+  module_ids: [11]  # Example: module 1 is the only active module
   
   # Sensor-only modules (no motor commands, just provide sensor data)
   # Useful for dedicated sensors like distance ranging modules
-  sensor_module_ids: [100]  # Example: [100] for a dedicated distance sensor
+  # sensor_module_ids: [100]  # Example: [100] for a dedicated distance sensor
   
   # ---------------------------------------------------------------------------
   # Global State Sources
@@ -46,11 +45,11 @@ real:
   # Can reference any module from module_ids OR sensor_module_ids.
   sources:
     # Main IMU module for global quat/gyro (default: first module in module_ids)
-    main_imu: 16
+    main_imu: 11
     
     # Goal distance source module (default: null = per-module only)
     # Set to a module ID to use that module's goal_distance as the global value
-    goal_distance: 100
+    goal_distance: 11
   
   # ---------------------------------------------------------------------------
   # Network Configuration
@@ -108,9 +107,9 @@ observation:
   
   components:
     - name: projected_gravity
+    - name: quat
     - name: ang_vel_body
     - name: dof_pos
-      transform: cos
     - name: dof_vel
     - name: last_action
 
