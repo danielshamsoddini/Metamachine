@@ -35,6 +35,7 @@ from .base import Base
 
 CONTROL_MODE_DIRECT_PD = 0
 CONTROL_MODE_ONBOARD_MODEL = 1
+CONTROL_MODE_LOCAL_DEBUG_SCENARIO = 2
 
 # Import capybarish for ESP32 communication
 try:
@@ -103,6 +104,23 @@ def format_policy_error(policy_error: int) -> str:
         4: "POLICY HASH",
     }
     return labels.get(policy_error, f"POLICY ERR{policy_error}")
+
+
+def format_policy_status(policy_status: int) -> str:
+    """Return a compact label for ESP32 policy runtime status bits."""
+    bits = int(policy_status)
+    names = []
+    if bits & (1 << 0):
+        names.append("loaded")
+    if bits & (1 << 1):
+        names.append("sanity")
+    if bits & (1 << 2):
+        names.append("pc_hash")
+    if bits & (1 << 3):
+        names.append("hash_match")
+    if bits & (1 << 4):
+        names.append("ready")
+    return "|".join(names) if names else "none"
 
 
 class RealMetaMachine(Base):
@@ -278,6 +296,7 @@ class RealMetaMachine(Base):
         self.module_data: Dict[int, SensorData] = {}
         self.module_policy_errors: Dict[int, int] = {}
         self.policy_feedback_callback = None
+        self.sim2real_check_callback = None
         # Set of connected modules
         self.connected_modules: Set[int] = set()
         
@@ -366,6 +385,7 @@ class RealMetaMachine(Base):
         print("\n" + "-" * 60)
         print("Keyboard Controls:")
         print("  Motor:    e=enable, d=disable, r=restart, c=calibrate")
+        print("  Checks:   v=sim-to-real sanity check")
         print("  Commands: 0-9=select/set, []=prev/next, +/-=adjust")
         print("            R=resample, k=toggle keyboard mode, i=info")
         print("  Models:   ,=prev model, .=next model, /=list models")
@@ -653,8 +673,12 @@ class RealMetaMachine(Base):
                 if err.reset_reason0 != 0 or err.reset_reason1 != 0:
                     error_str = f"Reset: {err.reset_reason0}/{err.reset_reason1}"
         policy_error = int(getattr(msg, "policy_error", 0))
+        policy_status = int(getattr(msg, "policy_status", 0))
         if policy_error != 0:
             policy_str = format_policy_error(policy_error)
+            error_str = f"{error_str}; {policy_str}" if error_str else policy_str
+        elif policy_status != 0 and (policy_status & (1 << 4)) == 0:
+            policy_str = f"POLICY {format_policy_status(policy_status)}"
             error_str = f"{error_str}; {policy_str}" if error_str else policy_str
         
         # Determine module type and build display name
@@ -1588,7 +1612,10 @@ class RealMetaMachine(Base):
             d: Disable motors
             r: Restart motors
             c: Calibrate motors
-        
+
+        Checks:
+            v: Run the dashboard sim-to-real sanity check
+
         Command Controls:
             0-9: Set one-hot command (if onehot_mode) or select command index
             [/]: Select previous/next command (for continuous adjustment)
@@ -1616,6 +1643,8 @@ class RealMetaMachine(Base):
                 self._restart_motor()
             elif self.input_key == "c":
                 self._calibrate_motor()
+            elif self.input_key == "v":
+                self._run_sim2real_check()
             
             # Command controls - number keys 0-9
             elif self.input_key in "0123456789":
@@ -1655,6 +1684,13 @@ class RealMetaMachine(Base):
             
             if time.time() - self.last_motor_com_time > 0.5:
                 self._reset_motor_commands()
+
+    def _run_sim2real_check(self) -> None:
+        """Trigger the runtime sim-to-real checker if one is attached."""
+        if self.sim2real_check_callback is None:
+            self._dashboard_log("Sim-to-real checker unavailable", "warn")
+            return
+        self.sim2real_check_callback()
 
     def _enable_motor(self) -> None:
         """Enable all motors."""

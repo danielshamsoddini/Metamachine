@@ -224,8 +224,12 @@ class MetaMachine(Base, MujocoEnv):
             # Load and compile robot asset
             self._load_robot_asset()
         elif hasattr(cfg, "morphology") and cfg.morphology.configuration is not None:
+            self._base_morphology_configuration = self._to_plain_container(
+                cfg.morphology.configuration
+            )
+            self._validate_morphology_randomization_config()
             self._load_robot_asset_from_morphology(
-                cfg.morphology.robot_type, cfg.morphology.configuration
+                cfg.morphology.robot_type, self._base_morphology_configuration
             )
         else:
             raise ValueError("No robot asset file or morphology provided")
@@ -280,13 +284,20 @@ class MetaMachine(Base, MujocoEnv):
         """Load robot asset from morphology using the new factory system."""
         import tempfile
         import os
+
+        factory_kwargs = self._get_morphology_factory_kwargs()
         
+        factory_init_kwargs = {
+            **get_default_fine_model_cfg(robot_type),
+            **factory_kwargs,
+        }
+
         # Get the factory using the new registry system
         factory = robot_factory.get_robot_factory(
             robot_type,
             sim_cfg=self.cfg.simulation,  # type: ignore
             log_dir=self._log_dir,  # Pass the environment's log directory
-            **get_default_fine_model_cfg(robot_type),
+            **factory_init_kwargs,
         )
         if factory is None:
             raise ValueError(f"Unknown robot factory type: {robot_type}")
@@ -302,6 +313,8 @@ class MetaMachine(Base, MujocoEnv):
         # Store robot instance for potential future use
         self._robot_instance = robot
         
+        # Morphology-based robots also initialize an XMLCompiler here so
+        # per-episode XML randomization can reuse the generated model.
         # Check if restructure is enabled (for lego_legs or other graph-based robots)
         restructure = getattr(self.cfg.morphology, "restructure", False)
         restructure_qpos = getattr(self.cfg.morphology, "restructure_qpos", None)
@@ -376,12 +389,19 @@ class MetaMachine(Base, MujocoEnv):
         self, robot_type: Any, morphology: Any
     ) -> None:
         """Load robot asset from morphology using the new factory system."""
+        factory_kwargs = self._get_morphology_factory_kwargs()
+
+        factory_init_kwargs = {
+            **get_default_draft_model_cfg(robot_type),
+            **factory_kwargs,
+        }
+
         # Get the factory using the new registry system
         draft_factory = robot_factory.get_robot_factory(
             robot_type,
             sim_cfg=self.cfg.simulation,  # type: ignore
             log_dir=self._log_dir,  # Pass the environment's log directory
-            **get_default_draft_model_cfg(robot_type),
+            **factory_init_kwargs,
         )
 
         if draft_factory is None:
@@ -405,6 +425,167 @@ class MetaMachine(Base, MujocoEnv):
 
         # Store robot instance for potential future use
         self._draft_robot_instance = draft_robot
+
+    def _get_morphology_factory_kwargs(self) -> dict[str, Any]:
+        """Extract optional factory kwargs from morphology config."""
+        morphology_cfg = getattr(self.cfg, "morphology", None)
+        if morphology_cfg is None:
+            return {}
+
+        if hasattr(morphology_cfg, "get"):
+            factory_kwargs = morphology_cfg.get("factory_kwargs", None)
+        else:
+            factory_kwargs = getattr(morphology_cfg, "factory_kwargs", None)
+
+        if factory_kwargs is None:
+            return {}
+
+        if isinstance(factory_kwargs, dict):
+            return factory_kwargs.copy()
+
+        try:
+            from omegaconf import OmegaConf
+            factory_kwargs = OmegaConf.to_container(factory_kwargs, resolve=True)
+        except Exception:
+            pass
+
+        return dict(factory_kwargs) if isinstance(factory_kwargs, dict) else {}
+
+    def _to_plain_container(self, value: Any) -> Any:
+        """Convert OmegaConf containers to plain Python containers."""
+        if OmegaConf.is_config(value):
+            return OmegaConf.to_container(value, resolve=True)
+        return copy.deepcopy(value)
+
+    def _get_morphology_randomization_cfg(self) -> dict[str, Any]:
+        """Return morphology randomization config as a plain dictionary."""
+        randomization_cfg = getattr(self.cfg, "randomization", {}) or {}
+        morphology_cfg = randomization_cfg.get("morphology", {}) or {}
+        plain_cfg = self._to_plain_container(morphology_cfg)
+        return plain_cfg if isinstance(plain_cfg, dict) else {}
+
+    def _has_morphology_randomization(self) -> bool:
+        """Check whether morphology parameter randomization is enabled."""
+        morphology_cfg = self._get_morphology_randomization_cfg()
+        rules = morphology_cfg.get("component_params", []) or []
+        return bool(
+            morphology_cfg.get("enabled", False)
+            and rules
+            and hasattr(self, "_base_morphology_configuration")
+        )
+
+    def _validate_morphology_randomization_config(self) -> None:
+        """Validate morphology randomization rules against the base morphology."""
+        if not self._has_morphology_randomization():
+            return
+
+        base_morphology = getattr(self, "_base_morphology_configuration", None)
+        if not isinstance(base_morphology, dict):
+            raise ValueError(
+                "Morphology randomization requires a dict-like morphology.configuration"
+            )
+
+        components = base_morphology.get("components", []) or []
+        if not isinstance(components, list):
+            raise ValueError("morphology.configuration.components must be a list")
+
+        for rule in self._get_morphology_randomization_cfg().get("component_params", []):
+            component_type = rule.get("component_type")
+            param_rules = rule.get("params", {}) or {}
+            if not component_type:
+                raise ValueError(
+                    "Each randomization.morphology.component_params entry needs component_type"
+                )
+            if not isinstance(param_rules, dict) or not param_rules:
+                raise ValueError(
+                    f"Morphology randomization rule for '{component_type}' needs a params mapping"
+                )
+
+            matching_components = [
+                component
+                for component in components
+                if str(component.get("component_type")) == str(component_type)
+            ]
+            if not matching_components:
+                raise ValueError(
+                    f"No components found for morphology randomization type '{component_type}'"
+                )
+
+            for param_name, param_cfg in param_rules.items():
+                if not isinstance(param_cfg, dict):
+                    raise ValueError(
+                        f"Morphology randomization config for '{component_type}.{param_name}' "
+                        "must be a mapping"
+                    )
+
+                param_mode = param_cfg.get("mode", "absolute")
+                param_range = param_cfg.get("range")
+                if (
+                    not is_list_like(param_range)
+                    or len(param_range) != 2
+                    or not all(is_number(v) for v in param_range)
+                ):
+                    raise ValueError(
+                        f"Morphology randomization for '{component_type}.{param_name}' "
+                        "requires numeric range: [min, max]"
+                    )
+                if param_mode not in {"absolute", "percentage", "additive"}:
+                    raise ValueError(
+                        f"Unsupported morphology randomization mode '{param_mode}' "
+                        f"for '{component_type}.{param_name}'"
+                    )
+
+                matched_param = False
+                for component in matching_components:
+                    component_params = component.get("params", {}) or {}
+                    if param_name not in component_params:
+                        continue
+                    matched_param = True
+                    if not is_number(component_params[param_name]):
+                        raise ValueError(
+                            f"Morphology randomization only supports numeric params, got "
+                            f"'{component_type}.{param_name}'={component_params[param_name]!r}"
+                        )
+
+                if not matched_param:
+                    raise ValueError(
+                        f"No '{component_type}' components define param '{param_name}'"
+                    )
+
+    def _sample_morphology_param(
+        self, base_value: float, param_cfg: dict[str, Any]
+    ) -> float:
+        """Sample one randomized morphology parameter from its base value."""
+        param_mode = param_cfg.get("mode", "absolute")
+        low, high = param_cfg["range"]
+
+        if param_mode == "percentage":
+            return float(base_value * (1.0 + self.np_random.uniform(low, high)))
+        if param_mode == "additive":
+            return float(base_value + self.np_random.uniform(low, high))
+        return float(self.np_random.uniform(low, high))
+
+    def _get_randomized_morphology_configuration(self) -> dict[str, Any]:
+        """Create a randomized morphology config from the pristine base graph."""
+        randomized = copy.deepcopy(self._base_morphology_configuration)
+        rules = self._get_morphology_randomization_cfg().get("component_params", []) or []
+
+        for component in randomized.get("components", []) or []:
+            component_type = str(component.get("component_type"))
+            component_params = component.setdefault("params", {})
+
+            for rule in rules:
+                if component_type != str(rule.get("component_type")):
+                    continue
+
+                for param_name, param_cfg in (rule.get("params", {}) or {}).items():
+                    if param_name not in component_params:
+                        continue
+                    component_params[param_name] = self._sample_morphology_param(
+                        float(component_params[param_name]), param_cfg
+                    )
+
+        return randomized
 
     def get_robot_instance(self) -> Any:
         """Get the robot instance if available (new factory system only)."""
@@ -859,6 +1040,8 @@ class MetaMachine(Base, MujocoEnv):
 
     def _setup_simulation_state(self) -> None:
         """Setup simulation-specific state and tracking."""
+        self.state.set_module_orientation_offset_sim_enabled(True)
+
         # Robot configuration
         self._parse_robot_parameters()
 
@@ -1408,6 +1591,7 @@ class MetaMachine(Base, MujocoEnv):
 
         # Apply constraints
         torques = self._apply_torque_constraints(torques, dof_vel)
+        # print(f"Applying torques: {torques}")
 
         # Execute simulation
         self.do_simulation(torques, int(frame_skip))
@@ -1786,6 +1970,7 @@ class MetaMachine(Base, MujocoEnv):
     def _need_model_reload(self) -> bool:
         """Check if model needs to be reloaded for randomization."""
         self.randomize_asset = is_list_like(self.cfg.morphology.asset_file)  # type: ignore
+        morphology_enabled = self._has_morphology_randomization()
         
         # Check randomization config (new style: cfg.randomization.*)
         randomization_cfg = getattr(self.cfg, "randomization", {})
@@ -1804,17 +1989,31 @@ class MetaMachine(Base, MujocoEnv):
                 damping_enabled,
                 self.sim_cfg.get("add_scaffold_walls", False),
                 self.randomize_asset,
+                morphology_enabled,
             ]
         )
 
     def _reload_model_with_randomization(self) -> None:
-        """Reload model with randomization applied."""
+        """Reload model with XML-level randomization applied.
+
+        For asset-based robots with multiple XML files, this may select a new
+        source asset. For morphology-built robots, this either rebuilds the
+        XML from a randomized copy of the base morphology graph or reuses the
+        existing XMLCompiler and mutates it in place before reloading the
+        MuJoCo model.
+        """
         # Asset randomization (for asset-based robots with multiple asset files)
         if self.randomize_asset:
             self._load_robot_asset()
-        # For morphology-based robots, regenerate from morphology
+        elif self._has_morphology_randomization():
+            randomized_morphology = self._get_randomized_morphology_configuration()
+            self._load_robot_asset_from_morphology(
+                self.cfg.morphology.robot_type, randomized_morphology
+            )
+        # Morphology-built robots normally already have an XMLCompiler from
+        # _load_robot_asset_from_morphology(). If not, there is no XML to
+        # mutate for mass/damping randomization, so skip this reload path.
         elif not hasattr(self, 'xml_compiler') or self.xml_compiler is None:
-            # Morphology-based robot without xml_compiler - skip randomization
             return
 
         # Get randomization config (new style)

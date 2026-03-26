@@ -16,6 +16,7 @@ import pdb
 import xml.etree.ElementTree as ET
 import numpy as np
 import copy
+import builtins
 from pathlib import Path
 import sys
 import os
@@ -29,6 +30,14 @@ from metamachine.utils.xml_graph_utils import (
     build_connection_graph, select_root_module, build_spanning_tree,
     print_tree_structure, analyze_freejoint_reduction
 )
+
+ENABLE_PRINTING = False
+
+
+def print(*args, **kwargs):
+    """Module-local print gate controlled by ENABLE_PRINTING."""
+    if ENABLE_PRINTING:
+        builtins.print(*args, **kwargs)
 
 
 def parse_site_pose(site_element):
@@ -102,7 +111,7 @@ def transform_module_hierarchy(xml_path, module_name, docking_site_name, output_
     # Transform the hierarchy to make the docking body the root
     try:
         transformed_path = change_to_root_with_new_parent(
-            xml_path, module_name, docking_body_name, output_path, verbose=True
+            xml_path, module_name, docking_body_name, output_path, verbose=ENABLE_PRINTING
         )
         print(f"  ✓ Transformed module saved to {transformed_path}")
         return transformed_path
@@ -627,7 +636,8 @@ def main():
     except Exception as e:
         print(f"\n❌ Error during restructuring: {e}")
         import traceback
-        traceback.print_exc()
+        if ENABLE_PRINTING:
+            traceback.print_exc()
         sys.exit(1)
 
 

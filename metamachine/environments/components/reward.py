@@ -423,6 +423,18 @@ class ActionRateComponent(RewardComponent):
         return action_rate
 
 
+class ActionRateRateComponent(RewardComponent):
+    """Penalizes changes in action rate (second-order action smoothness)."""
+
+    def calculate(self, state, calculator) -> float:
+        current_action = state.action_history.last_action
+        last_action = state.action_history.last_last_action
+        last_last_action = state.action_history.last_last_last_action
+        second_diff = current_action - 2.0 * last_action + last_last_action
+        action_rate_rate = np.sum(np.square(second_diff)) / calculator.dt
+        return action_rate_rate
+
+
 class WindowedDisplacementEfficiencyComponent(RewardComponent):
     """
     Windowed displacement efficiency reward for locomotion.
@@ -460,6 +472,7 @@ class WindowedDisplacementEfficiencyComponent(RewardComponent):
         window_size = self.params.get("window_size", 100)
         speed_weight = self.params.get("speed_weight", 1.0)
         efficiency_weight = self.params.get("efficiency_weight", 0.5)
+        # print("efficiency_weight:", efficiency_weight)
         use_weld_cluster = self.params.get("use_weld_cluster", True)
         
         # Get current position
@@ -803,6 +816,8 @@ COMPONENT_REGISTRY = {
     "jump_timer": JumpTimerComponent,
     "tripod_jump": TripodJumpComponent,
     "action_rate": ActionRateComponent,
+    "action_rate_rate": ActionRateRateComponent,
+    "action_acceleration": ActionRateRateComponent,
     "windowed_displacement_efficiency": WindowedDisplacementEfficiencyComponent,
     "onehot_turning": OneHotTurningComponent,
     "onehot_forward": OneHotForwardComponent,

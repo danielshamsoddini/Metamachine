@@ -328,13 +328,19 @@ class MJXMetaMachine:
         which need to convert flat body + weld constraints to nested hierarchy.
         """
         import uuid
+        factory_kwargs = self._get_morphology_factory_kwargs()
         
+        factory_init_kwargs = {
+            **get_default_draft_model_cfg(robot_type),
+            **factory_kwargs,
+        }
+
         # Use DRAFT model config for MJX compatibility
         # Draft models use primitive shapes (SPHERE, CAPSULE) instead of meshes
         factory = robot_factory.get_robot_factory(
             robot_type,
             sim_cfg=self.cfg.simulation,
-            **get_default_draft_model_cfg(robot_type),
+            **factory_init_kwargs,
         )
         if factory is None:
             raise ValueError(f"Unknown robot factory type: {robot_type}")
@@ -394,6 +400,30 @@ class MJXMetaMachine:
             with open(debug_xml_path, "w") as f:
                 f.write(self._xml_string)
             print(f"Saved robot XML to {debug_xml_path}")
+
+    def _get_morphology_factory_kwargs(self) -> dict[str, Any]:
+        """Extract optional factory kwargs from morphology config."""
+        morphology_cfg = getattr(self.cfg, "morphology", None)
+        if morphology_cfg is None:
+            return {}
+
+        if hasattr(morphology_cfg, "get"):
+            factory_kwargs = morphology_cfg.get("factory_kwargs", None)
+        else:
+            factory_kwargs = getattr(morphology_cfg, "factory_kwargs", None)
+
+        if factory_kwargs is None:
+            return {}
+
+        if isinstance(factory_kwargs, dict):
+            return factory_kwargs.copy()
+
+        try:
+            factory_kwargs = OmegaConf.to_container(factory_kwargs, resolve=True)
+        except Exception:
+            pass
+
+        return dict(factory_kwargs) if isinstance(factory_kwargs, dict) else {}
     
     def _load_from_asset(self, asset_file: str) -> None:
         """Load robot from asset file."""
@@ -929,6 +959,7 @@ class MJXMetaMachine:
             "step": jp.array(0),
             "rng": rng,
             "last_act": jp.zeros(self._num_actions),
+            "last_last_act": jp.zeros(self._num_actions),
             "commands": self._sample_commands(rng),
             # Store randomized parameters for use in step()
             "kp": randomized_kp,
@@ -1010,6 +1041,7 @@ class MJXMetaMachine:
             "step": state.info["step"] + 1,
             "rng": rng,
             "last_act": action,
+            "last_last_act": state.info["last_act"],
             "commands": state.info["commands"],
             # Preserve randomized parameters for the episode
             "kp": kp,
@@ -1359,6 +1391,8 @@ class MJXMetaMachine:
             return self._reward_angular_velocity_tracking(data, info, params)
         elif reward_type == "action_rate":
             return self._reward_action_rate(action, info)
+        elif reward_type in ("action_rate_rate", "action_acceleration"):
+            return self._reward_action_rate_rate(action, info)
         elif reward_type == "upright":
             return self._reward_upright(data)
         else:
@@ -1407,6 +1441,17 @@ class MJXMetaMachine:
         """Penalty for action rate (smoothness)."""
         last_action = info["last_act"]
         return -jp.sum(jp.square(action - last_action))
+
+    def _reward_action_rate_rate(
+        self,
+        action: jax.Array,
+        info: Dict[str, Any],
+    ) -> jax.Array:
+        """Penalty for changes in action rate (second-order smoothness)."""
+        last_action = info["last_act"]
+        last_last_action = info["last_last_act"]
+        second_diff = action - 2.0 * last_action + last_last_action
+        return -jp.sum(jp.square(second_diff))
     
     def _reward_upright(self, data: mjx.Data) -> jax.Array:
         """Reward for staying upright."""

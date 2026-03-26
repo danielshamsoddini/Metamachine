@@ -21,7 +21,33 @@ from typing import Any, Callable, Optional
 import numpy as np
 from omegaconf import OmegaConf
 
-from ...utils.math_utils import AverageFilter, quat_apply, quat_rotate_inverse
+from ...utils.math_utils import AverageFilter, euler_to_quaternion, quat_apply, quat_rotate_inverse
+
+
+def _quat_multiply_xyzw(
+    q1: np.ndarray, q2: np.ndarray
+) -> np.ndarray:
+    """Multiply quaternions in [x, y, z, w] format."""
+    x1, y1, z1, w1 = np.asarray(q1, dtype=np.float64)
+    x2, y2, z2, w2 = np.asarray(q2, dtype=np.float64)
+    return np.array(
+        [
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _normalize_quaternion_xyzw(quat: np.ndarray) -> np.ndarray:
+    """Normalize quaternion in [x, y, z, w] format."""
+    quat = np.asarray(quat, dtype=np.float64)
+    norm = np.linalg.norm(quat)
+    if norm < 1e-8:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    return quat / norm
 
 
 @dataclass
@@ -511,13 +537,13 @@ class State:
         "projected_gravity": lambda s: s.derived.projected_gravity,
         "projected_gravities": lambda s: s.derived.projected_gravities,
         "quat": lambda s: s.raw.quat,
-        "ang_vel_body": lambda s: s.raw.ang_vel_body,
+        "ang_vel_body": lambda s: s.get_observed_ang_vel_body(),
         "dof_pos": lambda s: s.raw.dof_pos,
         "dof_vel": lambda s: s.raw.dof_vel,
         # Masked joint observations (for robots with wheels or partial encoders)
         "masked_dof_pos": lambda s: s.masked_dof_pos,
         "masked_dof_vel": lambda s: s.masked_dof_vel,
-        "gyros": lambda s: s.raw.gyros,
+        "gyros": lambda s: s.get_observed_gyros(),
         "last_action": lambda s: s.action_history.last_action,
         "last_last_action": lambda s: s.action_history.last_last_action,
         "last_last_last_action": lambda s: s.action_history.last_last_last_action,
@@ -552,7 +578,7 @@ class State:
     MODULAR_OBSERVATION_COMPONENTS = {
         # List-type components (use index_type: "element")
         "projected_gravities": lambda s: s.derived.projected_gravities,
-        "gyros": lambda s: s.raw.gyros,
+        "gyros": lambda s: s.get_observed_gyros(),
         "accs": lambda s: s.raw.accs,
         "quats": lambda s: s.raw.quats,
         # Array-type components (use index_type: "slice")
@@ -599,11 +625,13 @@ class State:
         self.forward_vec = np.array(cfg.observation.forward_vec)
         self.projected_forward_vec = np.array(cfg.observation.projected_forward_vec)
         self.dt = cfg.control.dt
+        self._setup_module_orientation_randomization(cfg)
 
         # State containers
         self.raw = RawState(num_dof=self.num_act)
         self.derived = DerivedState(num_dof=self.num_act)
         self.accurate = AccurateState()  # Only used in simulation environments
+        self.offsetted_module_quats = np.zeros((self.num_act, 4), dtype=np.float64)
 
         # Setup observation masking for joints (e.g., wheels without encoders)
         self._setup_obs_masking(cfg)
@@ -671,6 +699,7 @@ class State:
         self.critic_obs_buf = ObservationBuffer(
             self.num_critic_obs * self.num_envs, self.include_history_steps
         )
+        self._resample_module_orientation_offsets()
 
     def __getattr__(self, name):
         """Automatically forward attribute access to raw, derived, accurate state objects, or observable_data.
@@ -779,6 +808,11 @@ class State:
                 # Observation masking attributes
                 "dof_pos_mask",
                 "dof_vel_mask",
+                "module_orientation_offset_enabled",
+                "module_orientation_offset_sim_enabled",
+                "module_orientation_offset_magnitude_deg",
+                "module_orientation_offset_quats",
+                "offsetted_module_quats",
             ]
             or not hasattr(self, "raw")
             or not hasattr(self, "derived")
@@ -862,6 +896,157 @@ class State:
         mask = np.ones(num_joints, dtype=bool)
         mask[exclude_indices] = False
         return mask
+
+    def _setup_module_orientation_randomization(self, cfg: OmegaConf) -> None:
+        """Configure per-episode module quaternion offsets for observations."""
+        randomization_cfg = getattr(cfg, "randomization", {}) or {}
+        module_quat_cfg = randomization_cfg.get("module_orientation_offset", {}) or {}
+        self.module_orientation_offset_enabled = bool(
+            module_quat_cfg.get("enabled", False)
+        )
+        self.module_orientation_offset_sim_enabled = False
+        self.module_orientation_offset_magnitude_deg = float(
+            module_quat_cfg.get("magnitude_deg", module_quat_cfg.get("magnitude", 20.0))
+        )
+        self.module_orientation_offset_quats = np.tile(
+            np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+            (self.num_act, 1),
+        )
+
+    def _resample_module_orientation_offsets(self) -> None:
+        """Sample one fixed orientation offset quaternion per module."""
+        identity = np.tile(
+            np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+            (self.num_act, 1),
+        )
+        if (
+            not self.module_orientation_offset_enabled
+            or not self.module_orientation_offset_sim_enabled
+            or self.module_orientation_offset_magnitude_deg <= 0.0
+        ):
+            self.module_orientation_offset_quats = identity
+            return
+
+        magnitude_rad = np.deg2rad(self.module_orientation_offset_magnitude_deg)
+        offsets = []
+        for _ in range(self.num_act):
+            # Sample tilt offsets so projected gravity changes across episodes.
+            roll = np.random.uniform(-magnitude_rad, magnitude_rad)
+            pitch = np.random.uniform(-magnitude_rad, magnitude_rad)
+            quat_wxyz = euler_to_quaternion([roll, pitch, 0.0])
+            quat_xyzw = np.array(
+                [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]],
+                dtype=np.float64,
+            )
+            offsets.append(_normalize_quaternion_xyzw(quat_xyzw))
+        self.module_orientation_offset_quats = np.asarray(offsets, dtype=np.float64)
+
+    def _get_offset_quat_for_module(self, module_idx: int) -> np.ndarray:
+        """Return the configured offset quaternion for a module."""
+        if (
+            module_idx < 0
+            or module_idx >= len(self.module_orientation_offset_quats)
+        ):
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        return self.module_orientation_offset_quats[module_idx]
+
+    def _get_offsetted_module_quats(self) -> np.ndarray:
+        """Apply fixed per-episode offsets to raw module quaternions."""
+        raw_quats = np.asarray(self.raw.quats, dtype=np.float64)
+        if raw_quats.size == 0:
+            return np.zeros((0, 4), dtype=np.float64)
+        if raw_quats.ndim == 1:
+            raw_quats = raw_quats.reshape(1, 4)
+
+        offsetted_quats = []
+        for module_idx, quat in enumerate(raw_quats):
+            offset_quat = self._get_offset_quat_for_module(module_idx)
+            offsetted_quats.append(
+                _normalize_quaternion_xyzw(_quat_multiply_xyzw(quat, offset_quat))
+            )
+        return np.asarray(offsetted_quats, dtype=np.float64)
+
+    def _get_global_projected_gravity_quat(self) -> np.ndarray:
+        """Select the quaternion used for flat/global projected gravity.
+
+        When module orientation offset randomization is active, the global
+        projected gravity follows the offsetted torso-module quaternion so
+        master policies that consume the flat observation see the same
+        orientation perturbation family as modular observations.
+        """
+        if (
+            self.module_orientation_offset_enabled
+            and self.module_orientation_offset_sim_enabled
+            and self.offsetted_module_quats.size > 0
+        ):
+            torso_node_id = getattr(self.cfg.observation, "torso_node_id", 0)
+            torso_idx = 0
+            if isinstance(torso_node_id, (int, np.integer)):
+                torso_idx = int(torso_node_id)
+            elif isinstance(torso_node_id, str) and torso_node_id.startswith("l"):
+                suffix = torso_node_id[1:]
+                if suffix.isdigit():
+                    torso_idx = int(suffix)
+
+            torso_idx = int(np.clip(torso_idx, 0, len(self.offsetted_module_quats) - 1))
+            return np.asarray(self.offsetted_module_quats[torso_idx], dtype=np.float64)
+
+        return np.asarray(self.raw.quat, dtype=np.float64)
+
+    def _get_global_module_offset_quat(self) -> np.ndarray:
+        """Return the offset quaternion associated with the torso module."""
+        if (
+            not self.module_orientation_offset_enabled
+            or not self.module_orientation_offset_sim_enabled
+            or self.module_orientation_offset_quats.size == 0
+        ):
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+
+        torso_node_id = getattr(self.cfg.observation, "torso_node_id", 0)
+        torso_idx = 0
+        if isinstance(torso_node_id, (int, np.integer)):
+            torso_idx = int(torso_node_id)
+        elif isinstance(torso_node_id, str) and torso_node_id.startswith("l"):
+            suffix = torso_node_id[1:]
+            if suffix.isdigit():
+                torso_idx = int(suffix)
+
+        torso_idx = int(np.clip(torso_idx, 0, len(self.module_orientation_offset_quats) - 1))
+        return np.asarray(self.module_orientation_offset_quats[torso_idx], dtype=np.float64)
+
+    def get_observed_ang_vel_body(self) -> np.ndarray:
+        """Return flat angular velocity in the same offsetted IMU frame as gravity."""
+        ang_vel_body = np.asarray(self.raw.ang_vel_body, dtype=np.float64)
+        if not (
+            self.module_orientation_offset_enabled
+            and self.module_orientation_offset_sim_enabled
+        ):
+            return ang_vel_body
+        return quat_rotate_inverse(self._get_global_module_offset_quat(), ang_vel_body)
+
+    def get_observed_gyros(self) -> np.ndarray:
+        """Return per-module gyros rotated into each module's offsetted IMU frame."""
+        gyros = np.asarray(self.raw.gyros, dtype=np.float64)
+        if gyros.size == 0:
+            return gyros
+        if gyros.ndim == 1:
+            gyros = gyros.reshape(1, 3)
+        if not (
+            self.module_orientation_offset_enabled
+            and self.module_orientation_offset_sim_enabled
+        ):
+            return gyros
+
+        rotated = []
+        for module_idx, gyro in enumerate(gyros):
+            offset_quat = self._get_offset_quat_for_module(module_idx)
+            rotated.append(quat_rotate_inverse(offset_quat, gyro))
+        return np.asarray(rotated, dtype=np.float64)
+
+    def set_module_orientation_offset_sim_enabled(self, enabled: bool) -> None:
+        """Allow simulation environments to opt into module quaternion offsets."""
+        self.module_orientation_offset_sim_enabled = bool(enabled)
+        self._resample_module_orientation_offsets()
     
     @property
     def masked_dof_pos(self) -> np.ndarray:
@@ -1235,6 +1420,7 @@ class State:
         # self.observable_data = {}
         self.step_counter = 0
         self.render_lookat_filter = AverageFilter(10)
+        self._resample_module_orientation_offsets()
 
         # Reset reward-related state
         self.reset_reward_state()
@@ -1350,6 +1536,7 @@ class State:
         """
         # Update raw state
         self.raw.update(data)
+        self.offsetted_module_quats = self._get_offsetted_module_quats()
 
         # Update accurate state (simulation only)
         self.accurate.update(data)
@@ -1381,6 +1568,8 @@ class State:
         self.observable_data.update(
             {
                 "projected_gravity": self.derived.projected_gravity,
+                "ang_vel_body": self.get_observed_ang_vel_body(),
+                "gyros": self.get_observed_gyros(),
                 "heading": self.derived.heading,
                 "dof_pos": self.raw.dof_pos,
                 "dof_vel": self.raw.dof_vel,
@@ -1397,14 +1586,18 @@ class State:
 
         # Projected gravity
         self.derived.projected_gravity = quat_rotate_inverse(
-            self.raw.quat, self.gravity_vec
+            self._get_global_projected_gravity_quat(), self.gravity_vec
         )
 
         # Projected gravities for each quaternion
-        self.derived.projected_gravities = [
-            quat_rotate_inverse(quat, self.gravity_vec) for quat in self.raw.quats
-        ]
-        if not self.derived.projected_gravities:
+        self.derived.projected_gravities = np.asarray(
+            [
+                quat_rotate_inverse(quat, self.gravity_vec)
+                for quat in self.offsetted_module_quats
+            ],
+            dtype=np.float64,
+        )
+        if self.derived.projected_gravities.size == 0:
             print("Warning: No projected gravities available")
 
         # Heading
