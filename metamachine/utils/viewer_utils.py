@@ -9,6 +9,7 @@ Licensed under the Apache License, Version 2.0
 """
 
 import time
+import xml.etree.ElementTree as ET
 import numpy as np
 from typing import Callable, Optional, Tuple
 import mujoco
@@ -71,6 +72,84 @@ def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
     return np.array([q[1], q[2], q[3], q[0]])
 
 
+def _format_floats(values: np.ndarray | list[float]) -> str:
+    """Format float values compactly for MuJoCo XML attributes."""
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    return " ".join(f"{value:.12g}" for value in arr)
+
+
+def _mat9_to_quat_wxyz(mat9: np.ndarray) -> np.ndarray:
+    """Convert a flattened 3x3 MuJoCo rotation matrix to [w, x, y, z]."""
+    quat = np.zeros(4, dtype=np.float64)
+    mujoco.mju_mat2Quat(quat, np.asarray(mat9, dtype=np.float64))
+    return quat
+
+
+def _inject_welded_tracker_body(
+    xml_string: str,
+    reference_model: mujoco.MjModel,
+    *,
+    tracked_site: str = "imu_site0",
+) -> tuple[str, str | None]:
+    """Add a viewer-only freejoint tracker body welded to a target site."""
+    site_id = mujoco.mj_name2id(reference_model, mujoco.mjtObj.mjOBJ_SITE, tracked_site)
+    if site_id < 0:
+        return xml_string, None
+
+    reference_data = mujoco.MjData(reference_model)
+    mujoco.mj_forward(reference_model, reference_data)
+
+    site_pos = np.asarray(reference_data.site_xpos[site_id], dtype=np.float64)
+    site_quat = _mat9_to_quat_wxyz(reference_data.site_xmat[site_id])
+
+    root = ET.fromstring(xml_string)
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise ValueError("Viewer model XML is missing <worldbody>")
+
+    equality = root.find("equality")
+    if equality is None:
+        equality = ET.SubElement(root, "equality")
+
+    tracker_body_name = f"viewer_tracker__{tracked_site}"
+    tracker_joint_name = f"viewer_tracker_freejoint__{tracked_site}"
+    tracker_site_name = f"viewer_tracker_site__{tracked_site}"
+
+    tracker_body = ET.SubElement(
+        worldbody,
+        "body",
+        name=tracker_body_name,
+        pos=_format_floats(site_pos),
+        quat=_format_floats(site_quat),
+    )
+    ET.SubElement(tracker_body, "freejoint", name=tracker_joint_name)
+    ET.SubElement(
+        tracker_body,
+        "inertial",
+        pos="0 0 0",
+        mass="1000",
+        diaginertia="1000 1000 1000",
+    )
+    ET.SubElement(
+        tracker_body,
+        "site",
+        name=tracker_site_name,
+        pos="0 0 0",
+        size="0.012",
+        rgba="1 0 0 0.12",
+    )
+    ET.SubElement(
+        equality,
+        "weld",
+        site1=tracked_site,
+        site2=tracker_site_name,
+        solref="0.0001 1",
+        solimp="1 1 0.01",
+    )
+
+    return ET.tostring(root, encoding="unicode"), tracker_joint_name
+
+
 # =============================================================================
 # Model Creation
 # =============================================================================
@@ -104,9 +183,30 @@ def create_viewer_model(cfg, viewer_config=None) -> Tuple[mujoco.MjModel, mujoco
     temp_cfg.environment.mode = "sim"
     temp_env = MetaMachine(temp_cfg)
     
-    # Get the model from the temp environment
-    model = temp_env.model
+    xml_string = getattr(temp_env, "xml_string", None)
+    if not xml_string:
+        raise ValueError("Temporary viewer environment did not expose xml_string")
+
+    viewer_xml_string, tracker_joint_name = _inject_welded_tracker_body(
+        xml_string,
+        temp_env.model,
+        tracked_site="imu_site0",
+    )
+    model = mujoco.MjModel.from_xml_string(viewer_xml_string)
+    model.opt.gravity[:] = 0.0
     data = mujoco.MjData(model)
+    if tracker_joint_name is not None:
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, tracker_joint_name)
+        if joint_id >= 0:
+            qpos_adr = model.jnt_qposadr[joint_id]
+            tracked_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "imu_site0")
+            mujoco.mj_forward(model, data)
+            if tracked_site_id >= 0:
+                data.qpos[qpos_adr:qpos_adr + 3] = data.site_xpos[tracked_site_id]
+                data.qpos[qpos_adr + 3:qpos_adr + 7] = _mat9_to_quat_wxyz(
+                    data.site_xmat[tracked_site_id]
+                )
+                mujoco.mj_forward(model, data)
     
     # Close temp environment (we just needed the model)
     temp_env.close()
@@ -186,8 +286,39 @@ class ViewerStateUpdater:
         self.has_mocap = self.info['has_mocap']
         self.joint_qpos_start = self.info['joint_qpos_start']
         self.mocap_idx = 0
+        self.tracked_site_name = "imu_site0"
+        self.tracked_site_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_SITE, self.tracked_site_name
+        )
+        self.tracker_joint_name = f"viewer_tracker_freejoint__{self.tracked_site_name}"
+        self.tracker_joint_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_JOINT, self.tracker_joint_name
+        )
+        self.tracker_qpos_adr = (
+            int(model.jnt_qposadr[self.tracker_joint_id]) if self.tracker_joint_id >= 0 else None
+        )
+        self.tracker_settle_steps = 15
         
         self.step_count = 0
+
+    def _get_tracked_site_quat_wxyz(self, observable_data: dict) -> np.ndarray | None:
+        """Get the desired world quaternion for the tracked site."""
+        if self.tracked_site_name.startswith("imu_site") and "quats" in observable_data:
+            suffix = self.tracked_site_name.removeprefix("imu_site")
+            if suffix.isdigit():
+                module_idx = int(suffix)
+                quats = observable_data.get("quats")
+                if quats is not None and module_idx < len(quats):
+                    quat_wxyz = xyzw_to_wxyz(quats[module_idx])
+                    quat_wxyz = normalize_quat(quat_wxyz)
+                    return canonicalize_quat(quat_wxyz)
+
+        if "quat" in observable_data:
+            quat_wxyz = xyzw_to_wxyz(observable_data["quat"])
+            quat_wxyz = normalize_quat(quat_wxyz)
+            return canonicalize_quat(quat_wxyz)
+
+        return None
     
     def update(self, observable_data: dict) -> None:
         """Update viewer state from real robot observable data.
@@ -196,27 +327,13 @@ class ViewerStateUpdater:
             observable_data: Dictionary containing robot sensor data
                 Expected keys: 'quat' [x,y,z,w], 'dof_pos'
         """
-        # Update base orientation from IMU
-        if 'quat' in observable_data:
-            quat_xyzw = observable_data['quat']  # Real robot uses [x, y, z, w]
-            quat_wxyz = xyzw_to_wxyz(quat_xyzw)  # MuJoCo uses [w, x, y, z]
-            quat_wxyz = normalize_quat(quat_wxyz)
-            quat_wxyz = canonicalize_quat(quat_wxyz)
-            
-            if self.has_floating_base:
-                # Update base position and orientation via qpos
-                self.data.qpos[0:3] = [0.0, 0.0, 0.5]  # Fixed position at visible height
-                self.data.qpos[3:7] = quat_wxyz  # [w, x, y, z]
-                
-            elif self.has_mocap:
-                # Update via mocap
-                self.data.mocap_pos[self.mocap_idx] = np.array([0.0, 0.0, 0.5])
-                self.data.mocap_quat[self.mocap_idx] = quat_wxyz
-            
-            # Print quaternion for debugging
-            if self.verbose and self.step_count % 50 == 0:
-                print(f"\n[Debug] IMU quat (wxyz): [{quat_wxyz[0]:+.3f}, {quat_wxyz[1]:+.3f}, "
-                      f"{quat_wxyz[2]:+.3f}, {quat_wxyz[3]:+.3f}]", flush=True)
+        # Tracked-site weld mode only: start each frame from a neutral base pose.
+        if self.has_floating_base:
+            self.data.qpos[0:3] = [0.0, 0.0, 0.5]
+            self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+        elif self.has_mocap:
+            self.data.mocap_pos[self.mocap_idx] = np.array([0.0, 0.0, 0.5])
+            self.data.mocap_quat[self.mocap_idx] = np.array([1.0, 0.0, 0.0, 0.0])
         
         # Update joint positions
         if 'dof_pos' in observable_data:
@@ -229,9 +346,32 @@ class ViewerStateUpdater:
             
             # Also set control inputs
             self.data.ctrl[:num_joints] = dof_pos[:num_joints]
-        
-        # Forward kinematics to update visualization
+
+        # Compute current robot site world position before driving the tracker body.
         mujoco.mj_forward(self.model, self.data)
+
+        tracked_site_quat = self._get_tracked_site_quat_wxyz(observable_data)
+        if (
+            self.tracker_qpos_adr is not None
+            and self.tracked_site_id >= 0
+            and tracked_site_quat is not None
+        ):
+            tracked_site_pos = np.asarray(
+                self.data.site_xpos[self.tracked_site_id], dtype=np.float64
+            )
+            self.data.qpos[self.tracker_qpos_adr:self.tracker_qpos_adr + 3] = tracked_site_pos
+            self.data.qpos[self.tracker_qpos_adr + 3:self.tracker_qpos_adr + 7] = tracked_site_quat
+            self.data.qvel[:] = 0.0
+            for _ in range(self.tracker_settle_steps):
+                mujoco.mj_step(self.model, self.data)
+
+        if self.verbose and tracked_site_quat is not None and self.step_count % 50 == 0:
+            print(
+                f"\n[Debug] Tracked site quat (wxyz): "
+                f"[{tracked_site_quat[0]:+.3f}, {tracked_site_quat[1]:+.3f}, "
+                f"{tracked_site_quat[2]:+.3f}, {tracked_site_quat[3]:+.3f}]",
+                flush=True,
+            )
         
         self.step_count += 1
 

@@ -162,6 +162,7 @@ def get_robot_factory_legacy(factory_name: str = "modular_legs"):
         "modular_legs": "modular_legs",
         "mini_modular_legs": "mini_modular_legs",
         "lego_legs": "lego_legs",
+        "smart_joints": "smart_joints",
     }
 
     new_name = legacy_mapping.get(factory_name)

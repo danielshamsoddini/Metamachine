@@ -80,6 +80,7 @@ class RawState:
 
     # Goal distance (from distance sensor)
     goal_distance: float = -1.0  # Global goal distance (-1 = no reading)
+    goal_distance_delta: float = 0.0  # Positive when the robot gets closer
     goal_distances: np.ndarray = field(default_factory=lambda: np.zeros(1))  # Per-module
     
     # Special/external quaternion (from external tracking sensor)
@@ -93,6 +94,7 @@ class RawState:
         self.quat = np.zeros(4)
         self.quats = []
         self.goal_distance = -1.0
+        self.goal_distance_delta = 0.0
         self.special_quat = np.array([0, 0, 0, 1])  # Identity quaternion
 
         # Velocities
@@ -570,6 +572,7 @@ class State:
         "com_vel_world": lambda s: getattr(s, "com_vel_world", np.zeros(3)),
         # Goal distance (from distance sensor)
         "goal_distance": lambda s: np.array([s.raw.goal_distance]),
+        "goal_distance_delta": lambda s: np.array([s.raw.goal_distance_delta]),
         "goal_distances": lambda s: s.raw.goal_distances,
     }
 
@@ -2233,6 +2236,7 @@ class State:
             "gyros",
             "accs",
             "goal_distance",
+            "goal_distance_delta",
             "goal_distances",
         ]:
             if hasattr(self.raw, attr):

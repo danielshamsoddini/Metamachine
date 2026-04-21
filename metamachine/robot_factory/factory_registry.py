@@ -621,6 +621,7 @@ def get_default_fine_model_cfg(robot_type: RobotType) -> dict[str, Any]:
         robot_type == RobotType.CUSTOM
         or robot_type == RobotType.CUSTOM.value
         or robot_type == "lego_legs"
+        or robot_type == "smart_joints"
     ):
         # For lego_legs: use fine preset (high-fidelity meshes)
         return {"preset": "fine"}
@@ -650,6 +651,7 @@ def get_default_draft_model_cfg(robot_type: RobotType) -> dict[str, Any]:
         robot_type == RobotType.CUSTOM
         or robot_type == RobotType.CUSTOM.value
         or robot_type == "lego_legs"
+        or robot_type == "smart_joints"
     ):
         # For lego_legs: use draft preset (simple primitives for fast simulation)
         return {"preset": "draft"}

@@ -435,6 +435,63 @@ class ActionRateRateComponent(RewardComponent):
         return action_rate_rate
 
 
+def _get_valid_goal_distance(state) -> Optional[float]:
+    """Read a usable goal distance from state, if available."""
+    distance = float(getattr(state.raw, "goal_distance", -1.0))
+    if not np.isfinite(distance) or distance < 0.0:
+        return None
+    return distance
+
+
+class GoalDistancePenaltyComponent(RewardComponent):
+    """Dense penalty on current goal distance."""
+
+    def calculate(self, state, calculator) -> float:
+        distance = _get_valid_goal_distance(state)
+        if distance is None:
+            return 0.0
+
+        offset = float(self.params.get("offset", 0.0))
+        clamp_max = self.params.get("clamp_max", None)
+
+        distance = max(distance - offset, 0.0)
+        if clamp_max is not None:
+            distance = min(distance, float(clamp_max))
+
+        return -distance
+
+
+class GoalProgressComponent(RewardComponent):
+    """Rewards reducing goal distance from one step to the next."""
+
+    def calculate(self, state, calculator) -> float:
+        delta = float(getattr(state.raw, "goal_distance_delta", 0.0))
+        if not np.isfinite(delta):
+            return 0.0
+
+        clip_abs = self.params.get("clip_abs", None)
+        if clip_abs is not None:
+            clip_abs = abs(float(clip_abs))
+            delta = float(np.clip(delta, -clip_abs, clip_abs))
+
+        if bool(self.params.get("positive_only", False)):
+            delta = max(delta, 0.0)
+
+        return delta
+
+
+class GoalSuccessBonusComponent(RewardComponent):
+    """Bonus when the robot is within a success radius of the goal."""
+
+    def calculate(self, state, calculator) -> float:
+        distance = _get_valid_goal_distance(state)
+        if distance is None:
+            return 0.0
+
+        success_distance = float(self.params.get("success_distance", 0.08))
+        return float(distance <= success_distance)
+
+
 class WindowedDisplacementEfficiencyComponent(RewardComponent):
     """
     Windowed displacement efficiency reward for locomotion.
@@ -525,6 +582,130 @@ class WindowedDisplacementEfficiencyComponent(RewardComponent):
 
     def reset(self) -> None:
         self.pos_history = []
+
+
+class WindowedTurningCurveTrackingComponent(RewardComponent):
+    """
+    Windowed turning reward based on net heading change over a sliding window.
+
+    This is meant for commanded turning tasks where instantaneous torso yaw-rate
+    is too noisy or oscillatory. The component tracks:
+    1. Net heading change over the window, which suppresses fast left-right
+       oscillations that produce little overall turning.
+    2. Turning consistency, which penalizes oscillatory turning even when the
+       average turn-rate looks reasonable.
+    3. Optional curvature matching when both forward-speed and turn-rate
+       commands are available.
+    """
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.pos_history: list[np.ndarray] = []
+        self.heading_history: list[float] = []
+        self._last_heading: float | None = None
+        self._unwrapped_heading: float | None = None
+
+    def _resolve_target(self, value: Any, state) -> float:
+        if isinstance(value, str) and value.startswith("cmd:"):
+            return float(state.get_command_by_name(value[4:]))
+        return float(value)
+
+    def _get_planar_position(self, state) -> np.ndarray:
+        use_weld_cluster = self.params.get("use_weld_cluster", True)
+        if use_weld_cluster and state.mj_model is not None and state.mj_data is not None:
+            from ...utils.mujoco_utils import get_largest_weld_cluster_average_pos
+
+            result = get_largest_weld_cluster_average_pos(state.mj_model, state.mj_data)
+            if result[1] is not None:
+                return np.asarray(result[1][:2], dtype=np.float32)
+
+        if state.accurate.pos_world is not None:
+            return np.asarray(state.accurate.pos_world[:2], dtype=np.float32)
+        return np.asarray(state.raw.pos_world[:2], dtype=np.float32)
+
+    def calculate(self, state, calculator) -> float:
+        window_size = int(self.params.get("window_size", 100))
+        tracking_sigma = max(float(self.params.get("tracking_sigma", 0.5)), 1e-6)
+        straight_tracking_sigma = max(
+            float(self.params.get("straight_tracking_sigma", tracking_sigma)),
+            1e-6,
+        )
+        consistency_weight = float(self.params.get("consistency_weight", 0.25))
+        turn_command_deadband = float(self.params.get("turn_command_deadband", 0.05))
+        min_path_length = float(self.params.get("min_path_length", 0.05))
+        min_forward_speed = float(self.params.get("min_forward_speed", 0.05))
+
+        heading = float(np.asarray(state.derived.heading, dtype=np.float32).reshape(-1)[0])
+        curr_pos = self._get_planar_position(state)
+
+        if self._last_heading is None or self._unwrapped_heading is None:
+            self._unwrapped_heading = heading
+        else:
+            heading_delta = normalize_angle(
+                np.array([heading - self._last_heading], dtype=np.float32)
+            )[0]
+            self._unwrapped_heading += float(heading_delta)
+        self._last_heading = heading
+
+        self.pos_history.append(curr_pos)
+        self.heading_history.append(float(self._unwrapped_heading))
+
+        if len(self.pos_history) > window_size:
+            self.pos_history.pop(0)
+            self.heading_history.pop(0)
+
+        if len(self.pos_history) < 2:
+            return 0.0
+
+        net_heading_change = self.heading_history[-1] - self.heading_history[0]
+        heading_path = sum(
+            abs(self.heading_history[i + 1] - self.heading_history[i])
+            for i in range(len(self.heading_history) - 1)
+        )
+        path_len = sum(
+            np.linalg.norm(self.pos_history[i + 1] - self.pos_history[i])
+            for i in range(len(self.pos_history) - 1)
+        )
+        time_elapsed = calculator.dt * max(1, len(self.heading_history) - 1)
+        actual_turn_rate = net_heading_change / max(time_elapsed, 1e-6)
+
+        target_turn_rate = self._resolve_target(
+            self.params.get("target_turn_rate", 0.0),
+            state,
+        )
+        target_forward_speed_cfg = self.params.get("target_forward_speed", None)
+        target_forward_speed = (
+            self._resolve_target(target_forward_speed_cfg, state)
+            if target_forward_speed_cfg is not None
+            else None
+        )
+
+        target_metric = target_turn_rate
+        actual_metric = actual_turn_rate
+        if (
+            target_forward_speed is not None
+            and abs(target_forward_speed) >= min_forward_speed
+            and path_len >= min_path_length
+        ):
+            target_metric = target_turn_rate / target_forward_speed
+            actual_metric = net_heading_change / path_len
+
+        tracking_reward = np.exp(-np.square(target_metric - actual_metric) / tracking_sigma)
+
+        if abs(target_turn_rate) <= turn_command_deadband:
+            leakage_rate = heading_path / max(time_elapsed, 1e-6)
+            leakage_reward = np.exp(-np.square(leakage_rate) / straight_tracking_sigma)
+            return float(tracking_reward * leakage_reward)
+
+        turning_consistency = abs(net_heading_change) / (heading_path + 1e-6)
+        consistency_scale = (1.0 - consistency_weight) + consistency_weight * turning_consistency
+        return float(tracking_reward * consistency_scale)
+
+    def reset(self) -> None:
+        self.pos_history = []
+        self.heading_history = []
+        self._last_heading = None
+        self._unwrapped_heading = None
 
 
 class OneHotTurningComponent(RewardComponent):
@@ -818,7 +999,11 @@ COMPONENT_REGISTRY = {
     "action_rate": ActionRateComponent,
     "action_rate_rate": ActionRateRateComponent,
     "action_acceleration": ActionRateRateComponent,
+    "goal_distance_penalty": GoalDistancePenaltyComponent,
+    "goal_progress": GoalProgressComponent,
+    "goal_success_bonus": GoalSuccessBonusComponent,
     "windowed_displacement_efficiency": WindowedDisplacementEfficiencyComponent,
+    "windowed_turning_curve_tracking": WindowedTurningCurveTrackingComponent,
     "onehot_turning": OneHotTurningComponent,
     "onehot_forward": OneHotForwardComponent,
     "local_x_velocity": LocalXVelocityComponent,

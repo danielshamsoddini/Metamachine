@@ -861,6 +861,7 @@ def play_checkpoint(
     verbose: bool = True,
     commands: Optional[dict] = None,
     disable_resampling: bool = False,
+    zero_actions: bool = False,
 ) -> dict:
     """Play/evaluate a trained policy from a checkpoint.
     
@@ -880,6 +881,7 @@ def play_checkpoint(
             Use with disable_resampling=True to keep commands fixed.
         disable_resampling: If True, disable automatic command resampling.
             Useful when you want to test specific command values.
+        zero_actions: If True, override the policy output with all-zero actions.
     
     Returns:
         dict: Statistics from the playback (rewards, lengths, etc.)
@@ -954,6 +956,7 @@ def play_checkpoint(
     print(f"  Episodes: {'infinite' if num_episodes == 0 else num_episodes}")
     print(f"  Deterministic: {deterministic}")
     print(f"  Real robot: {real_robot}")
+    print(f"  Zero actions: {zero_actions}")
     if realtime_playback:
         print(f"  Real-time playback: ENABLED (dt={dt:.4f}s, {1/dt:.1f}Hz)")
     if commands:
@@ -986,7 +989,10 @@ def play_checkpoint(
                 if realtime_playback:
                     step_start_time = time.time()
                 
-                action, _ = model.predict(obs, deterministic=deterministic)
+                if zero_actions:
+                    action = np.zeros(env.action_space.shape, dtype=np.float32)
+                else:
+                    action, _ = model.predict(obs, deterministic=deterministic)
                 obs, reward, terminated, truncated, info = env.step(action)
                 episode_reward += reward
                 episode_length += 1
@@ -1710,6 +1716,7 @@ def play_checkpoint_with_tracking(
     enable_realtime_plot: bool = False,
     save_tracking_path: Optional[str] = None,
     save_state_path: Optional[str] = None,
+    zero_actions: bool = False,
     plot_update_interval: float = 0.05,
     plot_history_length: int = 200,
 ) -> dict:
@@ -1733,6 +1740,7 @@ def play_checkpoint_with_tracking(
         enable_realtime_plot: If True, show real-time joint tracking plot
         save_tracking_path: If provided, save joint tracking data to this file (.npz or .pkl)
         save_state_path: If provided, save full state data for behavior analysis (.npz or .pkl)
+        zero_actions: If True, override the policy output with all-zero actions.
         plot_update_interval: Real-time plot update interval (seconds)
         plot_history_length: Number of timesteps to show in real-time plot
     
@@ -1819,6 +1827,7 @@ def play_checkpoint_with_tracking(
     print(f"  Deterministic: {deterministic}")
     print(f"  Real robot: {real_robot}")
     print(f"  Real-time plot: {enable_realtime_plot}")
+    print(f"  Zero actions: {zero_actions}")
     if save_tracking_path:
         print(f"  Saving tracking to: {save_tracking_path}")
     if save_state_path:
@@ -1859,7 +1868,10 @@ def play_checkpoint_with_tracking(
                     step_start_time = time.time()
                 
                 # Get action from policy
-                action, _ = model.predict(obs, deterministic=deterministic)
+                if zero_actions:
+                    action = np.zeros(env.action_space.shape, dtype=np.float32)
+                else:
+                    action, _ = model.predict(obs, deterministic=deterministic)
                 
                 # Execute step
                 obs, reward, terminated, truncated, info = env.step(action)

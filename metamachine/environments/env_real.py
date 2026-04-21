@@ -268,6 +268,7 @@ class RealMetaMachine(Base):
         self.listen_port = real_cfg.get("listen_port", self.DEFAULT_LISTEN_PORT)
         self.command_port = real_cfg.get("command_port", self.DEFAULT_COMMAND_PORT)
         self.device_timeout = real_cfg.get("device_timeout", 2.0)
+        self.enable_ready_grace_sec = float(real_cfg.get("enable_ready_grace_sec", 1.0))
         
         # Control parameters
         self.kp_default = cfg.control.get("kp", 10.0)
@@ -302,6 +303,7 @@ class RealMetaMachine(Base):
         
         # Control state
         self.motor_enabled = False
+        self._enable_ready_grace_deadline = 0.0
         self.last_motor_com_time = time.time()
         self.compute_time = 0.0
         self.send_dt = 0.0
@@ -332,6 +334,7 @@ class RealMetaMachine(Base):
         
         # Observable data cache
         self.observable_data: Dict[str, Any] = {}
+        self._last_goal_distance_value: Optional[float] = None
         
         # Initialize dashboard if enabled
         if self.enable_dashboard:
@@ -740,6 +743,45 @@ class RealMetaMachine(Base):
         """
         return all(mid in self.connected_modules for mid in self.all_expected_module_ids)
 
+    def _get_modules_not_in_active_mode(self) -> Dict[int, int]:
+        """Return active modules whose motor_mode is not Active/On."""
+        modules_not_on: Dict[int, int] = {}
+        for module_id in self.expected_module_ids:
+            data = self.module_data.get(module_id)
+            motor = getattr(data, "motor", None) if data is not None else None
+            motor_mode = getattr(motor, "motor_mode", 0) if motor else 0
+            if motor_mode != 2:
+                modules_not_on[module_id] = motor_mode
+        return modules_not_on
+
+    def _is_calibration_in_progress(self) -> bool:
+        """Return True when the only readiness issue is modules still calibrating."""
+        modules_not_on = self._get_modules_not_in_active_mode()
+        return bool(modules_not_on) and all(mode == 1 for mode in modules_not_on.values())
+
+    def _get_not_ready_reason(self) -> Optional[str]:
+        """Return a short explanation when the robot is not ready for control."""
+        if not self.all_modules_connected():
+            return f"missing modules {self.get_missing_modules()}"
+
+        active_ips = set(self.server.active_devices.keys())
+        inactive_modules = []
+        for module_id in self.all_expected_module_ids:
+            ip = self.module_to_ip.get(module_id)
+            if ip not in active_ips:
+                inactive_modules.append(module_id)
+        if inactive_modules:
+            return f"inactive modules {inactive_modules}"
+
+        modules_not_on = self._get_modules_not_in_active_mode()
+        if modules_not_on:
+            module_ids = list(modules_not_on)
+            if all(mode == 1 for mode in modules_not_on.values()):
+                return f"calibrating modules {module_ids}"
+            return f"motor mode not ON for modules {module_ids}"
+
+        return None
+
     def ready(self) -> bool:
         """Check if the robot system is ready for control.
         
@@ -751,27 +793,30 @@ class RealMetaMachine(Base):
         Returns:
             bool: True if all expected modules are active and motors are ON
         """
-        # Check all expected modules are connected
-        if not self.all_modules_connected():
+        return self._get_not_ready_reason() is None
+
+    def _engage_not_ready_interlock(self, reason: Optional[str]) -> None:
+        """Disable all still-connected active modules after a readiness fault."""
+        if not self.motor_enabled:
+            return
+
+        message = "Robot not ready; disabling all active modules"
+        if reason:
+            message = f"{message} ({reason})"
+
+        print(f"[Safety] {message}")
+        self._dashboard_log(message, "error")
+        self._disable_motor()
+
+    def _should_engage_not_ready_interlock(self) -> bool:
+        """Return whether a not-ready fault should trip the safety interlock."""
+        if not self.motor_enabled:
             return False
-        
-        # Check all modules are in active devices (recently seen)
-        active_ips = set(self.server.active_devices.keys())
-        for module_id in self.all_expected_module_ids:
-            ip = self.module_to_ip.get(module_id)
-            if ip not in active_ips:
-                return False
-        
-        # Check all active motor modules are ON (motor_mode == 2)
-        # motor_mode: 0=Reset/Off, 1=Calibration, 2=Active/On
-        for module_id in self.expected_module_ids:
-            if module_id in self.module_data:
-                motor = self.module_data[module_id].motor
-                motor_mode = getattr(motor, 'motor_mode', 0) if motor else 0
-                if motor_mode != 2:  # Not in Active/On mode
-                    return False
-        
-        return True
+
+        if self._is_calibration_in_progress():
+            return False
+
+        return time.time() >= self._enable_ready_grace_deadline
 
     def get_missing_modules(self) -> List[int]:
         """Get list of expected modules (active + sensor) that are not yet connected.
@@ -910,6 +955,13 @@ class RealMetaMachine(Base):
         global_goal_distance = -1.0
         if self.goal_distance_module_id is not None:
             global_goal_distance = self._get_module_goal_distance(self.goal_distance_module_id)
+        global_goal_distance_delta = 0.0
+        if global_goal_distance >= 0.0:
+            if self._last_goal_distance_value is not None:
+                global_goal_distance_delta = self._last_goal_distance_value - global_goal_distance
+            self._last_goal_distance_value = global_goal_distance
+        else:
+            self._last_goal_distance_value = None
         
         # Special quaternion from configured module (for external tracking)
         special_quat = np.array([0, 0, 0, 1])  # Identity quaternion by default
@@ -934,6 +986,7 @@ class RealMetaMachine(Base):
             
             # Global goal distance (from configured source, if any)
             "goal_distance": global_goal_distance,
+            "goal_distance_delta": global_goal_distance_delta,
             
             # Special quaternion (from external tracking sensor)
             "special_quat": special_quat,
@@ -1593,6 +1646,7 @@ class RealMetaMachine(Base):
         
         # Signal new episode to dashboard
         self._update_dashboard_new_episode()
+        self._last_goal_distance_value = None
         
         time.sleep(0.5)
 
@@ -1696,6 +1750,7 @@ class RealMetaMachine(Base):
         """Enable all motors."""
         print("[CMD] Enabling motors...")
         self.motor_enabled = True
+        self._enable_ready_grace_deadline = time.time() + max(self.enable_ready_grace_sec, 0.0)
         self._send_enable_command(enable=True)
         if self.dashboard:
             self.dashboard.set_switch(True)
@@ -1704,6 +1759,7 @@ class RealMetaMachine(Base):
         """Disable all motors."""
         print("[CMD] Disabling motors...")
         self.motor_enabled = False
+        self._enable_ready_grace_deadline = 0.0
         self._send_enable_command(enable=False)
         if self.dashboard:
             self.dashboard.set_switch(False)
@@ -2095,6 +2151,15 @@ class RealMetaMachine(Base):
         """
         # Call parent step
         obs, reward, done, truncated, info = super().step(action)
+
+        not_ready_reason = self._get_not_ready_reason()
+        if not_ready_reason is not None:
+            info["not_ready"] = True
+            info["not_ready_reason"] = not_ready_reason
+            if self._should_engage_not_ready_interlock():
+                self._engage_not_ready_interlock(not_ready_reason)
+        else:
+            info["not_ready"] = False
         
         # Update dashboard with reward info
         if self.dashboard is not None:
