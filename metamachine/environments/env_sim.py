@@ -1329,6 +1329,30 @@ class MetaMachine(Base, MujocoEnv):
         # Setup PD gains with per-joint control support
         self._setup_pd_gains()
 
+        # Detect MuJoCo position actuators (biastype == 1 = affine).
+        # For these the ctrl value is a position target, not a torque, so
+        # _pd_control bypasses the custom PD and sets ctrl directly.
+        biastype = self.model.actuator_biastype[: self.model.nu]
+        self._position_actuator_mask = (biastype == 1)  # bool array, length = num_act
+
+        # Auto-detect knee-hip pairs: consecutive motor→position actuator pairs
+        # produced by leg_rs03 meta-components (hip=motor, knee=position).
+        self._knee_hip_pairs: list[tuple[int, int]] = []
+        mask = self._position_actuator_mask
+        for i in range(len(mask) - 1):
+            if not mask[i] and mask[i + 1]:
+                self._knee_hip_pairs.append((i + 1, i))  # (knee_act_idx, hip_act_idx)
+
+        # Read coupling config: q_knee_target = sign * a_knee + alpha * q_hip + offset
+        knee_coupling_cfg = self.cfg.control.get("knee_hip_coupling", {})  # type: ignore
+        self._knee_coupling_enabled = (
+            bool(knee_coupling_cfg.get("enabled", False))
+            and len(self._knee_hip_pairs) > 0
+        )
+        self._knee_coupling_alpha = float(knee_coupling_cfg.get("alpha", 0.0))
+        self._knee_coupling_offset = float(knee_coupling_cfg.get("offset", 0.0))
+        self._knee_coupling_sign = float(knee_coupling_cfg.get("sign", 1.0))
+
     def _resolve_torso_body_id(self) -> int:
         """Resolve torso body ID for both modular and generic XML models."""
         torso_body_name = self.cfg.observation.get("torso_body_name", None)  # type: ignore
@@ -2275,19 +2299,38 @@ class MetaMachine(Base, MujocoEnv):
         dof_pos = self.data.qpos[self.model.jnt_qposadr[self.joint_idx]]
         dof_vel = self.data.qvel[self.model.jnt_dofadr[self.joint_idx]]
 
-        # Calculate PD torques
+        # Apply knee-hip coupling: q_knee_target = sign * a_knee + alpha * q_hip + offset.
+        # This rewrites pos_desired for each knee actuator before PD / position ctrl.
+        if self._knee_coupling_enabled:
+            pos_desired = pos_desired.copy()
+            for knee_idx, hip_idx in self._knee_hip_pairs:
+                q_hip = dof_pos[hip_idx]
+                a_knee = pos_desired[knee_idx]
+                pos_desired[knee_idx] = (
+                    self._knee_coupling_sign * a_knee
+                    + self._knee_coupling_alpha * q_hip
+                    + self._knee_coupling_offset
+                )
+
+        # Calculate PD torques for motor actuators.
         # For position joints: kp * (pos_error) + kd * (vel_error)
-        # For velocity joints: kp=0, so just kd * (vel_target - vel_current)
+        # For velocity joints (wheels): kp=0, so just kd * (vel_target - vel_current)
         torques = self.kps * (pos_desired - dof_pos) + self.kds * (
             vel_desired - dof_vel
         )
 
-        # Apply constraints
+        # Apply torque-velocity constraints only to motor actuators.
         torques = self._apply_torque_constraints(torques, dof_vel)
-        # print(f"Applying torques: {torques}")
+
+        # For MuJoCo <position> actuators ctrl is the target position, not a torque.
+        # Override the PD result with the (possibly coupled) target position directly.
+        ctrl = torques
+        if self._position_actuator_mask.any():
+            ctrl = torques.copy()
+            ctrl[self._position_actuator_mask] = pos_desired[self._position_actuator_mask]
 
         # Execute simulation
-        self.do_simulation(torques, int(frame_skip))
+        self.do_simulation(ctrl, int(frame_skip))
 
     def _apply_torque_constraints(
         self, torques: np.ndarray, dof_vel: np.ndarray
@@ -2499,6 +2542,7 @@ class MetaMachine(Base, MujocoEnv):
         # Joint states
         dof_pos = qpos[self.model.jnt_qposadr[self.joint_idx]]
         dof_vel = qvel[self.model.jnt_dofadr[self.joint_idx]]
+        dof_torque = self.data.qfrc_actuator[self.model.jnt_dofadr[self.joint_idx]]
 
         # Velocities
         cvel = self.data.cvel[torso_body_id]
@@ -2513,6 +2557,7 @@ class MetaMachine(Base, MujocoEnv):
             "quat": quat,
             "dof_pos": dof_pos,
             "dof_vel": dof_vel,
+            "dof_torque": dof_torque,
             "vel_world": vel_world,
             "vel_body": vel_body,
             "ang_vel_body": ang_vel_body,
@@ -3075,7 +3120,13 @@ class MetaMachine(Base, MujocoEnv):
             else:
                 init_qvel[:6] = self.np_random.uniform(-1, 1, 6)
 
-        return np.asarray(init_qvel + self.np_random.normal(0, 0.1, self.model.nv))
+        # Gate the per-step noise by the same `noisy_init` flag used for qpos
+        # — without this gate, every reset gets a ~0.1-std nudge on every DOF
+        # even when randomization is disabled, which can kick a model with
+        # foot-near-floor geometry into immediate floor penetration on step 1.
+        if self.init_cfg.get("noisy_init", True):
+            init_qvel = init_qvel + self.np_random.normal(0, 0.1, self.model.nv)
+        return np.asarray(init_qvel)
 
     def reload_model(self, xml_string: str) -> None:
         """Reload MuJoCo model with new XML."""

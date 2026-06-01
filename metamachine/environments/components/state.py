@@ -68,6 +68,7 @@ class RawState:
     # Joint state - size will be set after initialization
     dof_pos: np.ndarray = field(default_factory=lambda: np.zeros(1))  # Will be resized
     dof_vel: np.ndarray = field(default_factory=lambda: np.zeros(1))  # Will be resized
+    dof_torque: np.ndarray = field(default_factory=lambda: np.zeros(1))  # Will be resized
 
     # Sensor data
     gyros: Optional[np.ndarray] = None
@@ -106,6 +107,7 @@ class RawState:
         # Per-module state
         self.dof_pos = np.zeros(num_dof)
         self.dof_vel = np.zeros(num_dof)
+        self.dof_torque = np.zeros(num_dof)
         self.gyros = np.zeros((num_dof, 3))
         self.accs = np.zeros((num_dof, 3))
         self.goal_distances = np.ones(num_dof)*-1.0
@@ -542,6 +544,7 @@ class State:
         "ang_vel_body": lambda s: s.get_observed_ang_vel_body(),
         "dof_pos": lambda s: s.raw.dof_pos,
         "dof_vel": lambda s: s.raw.dof_vel,
+        "dof_torque": lambda s: s.raw.dof_torque,
         # Masked joint observations (for robots with wheels or partial encoders)
         "masked_dof_pos": lambda s: s.masked_dof_pos,
         "masked_dof_vel": lambda s: s.masked_dof_vel,
@@ -587,6 +590,7 @@ class State:
         # Array-type components (use index_type: "slice")
         "dof_pos": lambda s: s.raw.dof_pos,
         "dof_vel": lambda s: s.raw.dof_vel,
+        "dof_torque": lambda s: s.raw.dof_torque,
         # Masked joint observations (for robots with wheels or partial encoders)
         "masked_dof_pos": lambda s: s.masked_dof_pos,
         "masked_dof_vel": lambda s: s.masked_dof_vel,
