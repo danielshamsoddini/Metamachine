@@ -83,6 +83,7 @@ from ..utils.math_utils import (
     rotate_vector2D,
     wxyz_to_xyzw,
 )
+from ..utils.rendering import add_ground_disc_marker, add_ground_line_marker
 from ..utils.validation import is_list_like, is_number
 from .base import Base
 from .gym.mujoco_env import MujocoEnv
@@ -224,11 +225,17 @@ class MetaMachine(Base, MujocoEnv):
             # Load and compile robot asset
             self._load_robot_asset()
         elif hasattr(cfg, "morphology") and cfg.morphology.configuration is not None:
+            self._base_morphology_configuration = self._to_plain_container(
+                cfg.morphology.configuration
+            )
+            self._validate_morphology_randomization_config()
             self._load_robot_asset_from_morphology(
-                cfg.morphology.robot_type, cfg.morphology.configuration
+                cfg.morphology.robot_type, self._base_morphology_configuration
             )
         else:
             raise ValueError("No robot asset file or morphology provided")
+
+        self._initialize_actuation_model()
 
         # Setup MuJoCo environment
         self._setup_mujoco()
@@ -280,13 +287,20 @@ class MetaMachine(Base, MujocoEnv):
         """Load robot asset from morphology using the new factory system."""
         import tempfile
         import os
+
+        factory_kwargs = self._get_morphology_factory_kwargs()
         
+        factory_init_kwargs = {
+            **get_default_fine_model_cfg(robot_type),
+            **factory_kwargs,
+        }
+
         # Get the factory using the new registry system
         factory = robot_factory.get_robot_factory(
             robot_type,
             sim_cfg=self.cfg.simulation,  # type: ignore
             log_dir=self._log_dir,  # Pass the environment's log directory
-            **get_default_fine_model_cfg(robot_type),
+            **factory_init_kwargs,
         )
         if factory is None:
             raise ValueError(f"Unknown robot factory type: {robot_type}")
@@ -302,6 +316,8 @@ class MetaMachine(Base, MujocoEnv):
         # Store robot instance for potential future use
         self._robot_instance = robot
         
+        # Morphology-based robots also initialize an XMLCompiler here so
+        # per-episode XML randomization can reuse the generated model.
         # Check if restructure is enabled (for lego_legs or other graph-based robots)
         restructure = getattr(self.cfg.morphology, "restructure", False)
         restructure_qpos = getattr(self.cfg.morphology, "restructure_qpos", None)
@@ -311,7 +327,8 @@ class MetaMachine(Base, MujocoEnv):
             # Use _log_dir if available to avoid race conditions in parallel environments
             if self._log_dir is not None:
                 import uuid
-                temp_xml_path = os.path.join(self._log_dir, f"robot_temp_{uuid.uuid4().hex[:8]}.xml")
+                os.makedirs(os.path.join(self._log_dir, "tmp"), exist_ok=True)
+                temp_xml_path = os.path.join(self._log_dir, "tmp", f"robot_temp_{uuid.uuid4().hex[:8]}.xml")
             else:
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as f:
                     temp_xml_path = f.name
@@ -376,12 +393,19 @@ class MetaMachine(Base, MujocoEnv):
         self, robot_type: Any, morphology: Any
     ) -> None:
         """Load robot asset from morphology using the new factory system."""
+        factory_kwargs = self._get_morphology_factory_kwargs()
+
+        factory_init_kwargs = {
+            **get_default_draft_model_cfg(robot_type),
+            **factory_kwargs,
+        }
+
         # Get the factory using the new registry system
         draft_factory = robot_factory.get_robot_factory(
             robot_type,
             sim_cfg=self.cfg.simulation,  # type: ignore
             log_dir=self._log_dir,  # Pass the environment's log directory
-            **get_default_draft_model_cfg(robot_type),
+            **factory_init_kwargs,
         )
 
         if draft_factory is None:
@@ -405,6 +429,215 @@ class MetaMachine(Base, MujocoEnv):
 
         # Store robot instance for potential future use
         self._draft_robot_instance = draft_robot
+
+    def _get_morphology_factory_kwargs(self) -> dict[str, Any]:
+        """Extract optional factory kwargs from morphology config."""
+        morphology_cfg = getattr(self.cfg, "morphology", None)
+        if morphology_cfg is None:
+            return {}
+
+        if hasattr(morphology_cfg, "get"):
+            factory_kwargs = morphology_cfg.get("factory_kwargs", None)
+        else:
+            factory_kwargs = getattr(morphology_cfg, "factory_kwargs", None)
+
+        if factory_kwargs is None:
+            return {}
+
+        if isinstance(factory_kwargs, dict):
+            return factory_kwargs.copy()
+
+        try:
+            from omegaconf import OmegaConf
+            factory_kwargs = OmegaConf.to_container(factory_kwargs, resolve=True)
+        except Exception:
+            pass
+
+        return dict(factory_kwargs) if isinstance(factory_kwargs, dict) else {}
+
+    def _get_robot_actuation_defaults(self) -> dict[str, Any]:
+        """Read robot-specific actuation defaults from the generated robot, if available."""
+        robot = getattr(self, "_robot_instance", None)
+        if robot is None or not hasattr(robot, "get_actuation_config"):
+            return {}
+
+        try:
+            actuation_cfg = robot.get_actuation_config()
+        except Exception:
+            return {}
+
+        if actuation_cfg is None:
+            return {}
+        return self._to_plain_container(actuation_cfg)
+
+    def _initialize_actuation_model(self) -> None:
+        """
+        Resolve the actuation model used by tn_constraint clipping.
+
+        Priority:
+        1. Explicit simulation.actuation in the environment config
+        2. Robot-specific defaults exposed by the factory/plugin
+        3. Legacy hardcoded smart motor curve
+        """
+        robot_defaults = self._get_robot_actuation_defaults()
+
+        if hasattr(self.sim_cfg, "get"):
+            explicit_cfg = self.sim_cfg.get("actuation", None)
+        else:
+            explicit_cfg = getattr(self.sim_cfg, "actuation", None)
+
+        explicit_cfg = self._to_plain_container(explicit_cfg) if explicit_cfg is not None else {}
+        if not isinstance(explicit_cfg, dict):
+            explicit_cfg = {}
+
+        self._actuation_cfg_per_joint = None
+        if "per_joint" in robot_defaults and "per_joint" not in explicit_cfg:
+            per_joint = robot_defaults.get("per_joint", [])
+            if isinstance(per_joint, list) and per_joint:
+                self._actuation_cfg_per_joint = [
+                    self._to_plain_container(cfg) for cfg in per_joint
+                ]
+
+        self._actuation_cfg = {
+            **{k: v for k, v in robot_defaults.items() if k != "per_joint"},
+            **explicit_cfg,
+        }
+
+    def _to_plain_container(self, value: Any) -> Any:
+        """Convert OmegaConf containers to plain Python containers."""
+        if OmegaConf.is_config(value):
+            return OmegaConf.to_container(value, resolve=True)
+        return copy.deepcopy(value)
+
+    def _get_morphology_randomization_cfg(self) -> dict[str, Any]:
+        """Return morphology randomization config as a plain dictionary."""
+        randomization_cfg = getattr(self.cfg, "randomization", {}) or {}
+        morphology_cfg = randomization_cfg.get("morphology", {}) or {}
+        plain_cfg = self._to_plain_container(morphology_cfg)
+        return plain_cfg if isinstance(plain_cfg, dict) else {}
+
+    def _has_morphology_randomization(self) -> bool:
+        """Check whether morphology parameter randomization is enabled."""
+        morphology_cfg = self._get_morphology_randomization_cfg()
+        rules = morphology_cfg.get("component_params", []) or []
+        return bool(
+            morphology_cfg.get("enabled", False)
+            and rules
+            and hasattr(self, "_base_morphology_configuration")
+        )
+
+    def _validate_morphology_randomization_config(self) -> None:
+        """Validate morphology randomization rules against the base morphology."""
+        if not self._has_morphology_randomization():
+            return
+
+        base_morphology = getattr(self, "_base_morphology_configuration", None)
+        if not isinstance(base_morphology, dict):
+            raise ValueError(
+                "Morphology randomization requires a dict-like morphology.configuration"
+            )
+
+        components = base_morphology.get("components", []) or []
+        if not isinstance(components, list):
+            raise ValueError("morphology.configuration.components must be a list")
+
+        for rule in self._get_morphology_randomization_cfg().get("component_params", []):
+            component_type = rule.get("component_type")
+            param_rules = rule.get("params", {}) or {}
+            if not component_type:
+                raise ValueError(
+                    "Each randomization.morphology.component_params entry needs component_type"
+                )
+            if not isinstance(param_rules, dict) or not param_rules:
+                raise ValueError(
+                    f"Morphology randomization rule for '{component_type}' needs a params mapping"
+                )
+
+            matching_components = [
+                component
+                for component in components
+                if str(component.get("component_type")) == str(component_type)
+            ]
+            if not matching_components:
+                raise ValueError(
+                    f"No components found for morphology randomization type '{component_type}'"
+                )
+
+            for param_name, param_cfg in param_rules.items():
+                if not isinstance(param_cfg, dict):
+                    raise ValueError(
+                        f"Morphology randomization config for '{component_type}.{param_name}' "
+                        "must be a mapping"
+                    )
+
+                param_mode = param_cfg.get("mode", "absolute")
+                param_range = param_cfg.get("range")
+                if (
+                    not is_list_like(param_range)
+                    or len(param_range) != 2
+                    or not all(is_number(v) for v in param_range)
+                ):
+                    raise ValueError(
+                        f"Morphology randomization for '{component_type}.{param_name}' "
+                        "requires numeric range: [min, max]"
+                    )
+                if param_mode not in {"absolute", "percentage", "additive"}:
+                    raise ValueError(
+                        f"Unsupported morphology randomization mode '{param_mode}' "
+                        f"for '{component_type}.{param_name}'"
+                    )
+
+                matched_param = False
+                for component in matching_components:
+                    component_params = component.get("params", {}) or {}
+                    if param_name not in component_params:
+                        continue
+                    matched_param = True
+                    if not is_number(component_params[param_name]):
+                        raise ValueError(
+                            f"Morphology randomization only supports numeric params, got "
+                            f"'{component_type}.{param_name}'={component_params[param_name]!r}"
+                        )
+
+                if not matched_param:
+                    raise ValueError(
+                        f"No '{component_type}' components define param '{param_name}'"
+                    )
+
+    def _sample_morphology_param(
+        self, base_value: float, param_cfg: dict[str, Any]
+    ) -> float:
+        """Sample one randomized morphology parameter from its base value."""
+        param_mode = param_cfg.get("mode", "absolute")
+        low, high = param_cfg["range"]
+
+        if param_mode == "percentage":
+            return float(base_value * (1.0 + self.np_random.uniform(low, high)))
+        if param_mode == "additive":
+            return float(base_value + self.np_random.uniform(low, high))
+        return float(self.np_random.uniform(low, high))
+
+    def _get_randomized_morphology_configuration(self) -> dict[str, Any]:
+        """Create a randomized morphology config from the pristine base graph."""
+        randomized = copy.deepcopy(self._base_morphology_configuration)
+        rules = self._get_morphology_randomization_cfg().get("component_params", []) or []
+
+        for component in randomized.get("components", []) or []:
+            component_type = str(component.get("component_type"))
+            component_params = component.setdefault("params", {})
+
+            for rule in rules:
+                if component_type != str(rule.get("component_type")):
+                    continue
+
+                for param_name, param_cfg in (rule.get("params", {}) or {}).items():
+                    if param_name not in component_params:
+                        continue
+                    component_params[param_name] = self._sample_morphology_param(
+                        float(component_params[param_name]), param_cfg
+                    )
+
+        return randomized
 
     def get_robot_instance(self) -> Any:
         """Get the robot instance if available (new factory system only)."""
@@ -759,7 +992,8 @@ class MetaMachine(Base, MujocoEnv):
                 camera_id = cam["id"]
                 cam_name = cam["name"]
                 renderer.update_scene(self.data, camera=camera_id)
-                
+                self._add_goal_markers_to_scene(renderer.scene)
+            
                 # Call pre-render callbacks (for adding 3D markers to scene)
                 for callback in getattr(self, '_pre_render_callbacks', []):
                     try:
@@ -930,6 +1164,8 @@ class MetaMachine(Base, MujocoEnv):
 
     def _setup_simulation_state(self) -> None:
         """Setup simulation-specific state and tracking."""
+        self.state.set_module_orientation_offset_sim_enabled(True)
+
         # Robot configuration
         self._parse_robot_parameters()
 
@@ -945,12 +1181,151 @@ class MetaMachine(Base, MujocoEnv):
         # External forces
         self._setup_external_forces()
 
+        # Per-module randomization events (latency, torque, control attenuation)
+        self._setup_asymmetric_randomization()
+
         # Initialization parameters
         self._setup_initialization_parameters()
 
         # Initialize viewer for viewer mode
         self._passive_viewer = None
         self._viewer_context_manager = None
+        self._setup_goal_task_state()
+
+    def _setup_goal_task_state(self) -> None:
+        """Initialize optional forward goal-reaching task state."""
+        goal_cfg = getattr(self.cfg.task, "goal", None)
+        self.goal_cfg = goal_cfg
+        self.goal_task_enabled = bool(goal_cfg and goal_cfg.get("enabled", False))
+        self.goal_position_world: Optional[np.ndarray] = None
+        self.goal_distance = -1.0
+        self.goal_distance_delta = 0.0
+        self._previous_goal_distance: Optional[float] = None
+
+    def _get_goal_forward_basis(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return forward and lateral unit vectors on the ground plane."""
+        forward_xy = getattr(self, "adjusted_forward_vec", self.forward_vec)
+        if forward_xy is None:
+            forward_xy = np.array([1.0, 0.0], dtype=np.float32)
+        else:
+            forward_xy = np.asarray(forward_xy[:2], dtype=np.float32)
+
+        norm = float(np.linalg.norm(forward_xy))
+        if norm < 1e-6:
+            forward_xy = np.array([1.0, 0.0], dtype=np.float32)
+        else:
+            forward_xy = forward_xy / norm
+
+        lateral_xy = np.array([-forward_xy[1], forward_xy[0]], dtype=np.float32)
+        return forward_xy, lateral_xy
+
+    def _reset_goal_task(self) -> None:
+        """Sample a new goal in front of the robot."""
+        if not self.goal_task_enabled:
+            return
+
+        goal_cfg = self.goal_cfg
+        robot_xy = np.asarray(self.data.xpos[self.torso_body_id][:2], dtype=np.float32)
+        forward_xy, lateral_xy = self._get_goal_forward_basis()
+
+        distance_range = np.asarray(
+            goal_cfg.get("distance_range", [0.35, 0.75]),
+            dtype=np.float32,
+        )
+        lateral_range = np.asarray(
+            goal_cfg.get("lateral_range", [0.0, 0.0]),
+            dtype=np.float32,
+        )
+        height = float(goal_cfg.get("height", 0.03))
+
+        if distance_range.size == 1:
+            forward_distance = float(distance_range[0])
+        else:
+            forward_distance = float(
+                self.np_random.uniform(float(distance_range[0]), float(distance_range[1]))
+            )
+
+        if lateral_range.size == 1:
+            lateral_offset = float(lateral_range[0])
+        else:
+            lateral_offset = float(
+                self.np_random.uniform(float(lateral_range[0]), float(lateral_range[1]))
+            )
+
+        goal_xy = robot_xy + forward_distance * forward_xy + lateral_offset * lateral_xy
+        self.goal_position_world = np.array(
+            [goal_xy[0], goal_xy[1], height],
+            dtype=np.float32,
+        )
+        self.goal_distance = -1.0
+        self.goal_distance_delta = 0.0
+        self._previous_goal_distance = None
+
+    def _get_goal_observable_data(self, pos_world: np.ndarray) -> dict[str, Any]:
+        """Compute goal distance signals for observations and rewards."""
+        if not self.goal_task_enabled or self.goal_position_world is None:
+            return {}
+
+        goal_vector_xy = np.asarray(
+            self.goal_position_world[:2] - pos_world[:2],
+            dtype=np.float32,
+        )
+        current_distance = float(np.linalg.norm(goal_vector_xy))
+        if self._previous_goal_distance is None:
+            distance_delta = 0.0
+        else:
+            distance_delta = float(self._previous_goal_distance - current_distance)
+
+        self.goal_distance = current_distance
+        self.goal_distance_delta = distance_delta
+        self._previous_goal_distance = current_distance
+
+        return {
+            "goal_distance": current_distance,
+            "goal_distance_delta": distance_delta,
+            "goal_distances": np.full(self.num_act, current_distance, dtype=np.float32),
+            "goal_position_world": self.goal_position_world.copy(),
+            "goal_vector_world": np.array(
+                [
+                    self.goal_position_world[0] - pos_world[0],
+                    self.goal_position_world[1] - pos_world[1],
+                    self.goal_position_world[2] - pos_world[2],
+                ],
+                dtype=np.float32,
+            ),
+        }
+
+    def _add_goal_markers_to_scene(self, scene: Any) -> None:
+        """Visualize the goal and robot-to-goal line in recorded videos."""
+        if (
+            not self.goal_task_enabled
+            or self.goal_position_world is None
+            or not bool(self.goal_cfg.get("visualize", True))
+        ):
+            return
+
+        goal_xy = np.asarray(self.goal_position_world[:2], dtype=np.float32)
+        robot_xy = np.asarray(self.data.xpos[self.torso_body_id][:2], dtype=np.float32)
+        marker_radius = float(self.goal_cfg.get("marker_radius", 0.06))
+        line_radius = float(self.goal_cfg.get("line_radius", 0.01))
+        z_offset = float(self.goal_position_world[2])
+
+        add_ground_disc_marker(
+            scene,
+            pos_xy=goal_xy,
+            radius=marker_radius,
+            height=float(self.goal_cfg.get("marker_height", 0.01)),
+            color=(0.15, 0.95, 0.25, 0.85),
+            z_offset=z_offset,
+        )
+        add_ground_line_marker(
+            scene,
+            start_xy=robot_xy,
+            end_xy=goal_xy,
+            radius=line_radius,
+            color=(0.95, 0.35, 0.2, 0.75),
+            z_offset=max(z_offset, 0.02),
+        )
 
     def _parse_robot_parameters(self) -> None:
         """Parse robot-specific parameters."""
@@ -1024,6 +1399,30 @@ class MetaMachine(Base, MujocoEnv):
 
         # Setup PD gains with per-joint control support
         self._setup_pd_gains()
+
+        # Detect MuJoCo position actuators (biastype == 1 = affine).
+        # For these the ctrl value is a position target, not a torque, so
+        # _pd_control bypasses the custom PD and sets ctrl directly.
+        biastype = self.model.actuator_biastype[: self.model.nu]
+        self._position_actuator_mask = (biastype == 1)  # bool array, length = num_act
+
+        # Auto-detect knee-hip pairs: consecutive motor→position actuator pairs
+        # produced by leg_rs03 meta-components (hip=motor, knee=position).
+        self._knee_hip_pairs: list[tuple[int, int]] = []
+        mask = self._position_actuator_mask
+        for i in range(len(mask) - 1):
+            if not mask[i] and mask[i + 1]:
+                self._knee_hip_pairs.append((i + 1, i))  # (knee_act_idx, hip_act_idx)
+
+        # Read coupling config: q_knee_target = sign * a_knee + alpha * q_hip + offset
+        knee_coupling_cfg = self.cfg.control.get("knee_hip_coupling", {})  # type: ignore
+        self._knee_coupling_enabled = (
+            bool(knee_coupling_cfg.get("enabled", False))
+            and len(self._knee_hip_pairs) > 0
+        )
+        self._knee_coupling_alpha = float(knee_coupling_cfg.get("alpha", 0.0))
+        self._knee_coupling_offset = float(knee_coupling_cfg.get("offset", 0.0))
+        self._knee_coupling_sign = float(knee_coupling_cfg.get("sign", 1.0))
 
     def _resolve_torso_body_id(self) -> int:
         """Resolve torso body ID for both modular and generic XML models."""
@@ -1196,6 +1595,460 @@ class MetaMachine(Base, MujocoEnv):
                 range(len(self.external_force_config["bodies"])), 0
             )
 
+    def _setup_asymmetric_randomization(self) -> None:
+        """Parse and initialize per-module randomization state."""
+        randomization_cfg = self._to_plain_container(
+            getattr(self.cfg, "randomization", {}) or {}
+        )
+        if not isinstance(randomization_cfg, dict):
+            randomization_cfg = {}
+
+        self._module_id_to_joint_index = {
+            int(module_id): idx
+            for idx, module_id in enumerate(getattr(self, "jointed_module_ids", []))
+        }
+
+        self._module_latency_cfg = randomization_cfg.get("module_latency", {}) or {}
+        if not isinstance(self._module_latency_cfg, dict):
+            self._module_latency_cfg = {}
+        self._module_latency_enabled = bool(
+            self._module_latency_cfg.get("enabled", False)
+        )
+        self._module_latency_resample_interval = None
+        self._module_latency_steps_until_resample = None
+
+        self._external_torque_cfg = randomization_cfg.get("external_torque", {}) or {}
+        if not isinstance(self._external_torque_cfg, dict):
+            self._external_torque_cfg = {}
+        self._module_torque_event_specs = self._parse_module_torque_event_specs(
+            self._external_torque_cfg
+        )
+        self._module_torque_event_states: list[dict[str, Any]] = []
+
+        self._module_action_scale_cfg = (
+            randomization_cfg.get("module_action_scale", {}) or {}
+        )
+        if not isinstance(self._module_action_scale_cfg, dict):
+            self._module_action_scale_cfg = {}
+        self._module_action_scale_event_specs = (
+            self._parse_module_action_scale_event_specs(self._module_action_scale_cfg)
+        )
+        self._module_action_scale_event_states: list[dict[str, Any]] = []
+
+        base_latency_scheme = int(self.sim_cfg.get("latency_scheme", -1))
+        self.current_latency_schemes = np.full(
+            self.num_joint, base_latency_scheme, dtype=np.int32
+        )
+        self.current_module_torque_disturbance = np.zeros(
+            self.num_joint, dtype=np.float32
+        )
+        self.current_module_action_scale = np.ones(self.num_joint, dtype=np.float32)
+
+    def _resolve_selected_joint_indices(self, spec: dict[str, Any]) -> list[int]:
+        """Resolve target joints from module indices or module ids."""
+        raw_indices = spec.get("module_indices", spec.get("joint_indices"))
+        if raw_indices is not None:
+            if not isinstance(raw_indices, (list, tuple)):
+                raw_indices = [raw_indices]
+            selected = sorted({int(idx) for idx in raw_indices})
+            invalid = [idx for idx in selected if idx < 0 or idx >= self.num_joint]
+            if invalid:
+                raise ValueError(
+                    f"Invalid module_indices/joint_indices {invalid}; valid range is "
+                    f"[0, {self.num_joint - 1}]"
+                )
+            return selected
+
+        raw_module_ids = spec.get("module_ids")
+        if raw_module_ids is not None:
+            if not isinstance(raw_module_ids, (list, tuple)):
+                raw_module_ids = [raw_module_ids]
+            if not self._module_id_to_joint_index:
+                raise ValueError(
+                    "module_ids targeting requires modular joint naming in the MuJoCo model"
+                )
+
+            selected = []
+            missing_ids = []
+            for module_id in raw_module_ids:
+                module_id = int(module_id)
+                joint_index = self._module_id_to_joint_index.get(module_id)
+                if joint_index is None:
+                    missing_ids.append(module_id)
+                else:
+                    selected.append(joint_index)
+            if missing_ids:
+                raise ValueError(
+                    f"Unknown module_ids {missing_ids}; available ids are "
+                    f"{sorted(self._module_id_to_joint_index)}"
+                )
+            return sorted(set(selected))
+
+        return list(range(self.num_joint))
+
+    def _normalize_int_range(
+        self, value: Any, *, field_name: str, minimum: int = 0
+    ) -> tuple[int, int]:
+        """Normalize an integer or [min, max] pair to an inclusive range."""
+        if isinstance(value, (list, tuple)):
+            if len(value) != 2:
+                raise ValueError(f"{field_name} must be an int or a [min, max] pair")
+            low, high = int(value[0]), int(value[1])
+        else:
+            low = high = int(value)
+
+        if low > high:
+            raise ValueError(f"{field_name} must satisfy min <= max")
+        if low < minimum:
+            raise ValueError(f"{field_name} must be >= {minimum}")
+        return low, high
+
+    def _normalize_float_range(
+        self, value: Any, *, field_name: str
+    ) -> tuple[float, float]:
+        """Normalize a scalar or [min, max] pair to a float range."""
+        if isinstance(value, (list, tuple)):
+            if len(value) != 2:
+                raise ValueError(f"{field_name} must be a scalar or a [min, max] pair")
+            low, high = float(value[0]), float(value[1])
+        else:
+            low = high = float(value)
+
+        if low > high:
+            raise ValueError(f"{field_name} must satisfy min <= max")
+        return low, high
+
+    def _sample_int_from_range(self, value_range: tuple[int, int]) -> int:
+        """Sample an integer from an inclusive [min, max] range."""
+        low, high = value_range
+        if low == high:
+            return low
+        return int(self.np_random.integers(low, high + 1))
+
+    def _sample_float_from_range(self, value_range: tuple[float, float]) -> float:
+        """Sample a float from a [min, max] range."""
+        low, high = value_range
+        if np.isclose(low, high):
+            return float(low)
+        return float(self.np_random.uniform(low, high))
+
+    def _normalize_scheduled_module_event_spec(
+        self,
+        raw_spec: dict[str, Any],
+        *,
+        value_field: str,
+        default_value: Any,
+        neutral_value: float,
+    ) -> dict[str, Any]:
+        """Normalize a scheduled per-module event specification."""
+        joint_pool = self._resolve_selected_joint_indices(raw_spec)
+        if not joint_pool:
+            raise ValueError(f"{value_field} event must target at least one module")
+
+        sample_count = int(raw_spec.get("sample_count", len(joint_pool)))
+        if sample_count <= 0:
+            raise ValueError("sample_count must be >= 1")
+        sample_count = min(sample_count, len(joint_pool))
+
+        spec = {
+            "joint_pool": joint_pool,
+            "sample_count": sample_count,
+            "interval_steps": self._normalize_int_range(
+                raw_spec.get("interval_steps", 1),
+                field_name="interval_steps",
+                minimum=0,
+            ),
+            "duration_steps": self._normalize_int_range(
+                raw_spec.get("duration_steps", 1),
+                field_name="duration_steps",
+                minimum=1,
+            ),
+            "activate_on_reset": bool(raw_spec.get("activate_on_reset", False)),
+            "neutral_value": float(neutral_value),
+            value_field: self._normalize_float_range(
+                raw_spec.get(value_field, default_value), field_name=value_field
+            ),
+        }
+        return spec
+
+    def _parse_module_torque_event_specs(
+        self, torque_cfg: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Parse per-module torque burst config."""
+        if not torque_cfg.get("enabled", False):
+            return []
+
+        raw_events = torque_cfg.get("events", []) or []
+        if raw_events:
+            if not isinstance(raw_events, list):
+                raise ValueError("randomization.external_torque.events must be a list")
+            specs = []
+            for raw_event in raw_events:
+                spec = self._normalize_scheduled_module_event_spec(
+                    raw_event,
+                    value_field="torque_range",
+                    default_value=torque_cfg.get(
+                        "torque_range", torque_cfg.get("range", [0.0, 0.0])
+                    ),
+                    neutral_value=0.0,
+                )
+                spec["sign_mode"] = str(raw_event.get("sign_mode", "random")).lower()
+                if spec["sign_mode"] not in {"random", "positive", "negative"}:
+                    raise ValueError(
+                        "randomization.external_torque sign_mode must be one of "
+                        "'random', 'positive', or 'negative'"
+                    )
+                specs.append(spec)
+            return specs
+
+        legacy_spec = {
+            "module_indices": torque_cfg.get("module_indices", torque_cfg.get("bodies")),
+            "module_ids": torque_cfg.get("module_ids"),
+            "torque_range": torque_cfg.get("torque_range", torque_cfg.get("range", [0.0, 0.0])),
+            "interval_steps": torque_cfg.get("interval_steps", 1),
+            "duration_steps": torque_cfg.get("duration_steps", 1),
+            "sign_mode": torque_cfg.get("sign_mode", "random"),
+            "activate_on_reset": torque_cfg.get("activate_on_reset", False),
+        }
+        spec = self._normalize_scheduled_module_event_spec(
+            legacy_spec,
+            value_field="torque_range",
+            default_value=[0.0, 0.0],
+            neutral_value=0.0,
+        )
+        spec["sign_mode"] = str(legacy_spec.get("sign_mode", "random")).lower()
+        return [spec]
+
+    def _parse_module_action_scale_event_specs(
+        self, scale_cfg: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Parse temporary per-module command attenuation config."""
+        if not scale_cfg.get("enabled", False):
+            return []
+
+        raw_events = scale_cfg.get("events", []) or []
+        if not raw_events:
+            raise ValueError(
+                "randomization.module_action_scale.enabled=true requires an events list"
+            )
+        if not isinstance(raw_events, list):
+            raise ValueError("randomization.module_action_scale.events must be a list")
+
+        specs = []
+        for raw_event in raw_events:
+            spec = self._normalize_scheduled_module_event_spec(
+                raw_event,
+                value_field="scale_range",
+                default_value=scale_cfg.get("scale_range", [1.0, 1.0]),
+                neutral_value=1.0,
+            )
+            if spec["scale_range"][0] < 0.0:
+                raise ValueError("module_action_scale scale_range must be non-negative")
+            specs.append(spec)
+        return specs
+
+    def _create_module_event_state(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Create runtime state for a scheduled per-module event."""
+        neutral_value = float(spec["neutral_value"])
+        return {
+            "spec": spec,
+            "steps_until_activation": (
+                0
+                if spec["activate_on_reset"]
+                else self._sample_int_from_range(spec["interval_steps"])
+            ),
+            "remaining_steps": 0,
+            "current_values": np.full(self.num_joint, neutral_value, dtype=np.float32),
+        }
+
+    def _sample_event_joint_indices(self, spec: dict[str, Any]) -> list[int]:
+        """Sample the joint subset affected by an event activation."""
+        joint_pool = np.asarray(spec["joint_pool"], dtype=np.int32)
+        sample_count = int(spec["sample_count"])
+        if sample_count >= len(joint_pool):
+            return joint_pool.tolist()
+        sampled = self.np_random.choice(joint_pool, size=sample_count, replace=False)
+        return sorted(int(idx) for idx in sampled.tolist())
+
+    def _activate_module_event(
+        self, event_state: dict[str, Any], *, value_field: str
+    ) -> None:
+        """Activate one scheduled per-module event."""
+        spec = event_state["spec"]
+        joint_indices = self._sample_event_joint_indices(spec)
+        values = np.full(
+            self.num_joint, float(spec["neutral_value"]), dtype=np.float32
+        )
+
+        for joint_index in joint_indices:
+            sampled_value = self._sample_float_from_range(spec[value_field])
+            if value_field == "torque_range":
+                sign_mode = spec.get("sign_mode", "random")
+                if sign_mode == "negative":
+                    sampled_value = -abs(sampled_value)
+                elif sign_mode == "positive":
+                    sampled_value = abs(sampled_value)
+                else:
+                    sampled_value = abs(sampled_value)
+                    if bool(self.np_random.integers(0, 2)):
+                        sampled_value = -sampled_value
+            values[joint_index] = sampled_value
+
+        event_state["current_values"] = values
+        event_state["remaining_steps"] = self._sample_int_from_range(
+            spec["duration_steps"]
+        )
+        event_state["steps_until_activation"] = 0
+
+    def _advance_module_event_states(
+        self,
+        event_states: list[dict[str, Any]],
+        *,
+        value_field: str,
+        neutral_value: float,
+        combine_mode: str,
+    ) -> np.ndarray:
+        """Advance scheduled per-module events and return the current vector."""
+        if combine_mode == "sum":
+            combined = np.zeros(self.num_joint, dtype=np.float32)
+        else:
+            combined = np.full(self.num_joint, float(neutral_value), dtype=np.float32)
+
+        for event_state in event_states:
+            if event_state["remaining_steps"] <= 0 and event_state["steps_until_activation"] <= 0:
+                self._activate_module_event(event_state, value_field=value_field)
+
+            if event_state["remaining_steps"] > 0:
+                current_values = event_state["current_values"]
+                if combine_mode == "sum":
+                    combined = combined + current_values
+                else:
+                    combined = combined * current_values
+
+                event_state["remaining_steps"] -= 1
+                if event_state["remaining_steps"] <= 0:
+                    neutral = float(event_state["spec"]["neutral_value"])
+                    event_state["current_values"] = np.full(
+                        self.num_joint, neutral, dtype=np.float32
+                    )
+                    event_state["steps_until_activation"] = self._sample_int_from_range(
+                        event_state["spec"]["interval_steps"]
+                    )
+            else:
+                event_state["steps_until_activation"] = max(
+                    0, int(event_state["steps_until_activation"]) - 1
+                )
+
+        return combined
+
+    def _sample_module_latency_schemes(self) -> np.ndarray:
+        """Sample per-joint latency schemes from config."""
+        default_scheme = int(
+            self._module_latency_cfg.get(
+                "default_scheme", self.sim_cfg.get("latency_scheme", -1)
+            )
+        )
+        if default_scheme not in {-1, 0, 1}:
+            raise ValueError(
+                "randomization.module_latency.default_scheme must be one of -1, 0, or 1"
+            )
+
+        schemes = np.full(self.num_joint, default_scheme, dtype=np.int32)
+        for raw_module_cfg in self._module_latency_cfg.get("modules", []) or []:
+            joint_indices = self._resolve_selected_joint_indices(raw_module_cfg)
+            choices = raw_module_cfg.get("scheme_choices", raw_module_cfg.get("schemes"))
+            if choices is None:
+                choices = [raw_module_cfg.get("scheme", default_scheme)]
+            if not isinstance(choices, (list, tuple)):
+                choices = [choices]
+
+            normalized_choices = [int(choice) for choice in choices]
+            invalid_choices = sorted(
+                choice for choice in set(normalized_choices) if choice not in {-1, 0, 1}
+            )
+            if invalid_choices:
+                raise ValueError(
+                    "randomization.module_latency only supports latency schemes -1, 0, "
+                    f"and 1 per module, got {invalid_choices}"
+                )
+
+            sample_each_module = bool(raw_module_cfg.get("sample_each_module", False))
+            if sample_each_module:
+                sampled = self.np_random.choice(normalized_choices, size=len(joint_indices))
+                for joint_index, scheme in zip(joint_indices, sampled.tolist()):
+                    schemes[joint_index] = int(scheme)
+            else:
+                sampled_scheme = int(self.np_random.choice(normalized_choices))
+                schemes[joint_indices] = sampled_scheme
+
+        return schemes
+
+    def _reset_asymmetric_randomization_state(self) -> None:
+        """Reset all per-module randomization state for a new episode."""
+        self.current_module_torque_disturbance.fill(0.0)
+        self.current_module_action_scale.fill(1.0)
+        self._module_torque_event_states = [
+            self._create_module_event_state(spec)
+            for spec in self._module_torque_event_specs
+        ]
+        self._module_action_scale_event_states = [
+            self._create_module_event_state(spec)
+            for spec in self._module_action_scale_event_specs
+        ]
+
+        if self._module_latency_enabled:
+            self.current_latency_schemes = self._sample_module_latency_schemes()
+            resample_interval = self._module_latency_cfg.get(
+                "resample_interval_steps", None
+            )
+            if resample_interval is None:
+                self._module_latency_resample_interval = None
+                self._module_latency_steps_until_resample = None
+            else:
+                self._module_latency_resample_interval = self._normalize_int_range(
+                    resample_interval,
+                    field_name="module_latency.resample_interval_steps",
+                    minimum=1,
+                )
+                self._module_latency_steps_until_resample = self._sample_int_from_range(
+                    self._module_latency_resample_interval
+                )
+        else:
+            self.current_latency_schemes.fill(int(self.sim_cfg.get("latency_scheme", -1)))
+            self._module_latency_resample_interval = None
+            self._module_latency_steps_until_resample = None
+
+    def _update_asymmetric_randomization_state(self) -> None:
+        """Advance per-module latency and event randomization for one control step."""
+        if self._module_latency_enabled and self._module_latency_steps_until_resample is not None:
+            if self._module_latency_steps_until_resample <= 0:
+                self.current_latency_schemes = self._sample_module_latency_schemes()
+                self._module_latency_steps_until_resample = self._sample_int_from_range(
+                    self._module_latency_resample_interval
+                )
+            else:
+                self._module_latency_steps_until_resample -= 1
+
+        if self._module_torque_event_states:
+            self.current_module_torque_disturbance = self._advance_module_event_states(
+                self._module_torque_event_states,
+                value_field="torque_range",
+                neutral_value=0.0,
+                combine_mode="sum",
+            )
+        else:
+            self.current_module_torque_disturbance.fill(0.0)
+
+        if self._module_action_scale_event_states:
+            self.current_module_action_scale = self._advance_module_event_states(
+                self._module_action_scale_event_states,
+                value_field="scale_range",
+                neutral_value=1.0,
+                combine_mode="product",
+            )
+        else:
+            self.current_module_action_scale.fill(1.0)
+
     def _setup_initialization_parameters(self) -> None:
         """Setup robot initialization parameters."""
         # Get initialization config
@@ -1290,14 +2143,22 @@ class MetaMachine(Base, MujocoEnv):
         Returns:
             Action execution information
         """
+        self._update_asymmetric_randomization_state()
 
         # Apply external forces
         if self.external_forces_enabled:
             self._handle_external_forces()
 
         # Validate frame skip for latency
-        latency_scheme = self.sim_cfg.get("latency_scheme", -1)
-        if latency_scheme >= 0 and self.frame_skip % 2 != 0:
+        latency_scheme: Union[int, np.ndarray]
+        if self._module_latency_enabled:
+            latency_scheme = self.current_latency_schemes.copy()
+            latency_requires_even_skip = np.any(latency_scheme >= 0)
+        else:
+            latency_scheme = int(self.sim_cfg.get("latency_scheme", -1))
+            latency_requires_even_skip = latency_scheme >= 0
+
+        if latency_requires_even_skip and self.frame_skip % 2 != 0:
             raise ValueError("frame_skip must be even for latency simulation")
 
         # Prepare control targets (separate position/velocity, add noise if enabled)
@@ -1380,6 +2241,10 @@ class MetaMachine(Base, MujocoEnv):
                               + self.default_dof_vel[i])
                     pos[i] = 0  # Position target is 0 (will be multiplied by kp=0)
 
+        if getattr(self, "current_module_action_scale", None) is not None:
+            pos = pos * self.current_module_action_scale
+            vel = vel * self.current_module_action_scale
+
         # Add noise if enabled
         if self.sim_cfg.get("noisy_actions", False):
             noise_std = self.sim_cfg.action_noise_std
@@ -1398,9 +2263,44 @@ class MetaMachine(Base, MujocoEnv):
         }
 
     def _execute_control(
-        self, pos: np.ndarray, vel: np.ndarray, latency_scheme: int
+        self, pos: np.ndarray, vel: np.ndarray, latency_scheme: Union[int, np.ndarray]
     ) -> None:
         """Execute control with latency simulation."""
+        if isinstance(latency_scheme, np.ndarray):
+            latency_scheme = np.asarray(latency_scheme, dtype=np.int32)
+            if latency_scheme.shape != pos.shape:
+                raise ValueError(
+                    f"Per-module latency shape mismatch: expected {pos.shape}, got "
+                    f"{latency_scheme.shape}"
+                )
+            if np.any(latency_scheme == -2):
+                raise ValueError(
+                    "Per-module latency does not support scheme -2. Use -1, 0, or 1."
+                )
+            if np.all(latency_scheme == -1):
+                self._pd_control(pos, self.frame_skip, vel)
+                return
+
+            half_skip = self.frame_skip // 2
+            first_pos = pos.copy()
+            first_vel = vel.copy()
+            second_pos = pos.copy()
+            second_vel = vel.copy()
+
+            one_step_mask = latency_scheme == 0
+            two_step_mask = latency_scheme == 1
+
+            first_pos[one_step_mask] = self.last_pos_sim[one_step_mask]
+            first_vel[one_step_mask] = self.last_vel_sim[one_step_mask]
+            first_pos[two_step_mask] = self.last_last_pos_sim[two_step_mask]
+            first_vel[two_step_mask] = self.last_last_vel_sim[two_step_mask]
+            second_pos[two_step_mask] = self.last_pos_sim[two_step_mask]
+            second_vel[two_step_mask] = self.last_vel_sim[two_step_mask]
+
+            self._pd_control(first_pos, half_skip, first_vel)
+            self._pd_control(second_pos, half_skip, second_vel)
+            return
+
         if latency_scheme == -1:
             # No latency
             self._pd_control(pos, self.frame_skip, vel)
@@ -1475,18 +2375,38 @@ class MetaMachine(Base, MujocoEnv):
         dof_pos = self.data.qpos[self.model.jnt_qposadr[self.joint_idx]]
         dof_vel = self.data.qvel[self.model.jnt_dofadr[self.joint_idx]]
 
-        # Calculate PD torques
+        # Apply knee-hip coupling: q_knee_target = sign * a_knee + alpha * q_hip + offset.
+        # This rewrites pos_desired for each knee actuator before PD / position ctrl.
+        if self._knee_coupling_enabled:
+            pos_desired = pos_desired.copy()
+            for knee_idx, hip_idx in self._knee_hip_pairs:
+                q_hip = dof_pos[hip_idx]
+                a_knee = pos_desired[knee_idx]
+                pos_desired[knee_idx] = (
+                    self._knee_coupling_sign * a_knee
+                    + self._knee_coupling_alpha * q_hip
+                    + self._knee_coupling_offset
+                )
+
+        # Calculate PD torques for motor actuators.
         # For position joints: kp * (pos_error) + kd * (vel_error)
-        # For velocity joints: kp=0, so just kd * (vel_target - vel_current)
+        # For velocity joints (wheels): kp=0, so just kd * (vel_target - vel_current)
         torques = self.kps * (pos_desired - dof_pos) + self.kds * (
             vel_desired - dof_vel
         )
 
-        # Apply constraints
+        # Apply torque-velocity constraints only to motor actuators.
         torques = self._apply_torque_constraints(torques, dof_vel)
 
+        # For MuJoCo <position> actuators ctrl is the target position, not a torque.
+        # Override the PD result with the (possibly coupled) target position directly.
+        ctrl = torques
+        if self._position_actuator_mask.any():
+            ctrl = torques.copy()
+            ctrl[self._position_actuator_mask] = pos_desired[self._position_actuator_mask]
+
         # Execute simulation
-        self.do_simulation(torques, int(frame_skip))
+        self.do_simulation(ctrl, int(frame_skip))
 
     def _apply_torque_constraints(
         self, torques: np.ndarray, dof_vel: np.ndarray
@@ -1502,15 +2422,116 @@ class MetaMachine(Base, MujocoEnv):
         if broken_motors is not None:
             torques[broken_motors] = 0
 
+        if getattr(self, "current_module_torque_disturbance", None) is not None:
+            torques = torques + self.current_module_torque_disturbance
+
         return torques
 
     def _calculate_torque_limits(self, dof_vel: np.ndarray) -> np.ndarray:
         """Calculate velocity-dependent torque limits."""
         abs_vel = np.abs(dof_vel)
-        torque_limits = np.where(
-            abs_vel < 11.5, 12.0, np.clip(-0.656 * abs_vel + 19.541, 0, None)
-        )
-        return torque_limits
+        per_joint_cfg = getattr(self, "_actuation_cfg_per_joint", None)
+        if per_joint_cfg:
+            if len(per_joint_cfg) != len(abs_vel):
+                raise ValueError(
+                    f"Per-joint actuation config length {len(per_joint_cfg)} does not match "
+                    f"number of actuated joints {len(abs_vel)}"
+                )
+            return np.asarray(
+                [
+                    self._calculate_torque_limits_for_cfg(float(v), cfg)
+                    for v, cfg in zip(abs_vel, per_joint_cfg)
+                ],
+                dtype=np.float64,
+            )
+
+        cfg = getattr(self, "_actuation_cfg", {}) or {}
+        return self._calculate_torque_limits_for_cfg(abs_vel, cfg)
+
+    def _calculate_torque_limits_for_cfg(
+        self,
+        abs_vel: Union[float, np.ndarray],
+        cfg: dict[str, Any],
+    ) -> np.ndarray:
+        """Calculate torque limits for one actuation config."""
+        model = str(cfg.get("model", "legacy_piecewise_linear")).lower()
+
+        if model in {"legacy", "legacy_piecewise_linear"}:
+            return np.where(
+                abs_vel < 11.5, 12.0, np.clip(-0.656 * abs_vel + 19.541, 0, None)
+            )
+
+        if model == "none":
+            return np.full_like(abs_vel, np.inf, dtype=np.float64)
+
+        if model == "constant":
+            max_torque = float(cfg.get("max_torque", 12.0))
+            return np.full_like(abs_vel, max_torque, dtype=np.float64)
+
+        if model == "linear":
+            max_torque = float(cfg.get("max_torque", 12.0))
+            max_velocity = float(cfg.get("max_velocity", 19.541 / 0.656))
+            if max_velocity <= 0:
+                raise ValueError("simulation.actuation.max_velocity must be > 0 for linear model")
+            return np.clip(max_torque * (1.0 - abs_vel / max_velocity), 0.0, None)
+
+        if model == "piecewise_linear":
+            max_torque = float(cfg.get("max_torque", 12.0))
+            knee_velocity = float(cfg.get("knee_velocity", 11.5))
+            max_velocity = float(cfg.get("max_velocity", 19.541 / 0.656))
+            knee_torque = float(cfg.get("knee_torque", max_torque))
+            min_torque = float(cfg.get("min_torque", 0.0))
+
+            if knee_velocity < 0:
+                raise ValueError("simulation.actuation.knee_velocity must be >= 0")
+            if max_velocity < knee_velocity:
+                raise ValueError(
+                    "simulation.actuation.max_velocity must be >= knee_velocity"
+                )
+
+            torque_limits = np.full_like(abs_vel, max_torque, dtype=np.float64)
+            if max_velocity == knee_velocity:
+                torque_limits[abs_vel >= knee_velocity] = min_torque
+                return np.clip(torque_limits, 0.0, None)
+
+            after_knee = abs_vel > knee_velocity
+            torque_limits[after_knee] = np.interp(
+                abs_vel[after_knee],
+                [knee_velocity, max_velocity],
+                [knee_torque, min_torque],
+                left=knee_torque,
+                right=min_torque,
+            )
+            return np.clip(torque_limits, 0.0, None)
+
+        if model == "lookup_table":
+            velocity_breakpoints = np.asarray(
+                cfg.get("velocity_breakpoints", []), dtype=np.float64
+            )
+            torque_limits = np.asarray(cfg.get("torque_limits", []), dtype=np.float64)
+            if velocity_breakpoints.ndim != 1 or torque_limits.ndim != 1:
+                raise ValueError("simulation.actuation lookup_table arrays must be 1D")
+            if len(velocity_breakpoints) < 2 or len(velocity_breakpoints) != len(torque_limits):
+                raise ValueError(
+                    "simulation.actuation lookup_table requires equal-length arrays with at least 2 entries"
+                )
+            if np.any(np.diff(velocity_breakpoints) < 0):
+                raise ValueError(
+                    "simulation.actuation.velocity_breakpoints must be nondecreasing"
+                )
+            return np.clip(
+                np.interp(
+                    abs_vel,
+                    velocity_breakpoints,
+                    torque_limits,
+                    left=torque_limits[0],
+                    right=torque_limits[-1],
+                ),
+                0.0,
+                None,
+            )
+
+        raise ValueError(f"Unknown simulation.actuation.model '{model}'")
 
     def _pd_control_fine(
         self,
@@ -1580,8 +2601,9 @@ class MetaMachine(Base, MujocoEnv):
 
         # Simulation-specific data
         sim_data = self._extract_simulation_data()
+        goal_data = self._get_goal_observable_data(state_data["pos_world"])
 
-        return {**extended_data, **sim_data}
+        return {**extended_data, **sim_data, **goal_data}
 
     def _extract_core_state(self, qpos: np.ndarray, qvel: np.ndarray) -> dict[str, Any]:
         """Extract core robot state information."""
@@ -1596,6 +2618,7 @@ class MetaMachine(Base, MujocoEnv):
         # Joint states
         dof_pos = qpos[self.model.jnt_qposadr[self.joint_idx]]
         dof_vel = qvel[self.model.jnt_dofadr[self.joint_idx]]
+        dof_torque = self.data.qfrc_actuator[self.model.jnt_dofadr[self.joint_idx]]
 
         # Velocities
         cvel = self.data.cvel[torso_body_id]
@@ -1610,6 +2633,7 @@ class MetaMachine(Base, MujocoEnv):
             "quat": quat,
             "dof_pos": dof_pos,
             "dof_vel": dof_vel,
+            "dof_torque": dof_torque,
             "vel_world": vel_world,
             "vel_body": vel_body,
             "ang_vel_body": ang_vel_body,
@@ -1846,7 +2870,7 @@ class MetaMachine(Base, MujocoEnv):
 
     def _post_reset(self) -> None:
         """Post-reset operations."""
-        pass
+        self._reset_goal_task()
 
     def _post_done(self) -> None:
         """Post-done operations after an episode ends."""
@@ -1862,6 +2886,7 @@ class MetaMachine(Base, MujocoEnv):
     def _need_model_reload(self) -> bool:
         """Check if model needs to be reloaded for randomization."""
         self.randomize_asset = is_list_like(self.cfg.morphology.asset_file)  # type: ignore
+        morphology_enabled = self._has_morphology_randomization()
         
         # Check randomization config (new style: cfg.randomization.*)
         randomization_cfg = getattr(self.cfg, "randomization", {})
@@ -1880,17 +2905,31 @@ class MetaMachine(Base, MujocoEnv):
                 damping_enabled,
                 self.sim_cfg.get("add_scaffold_walls", False),
                 self.randomize_asset,
+                morphology_enabled,
             ]
         )
 
     def _reload_model_with_randomization(self) -> None:
-        """Reload model with randomization applied."""
+        """Reload model with XML-level randomization applied.
+
+        For asset-based robots with multiple XML files, this may select a new
+        source asset. For morphology-built robots, this either rebuilds the
+        XML from a randomized copy of the base morphology graph or reuses the
+        existing XMLCompiler and mutates it in place before reloading the
+        MuJoCo model.
+        """
         # Asset randomization (for asset-based robots with multiple asset files)
         if self.randomize_asset:
             self._load_robot_asset()
-        # For morphology-based robots, regenerate from morphology
+        elif self._has_morphology_randomization():
+            randomized_morphology = self._get_randomized_morphology_configuration()
+            self._load_robot_asset_from_morphology(
+                self.cfg.morphology.robot_type, randomized_morphology
+            )
+        # Morphology-built robots normally already have an XMLCompiler from
+        # _load_robot_asset_from_morphology(). If not, there is no XML to
+        # mutate for mass/damping randomization, so skip this reload path.
         elif not hasattr(self, 'xml_compiler') or self.xml_compiler is None:
-            # Morphology-based robot without xml_compiler - skip randomization
             return
 
         # Get randomization config (new style)
@@ -1980,6 +3019,9 @@ class MetaMachine(Base, MujocoEnv):
         # Friction randomization
         self._randomize_friction()
 
+        # Per-module latency and event randomization
+        self._reset_asymmetric_randomization_state()
+
     def _randomize_friction(self) -> None:
         """Apply friction randomization."""
         randomization_cfg = getattr(self.cfg, "randomization", {})
@@ -1988,7 +3030,7 @@ class MetaMachine(Base, MujocoEnv):
             return
 
         friction_range = friction_cfg.get("range", [0.8, 1.2])
-        rolling_friction_range = friction_cfg.get("rolling_range", [0.0, 0.04])
+        rolling_friction_range = friction_cfg.get("rolling_range", [0.01, 0.1])
         detailed_range = friction_cfg.get("detailed_range", None)
 
         if is_number(friction_range[0]):
@@ -1997,7 +3039,7 @@ class MetaMachine(Base, MujocoEnv):
             self.model.geom("floor").friction[0] = friction
             self.model.geom("floor").priority[0] = 10
             roll_friction = np.random.uniform(*rolling_friction_range)
-            self.model.geom("floor").friction[2] = 0 # 0.05 # roll_friction
+            self.model.geom("floor").friction[2] = 0.01 # roll_friction
             self.model.geom("floor").friction[1] = roll_friction
             # print(f"Applied floor rolling friction: {roll_friction:.4f}")
         else:
@@ -2154,7 +3196,13 @@ class MetaMachine(Base, MujocoEnv):
             else:
                 init_qvel[:6] = self.np_random.uniform(-1, 1, 6)
 
-        return np.asarray(init_qvel + self.np_random.normal(0, 0.1, self.model.nv))
+        # Gate the per-step noise by the same `noisy_init` flag used for qpos
+        # — without this gate, every reset gets a ~0.1-std nudge on every DOF
+        # even when randomization is disabled, which can kick a model with
+        # foot-near-floor geometry into immediate floor penetration on step 1.
+        if self.init_cfg.get("noisy_init", True):
+            init_qvel = init_qvel + self.np_random.normal(0, 0.1, self.model.nv)
+        return np.asarray(init_qvel)
 
     def reload_model(self, xml_string: str) -> None:
         """Reload MuJoCo model with new XML."""
@@ -2337,6 +3385,16 @@ class MetaMachine(Base, MujocoEnv):
             "Episode": self.episode_counter + 1,
         }
 
+        if self.goal_task_enabled and self.goal_position_world is not None:
+            metrics["GoalDist"] = f"{self.goal_distance:.3f}"
+            metrics["GoalDelta"] = f"{self.goal_distance_delta:+.4f}"
+            metrics["GoalXY"] = np.array2string(
+                np.asarray(self.goal_position_world[:2], dtype=np.float32),
+                precision=2,
+                separator=",",
+                suppress_small=True,
+            )
+
         cmd_dict = self.state.command_manager.get_commands_dict()
         if cmd_dict:
             for key, value in cmd_dict.items():
@@ -2357,12 +3415,17 @@ class MetaMachine(Base, MujocoEnv):
 
         # Draw semi-transparent background for better readability
         overlay = frame.copy()
+        text_lines = [f"{label}: {value}" for label, value in metrics.items()]
+        max_width = max(
+            cv2.getTextSize(text, font, font_scale, thickness)[0][0]
+            for text in text_lines
+        )
         bg_height = len(metrics) * line_height + 10
-        cv2.rectangle(overlay, (5, 5), (350, bg_height), (0, 0, 0), -1)
+        bg_width = max(350, max_width + 20)
+        cv2.rectangle(overlay, (5, 5), (bg_width, bg_height), (0, 0, 0), -1)
         frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
-        for i, (label, value) in enumerate(metrics.items()):
+        for i, text in enumerate(text_lines):
             y_pos = start_y + (i * line_height)
-            text = f"{label}: {value}"
             cv2.putText(frame, text, (10, y_pos), font, font_scale, color, thickness)
 
         return frame

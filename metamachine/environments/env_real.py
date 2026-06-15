@@ -25,6 +25,7 @@ import datetime
 import json
 import os
 import time
+from collections import deque
 from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
@@ -35,6 +36,7 @@ from .base import Base
 
 CONTROL_MODE_DIRECT_PD = 0
 CONTROL_MODE_ONBOARD_MODEL = 1
+CONTROL_MODE_LOCAL_DEBUG_SCENARIO = 2
 
 # Import capybarish for ESP32 communication
 try:
@@ -75,6 +77,12 @@ except ImportError:
     CybergearErrorDecoder = None
     CYBERGEAR_DECODER_AVAILABLE = False
 
+# Mirror of the firmware-side CAN-lost bit in driver_error. Fallback constant lets
+# the host work even with an older Capybarish that doesn't export the attribute.
+DRIVER_ERROR_CAN_LOST_BIT = getattr(
+    CybergearErrorDecoder, "DRIVER_ERROR_CAN_LOST_BIT", 1 << 25
+) if CYBERGEAR_DECODER_AVAILABLE else (1 << 25)
+
 
 def sanitize_dict(d: dict) -> dict:
     """Sanitize dictionary for JSON serialization."""
@@ -103,6 +111,23 @@ def format_policy_error(policy_error: int) -> str:
         4: "POLICY HASH",
     }
     return labels.get(policy_error, f"POLICY ERR{policy_error}")
+
+
+def format_policy_status(policy_status: int) -> str:
+    """Return a compact label for ESP32 policy runtime status bits."""
+    bits = int(policy_status)
+    names = []
+    if bits & (1 << 0):
+        names.append("loaded")
+    if bits & (1 << 1):
+        names.append("sanity")
+    if bits & (1 << 2):
+        names.append("pc_hash")
+    if bits & (1 << 3):
+        names.append("hash_match")
+    if bits & (1 << 4):
+        names.append("ready")
+    return "|".join(names) if names else "none"
 
 
 class RealMetaMachine(Base):
@@ -250,6 +275,7 @@ class RealMetaMachine(Base):
         self.listen_port = real_cfg.get("listen_port", self.DEFAULT_LISTEN_PORT)
         self.command_port = real_cfg.get("command_port", self.DEFAULT_COMMAND_PORT)
         self.device_timeout = real_cfg.get("device_timeout", 2.0)
+        self.enable_ready_grace_sec = float(real_cfg.get("enable_ready_grace_sec", 1.0))
         
         # Control parameters
         self.kp_default = cfg.control.get("kp", 10.0)
@@ -277,15 +303,42 @@ class RealMetaMachine(Base):
         # Latest data from each module
         self.module_data: Dict[int, SensorData] = {}
         self.module_policy_errors: Dict[int, int] = {}
+        # Tracks the CAN-lost state (firmware bit 25 of driver_error) per module so
+        # _update_dashboard_motor can log a single edge transition instead of
+        # spamming the log panel every UDP packet.
+        self.module_can_lost: Dict[int, bool] = {}
+        # Per-module last seen motor_mode / motor_error / driver_error, used to
+        # log edges (Active → Off transitions and newly-asserted fault bits).
+        # Catches the case where the firmware briefly saw a fault frame but the
+        # decoded "Error" column has already returned to "OK" by the time the
+        # user looks at the dashboard.
+        self.module_motor_mode: Dict[int, int] = {}
+        self.module_motor_error: Dict[int, int] = {}
+        self.module_driver_error: Dict[int, int] = {}
+        self._fault_log_decoder = (
+            CybergearErrorDecoder() if CYBERGEAR_DECODER_AVAILABLE else None
+        )
+        self.module_comm_stats: Dict[int, Dict[str, Any]] = {}
+        self.last_sent_motor_targets: Dict[int, float] = {}
         self.policy_feedback_callback = None
+        self.sim2real_check_callback = None
         # Set of connected modules
         self.connected_modules: Set[int] = set()
         
         # Control state
         self.motor_enabled = False
+        # True once a not-ready interlock has fired and the host disabled motors
+        # in response. Cleared only by an explicit re-enable (keyboard 'e' or an
+        # external script calling _enable_motor). Survives the underlying fault
+        # clearing on its own — the user must acknowledge before motors come back.
+        self._interlock_tripped = False
+        self._interlock_trip_reason: Optional[str] = None
+        self.current_control_mode = CONTROL_MODE_DIRECT_PD
+        self._enable_ready_grace_deadline = 0.0
         self.last_motor_com_time = time.time()
         self.compute_time = 0.0
         self.send_dt = 0.0
+        self._command_time_origin = time.perf_counter()
         
         # Command keyboard control state
         self._selected_command_idx = 0  # Currently selected command for adjustment
@@ -299,6 +352,16 @@ class RealMetaMachine(Base):
         self.cmd_count = 0
         self.fb_count = 0
         self.start_time = time.time()
+        self._comm_history_len = int(real_cfg.get("comm_history_len", 256))
+        self._comm_feedback_interval_warn_ms = float(
+            real_cfg.get("feedback_interval_warn_ms", 25.0)
+        )
+        self._comm_command_age_warn_ms = float(
+            real_cfg.get(
+                "command_feedback_age_warn_ms",
+                max(80.0, float(cfg.control.dt) * 2.0 * 1000.0),
+            )
+        )
         
         # Initialize parent class
         super(RealMetaMachine, self).__init__(cfg)
@@ -313,6 +376,7 @@ class RealMetaMachine(Base):
         
         # Observable data cache
         self.observable_data: Dict[str, Any] = {}
+        self._last_goal_distance_value: Optional[float] = None
         
         # Initialize dashboard if enabled
         if self.enable_dashboard:
@@ -366,6 +430,7 @@ class RealMetaMachine(Base):
         print("\n" + "-" * 60)
         print("Keyboard Controls:")
         print("  Motor:    e=enable, d=disable, r=restart, c=calibrate")
+        print("  Checks:   v=sim-to-real sanity check")
         print("  Commands: 0-9=select/set, []=prev/next, +/-=adjust")
         print("            R=resample, k=toggle keyboard mode, i=info")
         print("  Models:   ,=prev model, .=next model, /=list models")
@@ -559,6 +624,7 @@ class RealMetaMachine(Base):
         """
         module_id = msg.module_id
         self.fb_count += 1
+        self._update_comm_stats(module_id, msg)
         
         # Check if this is an expected module (active or sensor)
         if module_id not in self.all_expected_module_ids:
@@ -604,8 +670,246 @@ class RealMetaMachine(Base):
         if self.dashboard is not None:
             self._update_dashboard_motor(module_id, msg, sender_ip)
 
+    def _command_timestamp_now(self) -> float:
+        """Return a float32-safe monotonic command timestamp in seconds."""
+        origin = getattr(self, "_command_time_origin", None)
+        if origin is None:
+            origin = time.perf_counter()
+            self._command_time_origin = origin
+        return float(time.perf_counter() - origin)
+
+    def _get_or_create_comm_stats(self, module_id: int) -> Dict[str, Any]:
+        """Return the rolling communication stats bucket for one module."""
+        stats = self.module_comm_stats.get(module_id)
+        if stats is not None:
+            return stats
+
+        stats = {
+            "feedback_host_intervals_ms": deque(maxlen=self._comm_history_len),
+            "feedback_device_intervals_ms": deque(maxlen=self._comm_history_len),
+            "command_age_ms": deque(maxlen=self._comm_history_len),
+            "receive_dt_us": deque(maxlen=self._comm_history_len),
+            "last_feedback_host_interval_ms": np.nan,
+            "last_feedback_device_interval_ms": np.nan,
+            "last_command_age_ms": np.nan,
+            "last_receive_dt_us": np.nan,
+            "last_feedback_host_time": None,
+            "last_feedback_device_time_us": None,
+            "gap_events": 0,
+            "stale_events": 0,
+        }
+        self.module_comm_stats[module_id] = stats
+        return stats
+
+    def _update_comm_stats(self, module_id: int, msg: SensorData) -> None:
+        """Track per-module communication timing and staleness."""
+        stats = self._get_or_create_comm_stats(module_id)
+        host_now = time.perf_counter()
+
+        last_host = stats["last_feedback_host_time"]
+        if last_host is not None:
+            host_interval_ms = (host_now - last_host) * 1000.0
+            if 0.0 < host_interval_ms < 5000.0:
+                stats["feedback_host_intervals_ms"].append(host_interval_ms)
+                stats["last_feedback_host_interval_ms"] = float(host_interval_ms)
+                if host_interval_ms > self._comm_feedback_interval_warn_ms:
+                    stats["gap_events"] += 1
+        stats["last_feedback_host_time"] = host_now
+
+        device_timestamp_us = int(getattr(msg, "timestamp", 0) or 0)
+        last_device_timestamp_us = stats["last_feedback_device_time_us"]
+        if device_timestamp_us > 0 and last_device_timestamp_us is not None:
+            device_delta_us = device_timestamp_us - last_device_timestamp_us
+            if device_delta_us < 0:
+                device_delta_us += 2**32
+            if 0 < device_delta_us < 5_000_000:
+                device_interval_ms = device_delta_us / 1000.0
+                stats["feedback_device_intervals_ms"].append(device_interval_ms)
+                stats["last_feedback_device_interval_ms"] = float(device_interval_ms)
+        if device_timestamp_us > 0:
+            stats["last_feedback_device_time_us"] = device_timestamp_us
+
+        receive_dt_us = int(getattr(msg, "receive_dt", 0) or 0)
+        if 0 <= receive_dt_us < 1_000_000:
+            stats["receive_dt_us"].append(float(receive_dt_us))
+            stats["last_receive_dt_us"] = float(receive_dt_us)
+
+        last_rcv_timestamp = float(getattr(msg, "last_rcv_timestamp", 0.0) or 0.0)
+        if last_rcv_timestamp > 0.0:
+            command_age_ms = (self._command_timestamp_now() - last_rcv_timestamp) * 1000.0
+            if 0.0 <= command_age_ms < 60_000.0:
+                stats["command_age_ms"].append(command_age_ms)
+                stats["last_command_age_ms"] = float(command_age_ms)
+                if command_age_ms > self._comm_command_age_warn_ms:
+                    stats["stale_events"] += 1
+
+    @staticmethod
+    def _summarize_series(values: Any) -> Dict[str, Optional[float]]:
+        """Return mean/std/max summary for a short numeric series."""
+        if not values:
+            return {"mean": None, "std": None, "max": None, "latest": None}
+        arr = np.asarray(list(values), dtype=np.float64)
+        return {
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr)),
+            "max": float(np.max(arr)),
+            "latest": float(arr[-1]),
+        }
+
+    def get_communication_diagnostics(self) -> Dict[int, Dict[str, Any]]:
+        """Return summarized communication diagnostics for each module."""
+        diagnostics: Dict[int, Dict[str, Any]] = {}
+        for module_id, stats in self.module_comm_stats.items():
+            diagnostics[module_id] = {
+                "feedback_host_interval_ms": self._summarize_series(
+                    stats["feedback_host_intervals_ms"]
+                ),
+                "feedback_device_interval_ms": self._summarize_series(
+                    stats["feedback_device_intervals_ms"]
+                ),
+                "command_age_ms": self._summarize_series(stats["command_age_ms"]),
+                "receive_dt_us": self._summarize_series(stats["receive_dt_us"]),
+                "gap_events": int(stats["gap_events"]),
+                "stale_events": int(stats["stale_events"]),
+            }
+        return diagnostics
+
+    def get_communication_snapshot(self) -> Dict[str, np.ndarray]:
+        """Return latest per-step communication values aligned to active module order."""
+        num_actions = len(self.expected_module_ids)
+        last_sent_motor_targets = getattr(self, "last_sent_motor_targets", {})
+        host_interval_ms = np.full(num_actions, np.nan, dtype=np.float32)
+        device_interval_ms = np.full(num_actions, np.nan, dtype=np.float32)
+        command_age_ms = np.full(num_actions, np.nan, dtype=np.float32)
+        receive_dt_us = np.full(num_actions, np.nan, dtype=np.float32)
+        host_sent_motor_target = np.full(num_actions, np.nan, dtype=np.float32)
+        raw_motor_pos = np.full(num_actions, np.nan, dtype=np.float32)
+        firmware_motor_target = np.full(num_actions, np.nan, dtype=np.float32)
+        firmware_interp_target = np.full(num_actions, np.nan, dtype=np.float32)
+        firmware_applied_target = np.full(num_actions, np.nan, dtype=np.float32)
+        filtered_motor_pos = np.full(num_actions, np.nan, dtype=np.float32)
+        policy_debug_seq = np.full(num_actions, np.nan, dtype=np.float32)
+        policy_debug_valid = np.zeros(num_actions, dtype=np.int32)
+        gap_events = np.zeros(num_actions, dtype=np.int32)
+        stale_events = np.zeros(num_actions, dtype=np.int32)
+
+        for action_idx, module_id in enumerate(self.expected_module_ids):
+            stats = self.module_comm_stats.get(module_id)
+            if stats is not None:
+                host_interval_ms[action_idx] = float(stats["last_feedback_host_interval_ms"])
+                device_interval_ms[action_idx] = float(stats["last_feedback_device_interval_ms"])
+                command_age_ms[action_idx] = float(stats["last_command_age_ms"])
+                receive_dt_us[action_idx] = float(stats["last_receive_dt_us"])
+                gap_events[action_idx] = int(stats["gap_events"])
+                stale_events[action_idx] = int(stats["stale_events"])
+            if module_id in last_sent_motor_targets:
+                host_sent_motor_target[action_idx] = float(
+                    last_sent_motor_targets[module_id]
+                )
+
+            data = self.module_data.get(module_id)
+            if data is None:
+                continue
+
+            motor = getattr(data, "motor", None)
+            if motor is not None and hasattr(motor, "pos"):
+                raw_motor_pos[action_idx] = float(motor.pos)
+
+            policy_debug = getattr(data, "policy_debug", None)
+            if policy_debug is None:
+                continue
+
+            valid = int(getattr(policy_debug, "valid", 0))
+            policy_debug_valid[action_idx] = valid
+            if valid:
+                firmware_motor_target[action_idx] = float(
+                    getattr(policy_debug, "motor_target", np.nan)
+                )
+                firmware_interp_target[action_idx] = float(
+                    getattr(policy_debug, "interp_target", np.nan)
+                )
+                firmware_applied_target[action_idx] = float(
+                    getattr(policy_debug, "applied_target", np.nan)
+                )
+                filtered_motor_pos[action_idx] = float(
+                    getattr(policy_debug, "dof_pos", np.nan)
+                )
+                policy_debug_seq[action_idx] = float(
+                    getattr(policy_debug, "seq", np.nan)
+                )
+
+        return {
+            "comm_feedback_host_interval_ms": host_interval_ms,
+            "comm_feedback_device_interval_ms": device_interval_ms,
+            "comm_command_age_ms": command_age_ms,
+            "comm_receive_dt_us": receive_dt_us,
+            "host_sent_motor_target": host_sent_motor_target,
+            "feedback_raw_motor_pos": raw_motor_pos,
+            "firmware_motor_target": firmware_motor_target,
+            "firmware_interp_target": firmware_interp_target,
+            "firmware_applied_target": firmware_applied_target,
+            "firmware_filtered_dof_pos": filtered_motor_pos,
+            "firmware_policy_debug_seq": policy_debug_seq,
+            "firmware_policy_debug_valid": policy_debug_valid,
+            "comm_gap_events": gap_events,
+            "comm_stale_events": stale_events,
+        }
+
+    def _get_dashboard_comm_summary(self) -> str:
+        """Build a compact communication summary string for dashboard display."""
+        diagnostics = self.get_communication_diagnostics()
+        if not diagnostics:
+            return "--"
+
+        host_means = []
+        host_stds = []
+        age_means = []
+        recv_means = []
+        gap_events = 0
+        stale_events = 0
+
+        for diag in diagnostics.values():
+            host_summary = diag["feedback_host_interval_ms"]
+            age_summary = diag["command_age_ms"]
+            recv_summary = diag["receive_dt_us"]
+            if host_summary["mean"] is not None:
+                host_means.append(host_summary["mean"])
+            if host_summary["std"] is not None:
+                host_stds.append(host_summary["std"])
+            if age_summary["mean"] is not None:
+                age_means.append(age_summary["mean"])
+            if recv_summary["mean"] is not None:
+                recv_means.append(recv_summary["mean"])
+            gap_events += int(diag["gap_events"])
+            stale_events += int(diag["stale_events"])
+
+        parts = []
+        if host_means:
+            parts.append(
+                f"fb {max(host_means):.1f}±{max(host_stds) if host_stds else 0.0:.1f}ms"
+            )
+        if age_means:
+            parts.append(f"age {max(age_means):.1f}ms")
+        if recv_means:
+            parts.append(f"rx {max(recv_means) / 1000.0:.2f}ms")
+        issues = gap_events + stale_events
+        if issues:
+            parts.append(f"!{issues}")
+
+        return " | ".join(parts) if parts else "--"
+
+    def _update_dashboard_comm_status(self, comm_summary: Optional[str] = None) -> None:
+        """Publish a compact communication summary to simpler dashboards."""
+        if self.dashboard is None or not hasattr(self.dashboard, "set_status"):
+            return
+        self.dashboard.set_status("Comm", comm_summary or self._get_dashboard_comm_summary())
+
     def _handle_policy_feedback(self, module_id: int, msg: SensorData) -> None:
         """Log policy hash/sanity/runtime validation changes from ESP32."""
+        if self.current_control_mode != CONTROL_MODE_ONBOARD_MODEL:
+            self.module_policy_errors[module_id] = 0
+            return
+
         policy_error = int(getattr(msg, "policy_error", 0))
         previous_error = self.module_policy_errors.get(module_id)
         if previous_error == policy_error:
@@ -628,6 +932,77 @@ class RealMetaMachine(Base):
                 "success",
             )
 
+    def _track_motor_fault_edges(
+        self,
+        module_id: int,
+        motor,
+        motor_mode: int,
+        motor_error: int,
+        driver_error: int,
+    ) -> None:
+        """Log one-shot dashboard messages on motor fault edges.
+
+        Two kinds of edges are surfaced:
+          1. motor_mode transitions out of Active (2 → !=2). The raw error
+             ints, decoded names, and live telemetry are logged at the trip
+             instant so the cause is visible even if the firmware's
+             driver_error returns to 0 on the next packet.
+          2. New bits appearing in motor_error or driver_error (CAN-lost bit
+             handled separately upstream). Catches short fault-frame flashes.
+        """
+        prev_mode = self.module_motor_mode.get(module_id)
+        prev_motor_err = self.module_motor_error.get(module_id, 0)
+        # Ignore the CAN-lost bit here — it has its own logger upstream.
+        prev_drv_err = self.module_driver_error.get(module_id, 0) & ~DRIVER_ERROR_CAN_LOST_BIT
+        cur_drv_err = driver_error & ~DRIVER_ERROR_CAN_LOST_BIT
+
+        if prev_mode is not None and prev_mode == 2 and motor_mode != 2:
+            decoder = self._fault_log_decoder
+            m_decoded = decoder.decode_motor_error(motor_error) if decoder else ""
+            d_decoded = decoder.decode_driver_error(driver_error) if decoder else ""
+            telemetry = ""
+            if motor is not None:
+                telemetry = (
+                    f" V={getattr(motor, 'voltage', 0.0):.1f}"
+                    f" I={getattr(motor, 'current', 0.0):.2f}"
+                    f" T={getattr(motor, 'temperature', 0.0):.0f}C"
+                )
+            self._dashboard_log(
+                f"Module {module_id} motor OFF (mode 2→{motor_mode}): "
+                f"motor_error=0x{motor_error:02x}[{m_decoded or '-'}] "
+                f"driver_error=0x{driver_error:08x}[{d_decoded or '-'}]"
+                f"{telemetry}",
+                "error",
+            )
+
+        new_motor_bits = motor_error & ~prev_motor_err
+        if new_motor_bits:
+            decoded = (
+                self._fault_log_decoder.decode_motor_error(new_motor_bits)
+                if self._fault_log_decoder else ""
+            )
+            self._dashboard_log(
+                f"Module {module_id} motor_error +0x{new_motor_bits:02x}"
+                f"[{decoded or '-'}] (full=0x{motor_error:02x})",
+                "warn",
+            )
+
+        new_drv_bits = cur_drv_err & ~prev_drv_err
+        if new_drv_bits:
+            decoded = (
+                self._fault_log_decoder.decode_driver_error(new_drv_bits)
+                if self._fault_log_decoder else ""
+            )
+            self._dashboard_log(
+                f"Module {module_id} driver_error +0x{new_drv_bits:08x}"
+                f"[{decoded or '-'}] (full=0x{driver_error:08x})",
+                "warn",
+            )
+
+        self.module_motor_mode[module_id] = motor_mode
+        self.module_motor_error[module_id] = motor_error
+        self.module_driver_error[module_id] = driver_error
+
     def _update_dashboard_motor(self, module_id: int, msg: SensorData, sender_ip: str) -> None:
         """Update dashboard with motor data.
         
@@ -644,18 +1019,43 @@ class RealMetaMachine(Base):
         motor_error = getattr(motor, 'motor_error', 0) if motor else 0
         motor_mode = getattr(motor, 'motor_mode', 0) if motor else 0
         driver_error = getattr(motor, 'driver_error', 0) if motor else 0
-        
-        # Build error string from reset reasons (legacy)
+
+        # Surface mode-edge / new-fault-bit transitions on motor modules so
+        # the cause is captured even when the dashboard's "Error" column has
+        # already decoded back to "OK".
+        if module_id not in self.sensor_module_ids:
+            self._track_motor_fault_edges(
+                module_id, motor, motor_mode, motor_error, driver_error,
+            )
+
+        # Build error string from active runtime faults only.
+        # Boot reset reasons are startup diagnostics, not a live module fault.
         error_str = ""
-        if hasattr(msg, 'error') and msg.error:
-            err = msg.error
-            if hasattr(err, 'reset_reason0') and hasattr(err, 'reset_reason1'):
-                if err.reset_reason0 != 0 or err.reset_reason1 != 0:
-                    error_str = f"Reset: {err.reset_reason0}/{err.reset_reason1}"
-        policy_error = int(getattr(msg, "policy_error", 0))
-        if policy_error != 0:
-            policy_str = format_policy_error(policy_error)
-            error_str = f"{error_str}; {policy_str}" if error_str else policy_str
+
+        # Persistent CAN loss is set by firmware (bit 25 of driver_error) after the
+        # ESP32 fails CAN_Transceive consecutively. Surface it as a top-level
+        # error so the dashboard column shows "CAN LOST" instead of decoded
+        # silence ("OK" with mode=OFF), and log a one-shot edge transition.
+        can_lost = bool(driver_error & DRIVER_ERROR_CAN_LOST_BIT)
+        prev_can_lost = self.module_can_lost.get(module_id)
+        if prev_can_lost != can_lost:
+            self.module_can_lost[module_id] = can_lost
+            if can_lost:
+                self._dashboard_log(f"CAN lost to module {module_id}", "error")
+            elif prev_can_lost is True:
+                self._dashboard_log(f"CAN restored to module {module_id}", "success")
+        if can_lost:
+            error_str = "CAN LOST"
+
+        if self.current_control_mode == CONTROL_MODE_ONBOARD_MODEL:
+            policy_error = int(getattr(msg, "policy_error", 0))
+            policy_status = int(getattr(msg, "policy_status", 0))
+            if policy_error != 0:
+                policy_str = format_policy_error(policy_error)
+                error_str = f"{error_str}; {policy_str}" if error_str else policy_str
+            elif policy_status != 0 and (policy_status & (1 << 4)) == 0:
+                policy_str = f"POLICY {format_policy_status(policy_status)}"
+                error_str = f"{error_str}; {policy_str}" if error_str else policy_str
         
         # Determine module type and build display name
         is_sensor_module = module_id in self.sensor_module_ids
@@ -716,38 +1116,107 @@ class RealMetaMachine(Base):
         """
         return all(mid in self.connected_modules for mid in self.all_expected_module_ids)
 
+    def _get_modules_not_in_active_mode(self) -> Dict[int, int]:
+        """Return active modules whose motor_mode is not Active/On."""
+        modules_not_on: Dict[int, int] = {}
+        for module_id in self.expected_module_ids:
+            data = self.module_data.get(module_id)
+            motor = getattr(data, "motor", None) if data is not None else None
+            motor_mode = getattr(motor, "motor_mode", 0) if motor else 0
+            if motor_mode != 2:
+                modules_not_on[module_id] = motor_mode
+        return modules_not_on
+
+    def _is_calibration_in_progress(self) -> bool:
+        """Return True when the only readiness issue is modules still calibrating."""
+        modules_not_on = self._get_modules_not_in_active_mode()
+        return bool(modules_not_on) and all(mode == 1 for mode in modules_not_on.values())
+
+    def _get_not_ready_reason(self) -> Optional[str]:
+        """Return a short explanation when the robot is not ready for control."""
+        if not self.all_modules_connected():
+            return f"missing modules {self.get_missing_modules()}"
+
+        active_ips = set(self.server.active_devices.keys())
+        inactive_modules = []
+        for module_id in self.all_expected_module_ids:
+            ip = self.module_to_ip.get(module_id)
+            if ip not in active_ips:
+                inactive_modules.append(module_id)
+        if inactive_modules:
+            return f"inactive modules {inactive_modules}"
+
+        modules_not_on = self._get_modules_not_in_active_mode()
+        if modules_not_on:
+            module_ids = list(modules_not_on)
+            if all(mode == 1 for mode in modules_not_on.values()):
+                return f"calibrating modules {module_ids}"
+            return f"motor mode not ON for modules {module_ids}"
+
+        return None
+
     def ready(self) -> bool:
         """Check if the robot system is ready for control.
-        
+
         The system is ready when:
         1. All expected modules (active + sensor) are connected
         2. All modules are actively sending data
         3. All active motor modules are ON (motor_mode == 2)
-        
+
         Returns:
             bool: True if all expected modules are active and motors are ON
         """
-        # Check all expected modules are connected
-        if not self.all_modules_connected():
+        return self._get_not_ready_reason() is None
+
+    def interlock_tripped(self) -> bool:
+        """Whether a not-ready interlock has fired and is awaiting manual reset.
+
+        External scripts that re-enable motors automatically (e.g.
+        onboard_policy_monitor with --auto_enable) should check this and
+        refuse to re-enable while it's True, so the operator is forced to
+        acknowledge with 'e' rather than letting motors silently come back
+        after a transient fault. Cleared by _enable_motor().
+        """
+        return self._interlock_tripped
+
+    def interlock_trip_reason(self) -> Optional[str]:
+        """Reason string for the active interlock trip, or None if not tripped."""
+        return self._interlock_trip_reason if self._interlock_tripped else None
+
+    def _engage_not_ready_interlock(self, reason: Optional[str]) -> None:
+        """Disable all still-connected active modules after a readiness fault."""
+        if not self.motor_enabled:
+            return
+
+        message = "Robot not ready; disabling all active modules"
+        if reason:
+            message = f"{message} ({reason})"
+
+        print(f"[Safety] {message}")
+        self._dashboard_log(message, "error")
+        self._disable_motor()
+
+        # Latch the trip so the user must acknowledge with 'e' before motors
+        # come back, even after the fault (e.g. a temporarily offline module)
+        # clears on its own. _disable_motor is also called by the operator and
+        # by close(); only the interlock path sets this sticky flag.
+        self._interlock_tripped = True
+        self._interlock_trip_reason = reason
+        self._dashboard_log(
+            "Interlock latched — press 'e' to re-enable (motors will not "
+            "come back automatically when the robot is Ready again)",
+            "error",
+        )
+
+    def _should_engage_not_ready_interlock(self) -> bool:
+        """Return whether a not-ready fault should trip the safety interlock."""
+        if not self.motor_enabled:
             return False
-        
-        # Check all modules are in active devices (recently seen)
-        active_ips = set(self.server.active_devices.keys())
-        for module_id in self.all_expected_module_ids:
-            ip = self.module_to_ip.get(module_id)
-            if ip not in active_ips:
-                return False
-        
-        # Check all active motor modules are ON (motor_mode == 2)
-        # motor_mode: 0=Reset/Off, 1=Calibration, 2=Active/On
-        for module_id in self.expected_module_ids:
-            if module_id in self.module_data:
-                motor = self.module_data[module_id].motor
-                motor_mode = getattr(motor, 'motor_mode', 0) if motor else 0
-                if motor_mode != 2:  # Not in Active/On mode
-                    return False
-        
-        return True
+
+        if self._is_calibration_in_progress():
+            return False
+
+        return time.time() >= self._enable_ready_grace_deadline
 
     def get_missing_modules(self) -> List[int]:
         """Get list of expected modules (active + sensor) that are not yet connected.
@@ -823,21 +1292,23 @@ class RealMetaMachine(Base):
         # Initialize arrays in action order
         dof_pos = np.zeros(num_actions)
         dof_vel = np.zeros(num_actions)
-        
+        dof_torque = np.zeros(num_actions)
+
         # Per-module data lists (in action order, for active modules only)
         imu_quats = []
         imu_gyros = []
         imu_accels = []
         goal_distances = []
-        
+
         # Collect data for each active module IN ORDER
         for action_idx, module_id in enumerate(self.expected_module_ids):
             if module_id in self.module_data:
                 data = self.module_data[module_id]
-                
+
                 # Motor data
                 dof_pos[action_idx] = data.motor.pos
                 dof_vel[action_idx] = data.motor.vel
+                dof_torque[action_idx] = data.motor.torque
                 
                 # Goal distance (per-module)
                 goal_distance = getattr(data, 'goal_distance', 0.0)
@@ -886,6 +1357,13 @@ class RealMetaMachine(Base):
         global_goal_distance = -1.0
         if self.goal_distance_module_id is not None:
             global_goal_distance = self._get_module_goal_distance(self.goal_distance_module_id)
+        global_goal_distance_delta = 0.0
+        if global_goal_distance >= 0.0:
+            if self._last_goal_distance_value is not None:
+                global_goal_distance_delta = self._last_goal_distance_value - global_goal_distance
+            self._last_goal_distance_value = global_goal_distance
+        else:
+            self._last_goal_distance_value = None
         
         # Special quaternion from configured module (for external tracking)
         special_quat = np.array([0, 0, 0, 1])  # Identity quaternion by default
@@ -896,6 +1374,7 @@ class RealMetaMachine(Base):
             # Joint state (ordered by action index)
             "dof_pos": dof_pos,
             "dof_vel": dof_vel,
+            "dof_torque": dof_torque,
             
             # Global (torso) state - from configured main_imu module
             "quat": main_quat,
@@ -910,6 +1389,7 @@ class RealMetaMachine(Base):
             
             # Global goal distance (from configured source, if any)
             "goal_distance": global_goal_distance,
+            "goal_distance_delta": global_goal_distance_delta,
             
             # Special quaternion (from external tracking sensor)
             "special_quat": special_quat,
@@ -1027,6 +1507,7 @@ class RealMetaMachine(Base):
         
         # Common status updates for both dashboard types
         total_expected = len(self.expected_module_ids) + len(self.sensor_module_ids)
+        comm_summary = self._get_dashboard_comm_summary()
         
         # Check if using RLDashboard (has update_performance method)
         if hasattr(self.dashboard, 'update_performance'):
@@ -1035,7 +1516,8 @@ class RealMetaMachine(Base):
                 loop_dt=self.send_dt,
                 compute_time=self.compute_time,
                 cmd_count=self.cmd_count,
-                fb_count=self.fb_count
+                fb_count=self.fb_count,
+                comm_summary=comm_summary,
             )
             self.dashboard.set_status("Modules", f"{len(self.connected_modules)}/{total_expected}")
             
@@ -1048,6 +1530,7 @@ class RealMetaMachine(Base):
             # MotorDashboard - use set_status
             self.dashboard.set_status("Cmd/Fb", f"{self.cmd_count}/{self.fb_count}")
             self.dashboard.set_status("Modules", f"{len(self.connected_modules)}/{total_expected}")
+            self._update_dashboard_comm_status(comm_summary)
             
             # Update model info if available
             self._update_dashboard_model()
@@ -1510,7 +1993,11 @@ class RealMetaMachine(Base):
             control_mode: Firmware-side control mode selector.
         """
         sent_count = 0
+        self.current_control_mode = int(control_mode)
         current_time = time.time()
+        command_timestamp = self._command_timestamp_now()
+        if not hasattr(self, "last_sent_motor_targets"):
+            self.last_sent_motor_targets = {}
         # Transport expects a fixed 8-float context payload.
         command_context_list = (
             command_context.flatten()[:8].tolist()
@@ -1536,7 +2023,7 @@ class RealMetaMachine(Base):
                 switch_=1 if enable else 0,
                 calibrate=0,
                 restart=0,
-                timestamp=current_time,
+                timestamp=command_timestamp,
                 control_mode=int(control_mode),
                 joint_offset=float(joint_offsets[action_idx]) if action_idx < len(joint_offsets) else 0.0,
                 joint_id=action_idx,
@@ -1545,6 +2032,7 @@ class RealMetaMachine(Base):
             
             if self.server.send_to(ip, cmd):
                 sent_count += 1
+                self.last_sent_motor_targets[module_id] = float(cmd.target)
         
         self.last_motor_com_time = current_time
         return sent_count
@@ -1569,6 +2057,7 @@ class RealMetaMachine(Base):
         
         # Signal new episode to dashboard
         self._update_dashboard_new_episode()
+        self._last_goal_distance_value = None
         
         time.sleep(0.5)
 
@@ -1588,7 +2077,10 @@ class RealMetaMachine(Base):
             d: Disable motors
             r: Restart motors
             c: Calibrate motors
-        
+
+        Checks:
+            v: Run the dashboard sim-to-real sanity check
+
         Command Controls:
             0-9: Set one-hot command (if onehot_mode) or select command index
             [/]: Select previous/next command (for continuous adjustment)
@@ -1616,6 +2108,8 @@ class RealMetaMachine(Base):
                 self._restart_motor()
             elif self.input_key == "c":
                 self._calibrate_motor()
+            elif self.input_key == "v":
+                self._run_sim2real_check()
             
             # Command controls - number keys 0-9
             elif self.input_key in "0123456789":
@@ -1656,10 +2150,27 @@ class RealMetaMachine(Base):
             if time.time() - self.last_motor_com_time > 0.5:
                 self._reset_motor_commands()
 
+    def _run_sim2real_check(self) -> None:
+        """Trigger the runtime sim-to-real checker if one is attached."""
+        if self.sim2real_check_callback is None:
+            self._dashboard_log("Sim-to-real checker unavailable", "warn")
+            return
+        self.sim2real_check_callback()
+
     def _enable_motor(self) -> None:
         """Enable all motors."""
         print("[CMD] Enabling motors...")
+        if self._interlock_tripped:
+            trip_reason = self._interlock_trip_reason or "unknown"
+            self._dashboard_log(
+                f"Clearing interlock ({trip_reason}) and re-enabling motors",
+                "warn",
+            )
+            print(f"[Safety] Clearing interlock ({trip_reason})")
+        self._interlock_tripped = False
+        self._interlock_trip_reason = None
         self.motor_enabled = True
+        self._enable_ready_grace_deadline = time.time() + max(self.enable_ready_grace_sec, 0.0)
         self._send_enable_command(enable=True)
         if self.dashboard:
             self.dashboard.set_switch(True)
@@ -1668,6 +2179,7 @@ class RealMetaMachine(Base):
         """Disable all motors."""
         print("[CMD] Disabling motors...")
         self.motor_enabled = False
+        self._enable_ready_grace_deadline = 0.0
         self._send_enable_command(enable=False)
         if self.dashboard:
             self.dashboard.set_switch(False)
@@ -2002,7 +2514,10 @@ class RealMetaMachine(Base):
 
     def _send_enable_command(self, enable: bool) -> None:
         """Send enable/disable command to all modules."""
-        current_time = time.time()
+        command_timestamp = self._command_timestamp_now()
+        self.current_control_mode = CONTROL_MODE_DIRECT_PD
+        if not hasattr(self, "last_sent_motor_targets"):
+            self.last_sent_motor_targets = {}
         
         for module_id in self.expected_module_ids:
             if module_id not in self.module_to_ip:
@@ -2018,17 +2533,21 @@ class RealMetaMachine(Base):
                 switch_=1 if enable else 0,
                 calibrate=0,
                 restart=0,
-                timestamp=current_time,
+                timestamp=command_timestamp,
                 control_mode=CONTROL_MODE_DIRECT_PD,
                 joint_offset=0.0,
                 joint_id=-1,
                 command_context=[0.0] * 8,
             )
             self.server.send_to(ip, cmd)
+            self.last_sent_motor_targets[module_id] = float(cmd.target)
 
     def _send_special_command(self, calibrate: int = 0, restart: int = 0) -> None:
         """Send special command (calibrate/restart) to all modules."""
-        current_time = time.time()
+        command_timestamp = self._command_timestamp_now()
+        self.current_control_mode = CONTROL_MODE_DIRECT_PD
+        if not hasattr(self, "last_sent_motor_targets"):
+            self.last_sent_motor_targets = {}
         
         for module_id in self.expected_module_ids:
             if module_id not in self.module_to_ip:
@@ -2044,13 +2563,14 @@ class RealMetaMachine(Base):
                 switch_=0,
                 calibrate=calibrate,
                 restart=restart,
-                timestamp=current_time,
+                timestamp=command_timestamp,
                 control_mode=CONTROL_MODE_DIRECT_PD,
                 joint_offset=0.0,
                 joint_id=-1,
                 command_context=[0.0] * 8,
             )
             self.server.send_to(ip, cmd)
+            self.last_sent_motor_targets[module_id] = float(cmd.target)
 
     def step(self, action: np.ndarray):
         """Execute one environment step with dashboard updates.
@@ -2059,6 +2579,18 @@ class RealMetaMachine(Base):
         """
         # Call parent step
         obs, reward, done, truncated, info = super().step(action)
+
+        not_ready_reason = self._get_not_ready_reason()
+        if not_ready_reason is not None:
+            info["not_ready"] = True
+            info["not_ready_reason"] = not_ready_reason
+            if self._should_engage_not_ready_interlock():
+                self._engage_not_ready_interlock(not_ready_reason)
+        else:
+            info["not_ready"] = False
+        info["interlock_tripped"] = self._interlock_tripped
+        if self._interlock_tripped:
+            info["interlock_trip_reason"] = self._interlock_trip_reason
         
         # Update dashboard with reward info
         if self.dashboard is not None:
@@ -2098,6 +2630,33 @@ class RealMetaMachine(Base):
         print(f"  Active modules: {active_connected}")
         if self.sensor_module_ids:
             print(f"  Sensor modules: {sensor_connected}")
+        diagnostics = self.get_communication_diagnostics()
+        if diagnostics:
+            print("  Communication:")
+            for module_id in sorted(diagnostics):
+                diag = diagnostics[module_id]
+                host_fb = diag["feedback_host_interval_ms"]
+                cmd_age = diag["command_age_ms"]
+                recv_dt = diag["receive_dt_us"]
+                parts = [f"module {module_id}"]
+                if host_fb["mean"] is not None:
+                    parts.append(
+                        f"fb={host_fb['mean']:.1f}±{host_fb['std']:.1f}ms max={host_fb['max']:.1f}ms"
+                    )
+                if cmd_age["mean"] is not None:
+                    parts.append(
+                        f"age={cmd_age['mean']:.1f}ms max={cmd_age['max']:.1f}ms"
+                    )
+                if recv_dt["mean"] is not None:
+                    parts.append(
+                        f"rx={recv_dt['mean']:.0f}us max={recv_dt['max']:.0f}us"
+                    )
+                issues = int(diag["gap_events"]) + int(diag["stale_events"])
+                if issues:
+                    parts.append(
+                        f"issues={issues} (gap={int(diag['gap_events'])}, stale={int(diag['stale_events'])})"
+                    )
+                print(f"    {' | '.join(parts)}")
         print("=" * 60)
 
     # =========================================================================
