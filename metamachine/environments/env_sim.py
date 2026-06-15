@@ -1044,7 +1044,11 @@ class MetaMachine(Base, MujocoEnv):
             name, ext = os.path.splitext(base_filename)
             filename = f"{name}_{cam_name}{ext}"
 
-            clip = ImageSequenceClip(list(frames), fps=self.video_fps)
+            # Frames are captured as BGR for OpenCV overlays; moviepy expects RGB.
+            rgb_frames = [
+                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frames
+            ]
+            clip = ImageSequenceClip(rgb_frames, fps=self.video_fps)
             clip.write_videofile(
                 filename,
                 codec="libx264",
