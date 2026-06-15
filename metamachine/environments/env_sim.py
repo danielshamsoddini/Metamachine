@@ -558,7 +558,8 @@ class MetaMachine(Base, MujocoEnv):
 
     def _initialize_video_recording(self) -> None:
         """Initialize video recording system."""
-        self.video_frames: list[np.ndarray] = []
+        self.video_frames_dict: dict[str, list[np.ndarray]] = {}
+        self.recording_cameras: list[dict] = []
         self.egl_renderer: Optional[Union[str, Any]] = None
         self.recording_active = False
         
@@ -667,7 +668,16 @@ class MetaMachine(Base, MujocoEnv):
         """Create a synthetic frame with robot state visualization."""
         from io import BytesIO
 
+        import matplotlib
         import matplotlib.patches as patches
+
+        # Force a non-interactive backend so headless runs do not touch Tk.
+        try:
+            if matplotlib.get_backend().lower() != "agg":
+                matplotlib.use("Agg", force=True)
+        except Exception:
+            pass
+
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
@@ -740,64 +750,81 @@ class MetaMachine(Base, MujocoEnv):
         if renderer == "synthetic":
             width, height = self.render_size
             frame = self._create_synthetic_frame(width, height)
+            if "synthetic" not in self.video_frames_dict:
+                self.video_frames_dict["synthetic"] = []
+            self.video_frames_dict["synthetic"].append(frame)
+            return frame
         else:
-            camera_id = getattr(self, "preferred_camera_id", -1)
-            renderer.update_scene(self.data, camera=camera_id)
-            
-            # Call pre-render callbacks (for adding 3D markers to scene)
-            for callback in getattr(self, '_pre_render_callbacks', []):
-                try:
-                    callback(renderer, self.data)
-                except Exception as e:
-                    pass  # Silently ignore callback errors
-            
-            pixels = renderer.render()
-            frame = 1 - pixels
-            frame = (frame * 255).astype(np.uint8)
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        
-        # Call post-render callbacks (for frame processing)
-        for callback in getattr(self, '_post_render_callbacks', []):
-            try:
-                frame = callback(frame)
-            except Exception as e:
-                pass  # Silently ignore callback errors
+            for cam in self.recording_cameras:
+                camera_id = cam["id"]
+                cam_name = cam["name"]
+                renderer.update_scene(self.data, camera=camera_id)
+                
+                # Call pre-render callbacks (for adding 3D markers to scene)
+                for callback in getattr(self, '_pre_render_callbacks', []):
+                    try:
+                        callback(renderer, self.data)
+                    except Exception as e:
+                        pass  # Silently ignore callback errors
+                
+                pixels = renderer.render()
+                frame = cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
+                # Call post-render callbacks (for frame processing)
+                for callback in getattr(self, '_post_render_callbacks', []):
+                    try:
+                        frame = callback(frame)
+                    except Exception as e:
+                        pass  # Silently ignore callback errors
 
-        frame = self._add_metrics_overlay(frame)
-        
-        # Call frame overlay callbacks (for additional overlays)
-        for callback in getattr(self, '_frame_overlay_callbacks', []):
-            try:
-                frame = callback(frame)
-            except Exception as e:
-                pass  # Silently ignore callback errors
-        
-        self.video_frames.append(frame)
-        return frame
+                frame = self._add_metrics_overlay(frame)
+                
+                # Call frame overlay callbacks (for additional overlays)
+                for callback in getattr(self, '_frame_overlay_callbacks', []):
+                    try:
+                        frame = callback(frame)
+                    except Exception as e:
+                        pass  # Silently ignore callback errors
+                
+                if cam_name not in self.video_frames_dict:
+                    self.video_frames_dict[cam_name] = []
+                self.video_frames_dict[cam_name].append(frame)
+            
+            # Return the last frame as the nominal frame if needed
+            return frame
 
     def _save_video(self) -> bool:
         """Save collected frames to MP4 video using moviepy."""
-        if not self.video_frames:
+        if not getattr(self, 'video_frames_dict', None):
             print("No frames to save")
             return False
 
         from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 
-        filename = self._generate_video_filename()
+        base_filename = self._generate_video_filename()
+        success = False
 
-        clip = ImageSequenceClip(list(self.video_frames), fps=self.video_fps)
-        clip.write_videofile(
-            filename,
-            codec="libx264",
-            fps=self.video_fps,
-            audio=False,
-            logger=None,
-        )
-        clip.close()
+        for cam_name, frames in self.video_frames_dict.items():
+            if not frames:
+                continue
 
-        file_size = os.path.getsize(filename)
-        print(f"✓ Video saved: {filename} ({file_size:,} bytes, {len(self.video_frames)} frames)")
-        return True
+            name, ext = os.path.splitext(base_filename)
+            filename = f"{name}_{cam_name}{ext}"
+
+            clip = ImageSequenceClip(list(frames), fps=self.video_fps)
+            clip.write_videofile(
+                filename,
+                codec="libx264",
+                fps=self.video_fps,
+                audio=False,
+                logger=None,
+            )
+            clip.close()
+
+            file_size = os.path.getsize(filename)
+            print(f"✓ Video saved: {filename} ({file_size:,} bytes, {len(frames)} frames)")
+            success = True
+            
+        return success
 
     def _generate_video_filename(self) -> str:
         """Generate video filename based on pattern and episode counter."""
@@ -842,9 +869,14 @@ class MetaMachine(Base, MujocoEnv):
     def start_video_recording(self) -> None:
         """Start video recording."""
         if self.render_mode == "mp4":
-            self.video_frames = []
+            self.recording_cameras = self._get_available_cameras()
+            if not self.recording_cameras:
+                self.recording_cameras = [{"id": -1, "name": "default"}]
+            self.video_frames_dict = {cam["name"]: [] for cam in self.recording_cameras}
+            self.trajectory_xs = []
+            self.trajectory_ys = []
             self.recording_active = True
-            print(f"Video recording started for episode {self.episode_counter}")
+            print(f"Video recording started for episode {self.episode_counter} (Cameras: {[c['name'] for c in self.recording_cameras]})")
         else:
             print("Video recording not available (render_mode must be 'mp4')")
 
@@ -853,6 +885,45 @@ class MetaMachine(Base, MujocoEnv):
         if self.render_mode == "mp4" and self.recording_active:
             self.recording_active = False
             success = self._save_video()
+            
+            # Save trajectory plot if enabled
+            if self.sim_cfg.get("plot_trajectory", False) and hasattr(self, "trajectory_xs") and len(self.trajectory_xs) > 0:
+                try:
+                    import matplotlib
+
+                    # Use a headless-safe backend for file-only plot generation.
+                    try:
+                        if matplotlib.get_backend().lower() != "agg":
+                            matplotlib.use("Agg", force=True)
+                    except Exception:
+                        pass
+
+                    import matplotlib.pyplot as plt
+                    filename = self._generate_video_filename()
+                    plot_filename = filename.replace(".mp4", "_trajectory.png")
+                    
+                    plt.figure(figsize=(8, 8))
+                    plt.plot(self.trajectory_xs, self.trajectory_ys, label="Robot Trajectory", linewidth=2.5, color="blue", alpha=0.7)
+                    plt.scatter(self.trajectory_xs[0], self.trajectory_ys[0], color="green", s=150, marker="o", label="Start", zorder=5)
+                    plt.scatter(self.trajectory_xs[-1], self.trajectory_ys[-1], color="red", s=150, marker="X", label="End", zorder=5)
+                    plt.title(f"Robot 2D Trajectory (Episode {self.episode_counter})")
+                    plt.xlabel("X Position (meters)")
+                    plt.ylabel("Y Position (meters)")
+                    plt.grid(True, linestyle="--", alpha=0.6)
+                    plt.legend()
+                    plt.axis("equal")
+                    
+                    plot_scale = self.sim_cfg.get("plot_scale", None)
+                    if plot_scale is not None:
+                        plt.xlim(-plot_scale, plot_scale)
+                        plt.ylim(-plot_scale, plot_scale)
+                        
+                    plt.savefig(plot_filename, bbox_inches="tight", dpi=150)
+                    plt.close()
+                    print(f"✓ Trajectory plot saved: {plot_filename}")
+                except Exception as e:
+                    print(f"Failed to save trajectory plot: {e}")
+                    
             self._cleanup_egl_renderer()
             return success
         return False
@@ -1240,6 +1311,11 @@ class MetaMachine(Base, MujocoEnv):
 
         # Capture frame for video recording if needed
         self.render()
+        
+        if self.sim_cfg.get("plot_trajectory", False) and getattr(self, "recording_active", False) and hasattr(self, "trajectory_xs"):
+            pos = self.data.qpos.flat[:2]
+            self.trajectory_xs.append(pos[0])
+            self.trajectory_ys.append(pos[1])
 
         # Update latency tracking
         self._update_latency_tracking(pos, vel)

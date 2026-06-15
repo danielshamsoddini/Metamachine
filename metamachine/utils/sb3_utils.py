@@ -130,26 +130,75 @@ class ProgressBarCallback:
         
         try:
             from tqdm.rich import tqdm
+            progress_backend = "tqdm.rich"
         except ImportError:
-            tqdm = None
+            try:
+                from tqdm.auto import tqdm
+                progress_backend = "tqdm.auto"
+            except ImportError:
+                tqdm = None
+                progress_backend = None
         
         class _ProgressBarCallback(SB3ProgressBar):
             def __init__(self, name: str):
                 super().__init__()
                 self._name = name
+                self._backend = progress_backend
                 if tqdm is None:
                     raise ImportError(
-                        "You must install tqdm and rich for the progress bar callback. "
+                        "You must install tqdm for the progress bar callback. "
                         "Install with: pip install tqdm rich"
                     )
             
             def _on_training_start(self) -> None:
+                print(
+                    f"[Progress] Starting '{self._name}' progress bar "
+                    f"using {self._backend or 'unknown backend'}"
+                )
                 self.pbar = tqdm(
                     total=self.locals["total_timesteps"] - self.model.num_timesteps,
                     desc=f"[deep_pink1]{self._name}"
                 )
         
         return _ProgressBarCallback(name)
+
+
+class TerminalStatusCallback:
+    """Plain terminal status updates that do not depend on rich rendering."""
+
+    def __new__(cls, print_freq: int = 10000, verbose: int = 1):
+        from stable_baselines3.common.callbacks import BaseCallback
+
+        class _TerminalStatusCallback(BaseCallback):
+            def __init__(self, print_freq: int = 10000, verbose: int = 1):
+                super().__init__(verbose)
+                self.print_freq = max(1, int(print_freq))
+                self._next_print = self.print_freq
+
+            def _on_training_start(self) -> None:
+                total_timesteps = self.locals.get("total_timesteps")
+                print(
+                    f"[Progress] Terminal status updates every "
+                    f"{self.print_freq:,} timesteps"
+                )
+                if total_timesteps is not None:
+                    print(f"[Progress] Target timesteps: {int(total_timesteps):,}")
+
+            def _on_step(self) -> bool:
+                if self.num_timesteps >= self._next_print:
+                    total_timesteps = self.locals.get("total_timesteps")
+                    if total_timesteps:
+                        pct = 100.0 * self.num_timesteps / max(1, int(total_timesteps))
+                        print(
+                            f"[Progress] {self.num_timesteps:,}/{int(total_timesteps):,} "
+                            f"timesteps ({pct:.1f}%)"
+                        )
+                    else:
+                        print(f"[Progress] {self.num_timesteps:,} timesteps")
+                    self._next_print += self.print_freq
+                return True
+
+        return _TerminalStatusCallback(print_freq, verbose)
 
 
 class EpisodeStatsCallback:
@@ -208,6 +257,7 @@ def setup_sb3_training(
     checkpoint_freq: int = 100000,
     log_reward_components: bool = True,
     show_progress_bar: bool = True,
+    terminal_status_freq: int = 10000,
     log_episode_stats: bool = True,
     logger_outputs: List[str] = ["stdout", "csv", "tensorboard"],
     extra_callbacks: Optional[List["BaseCallback"]] = None,
@@ -278,7 +328,16 @@ def setup_sb3_training(
             progress_cb = ProgressBarCallback(name=exp_name)
             callbacks.append(progress_cb)
         except ImportError:
-            print("[Warning] tqdm/rich not installed, skipping progress bar")
+            print(
+                "[Warning] tqdm/rich not installed, skipping progress bar. "
+                "Install with: pip install tqdm rich"
+            )
+    
+    # Plain terminal status callback for environments where rich progress bars
+    # do not render reliably.
+    if terminal_status_freq > 0:
+        status_cb = TerminalStatusCallback(print_freq=terminal_status_freq)
+        callbacks.append(status_cb)
     
     # Reward component callback
     if log_reward_components:

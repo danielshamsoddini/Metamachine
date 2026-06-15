@@ -7,6 +7,7 @@ Core Classes:
     - MetaMachine: Main CPU-based simulation environment (env_sim.py)
     - MJXMetaMachine: GPU-accelerated MJX simulation environment (env_mjx.py)
     - RealMetaMachine: Real robot environment using capybarish (env_real.py)
+    - CyberGearRealMetaMachine: Real robot environment using CyberGearDriver CAN transport
     - RayVecMetaMachine: Vectorized environment using Ray for parallel execution (vec_env.py)
     - VecEnv: Abstract base class for vectorized environments (vec_env.py)
 
@@ -40,6 +41,11 @@ try:
     from .env_real import RealMetaMachine
 except ImportError:
     RealMetaMachine = None
+
+try:
+    from .env_real_cybergear import CyberGearRealMetaMachine
+except ImportError:
+    CyberGearRealMetaMachine = None
 
 # Optional import for MJX environment (requires jax and mujoco-mjx)
 try:
@@ -110,6 +116,13 @@ def make_env(cfg, **kwargs):
         return MJXMetaMachine(cfg, **kwargs)
     
     elif mode == "real":
+        real_backend = cfg.get("real", {}).get("backend", "capybarish").lower()
+        if real_backend == "cybergear":
+            if CyberGearRealMetaMachine is None:
+                raise ValueError(
+                    "CyberGear real mode requires python-can and CyberGearDriver."
+                )
+            return CyberGearRealMetaMachine(cfg, **kwargs)
         if RealMetaMachine is None:
             raise ValueError(
                 "Real robot mode requires capybarish. "
@@ -131,6 +144,7 @@ __all__ = [
     "MJXMetaMachine",
     "MJXState",
     "RealMetaMachine",
+    "CyberGearRealMetaMachine",
     "Base",
     
     # Factory function

@@ -647,9 +647,7 @@ class MultiPolicyBearingCollector:
             )
             
             pixels = renderer.render()
-            frame = 1 - pixels
-            frame = (frame * 255).astype(np.uint8)
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            frame = cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
         
         # Add standard metrics overlay from env
         frame = env._add_metrics_overlay(frame)
@@ -2013,9 +2011,7 @@ class BearingAugmentedPolicySwitchEnv(gym.Wrapper):
                         bearing_env._add_markers_to_renderer_scene(renderer)
                         
                         pixels = renderer.render()
-                        frame = 1 - pixels
-                        frame = (frame * 255).astype(np.uint8)
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        frame = cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
                     
                     frame = self_loco._add_metrics_overlay(frame)
                     self_loco.video_frames.append(frame)

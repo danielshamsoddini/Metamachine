@@ -21,7 +21,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from ...utils.curves import isaac_reward, plateau
-from ...utils.math_utils import normalize_angle, quat_rotate_inverse
+from ...utils.math_utils import normalize_angle, quat_apply, quat_rotate_inverse
 
 
 class RewardComponent(ABC):
@@ -222,6 +222,19 @@ class TorsoContactPenaltyComponent(RewardComponent):
             ]
         )
         return -float(torso_touch_floor)
+
+
+class LowHeightPenaltyComponent(RewardComponent):
+    """Penalizes torso getting too close to the ground."""
+
+    def calculate(self, state, calculator) -> float:
+        min_height = self.params.get("min_height", 0.4)
+        height = state.accurate_pos_world[2]
+        
+        if height < min_height:
+            # Quadratic penalty that gets worse as it gets closer to ground
+            return -np.square(min_height - height)
+        return 0.0
 
 
 class DOFPositionTrackingComponent(RewardComponent):
@@ -625,6 +638,83 @@ class OneHotForwardComponent(RewardComponent):
         return np.exp(-lin_vel_error / tracking_sigma)
 
 
+class OneHotHeadingAlignmentComponent(RewardComponent):
+    """
+    Rewards aligning the robot's heading with a target world direction.
+    The target direction changes depending on the active one-hot steering command.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        command_names = self.params.get(
+            "command_names", ["cmd_straight", "cmd_left", "cmd_right"]
+        )
+        directions = self.params.get(
+            "directions",
+            [
+                [0.0, 1.0, 0.0],   # North (+Y)
+                [-1.0, 0.0, 0.0],  # West (-X)
+                [1.0, 0.0, 0.0]    # East (+X)
+            ]
+        )
+
+        # Get active command index
+        active_idx = 0
+        try:
+            for i, name in enumerate(command_names):
+                if state.get_command_by_name(name) > 0.5:
+                    active_idx = i
+                    break
+        except (AttributeError, ValueError):
+            commands = getattr(state, "commands", np.array([1.0, 0.0, 0.0]))
+            for i, val in enumerate(commands[:len(command_names)]):
+                if val > 0.5:
+                    active_idx = i
+                    break
+
+        target_direction = np.asarray(directions[active_idx], dtype=np.float64)
+        target_direction = target_direction / (np.linalg.norm(target_direction) + 1e-8)
+
+        body_forward = np.asarray(calculator.projected_forward_vec, dtype=np.float64)
+        world_forward = quat_apply(state.accurate_quat, body_forward)
+
+        world_forward_xy = world_forward[:2]
+        target_xy = target_direction[:2]
+
+        world_forward_xy = world_forward_xy / (
+            np.linalg.norm(world_forward_xy) + 1e-8
+        )
+        target_xy = target_xy / (np.linalg.norm(target_xy) + 1e-8)
+
+        alignment = float(np.dot(world_forward_xy, target_xy))
+        return 0.5 * (alignment + 1.0)
+
+
+class ProjectedForwardVelocityComponent(RewardComponent):
+    """
+    Rewards moving forward along the projected forward vector without a specific target, 
+    encouraging the robot to move as fast as possible up to a clipping limit.
+
+    Parameters:
+        clip_max: Max rewarded velocity in m/s (default: 2.0)
+        normalize: If True, scale reward to [0, 1] by dividing by clip_max (default: True)
+    """
+    def calculate(self, state, calculator) -> float:
+        clip_max = self.params.get("clip_max", 2.0)
+        normalize = self.params.get("normalize", True)
+
+        # Get forward velocity in body frame projected onto forward direction
+        projected_forward_vel = np.dot(
+            state.accurate_vel_body, calculator.projected_forward_vec
+        )
+        
+        safe_clip_max = max(float(clip_max), 1e-6)
+        clipped_vel = np.clip(projected_forward_vel, 0.0, safe_clip_max)
+
+        if normalize:
+            return clipped_vel / safe_clip_max
+        return clipped_vel
+
+
 class LocalXVelocityComponent(RewardComponent):
     """
     Simple forward reward based on body-frame local x velocity.
@@ -678,6 +768,110 @@ class GlobalSpeedComponent(RewardComponent):
         if normalize:
             return clipped_speed / safe_clip_max
         return clipped_speed
+
+
+class WorldYVelocityTrackingComponent(RewardComponent):
+    """Tracks world-frame velocity along the global +y axis."""
+
+    def calculate(self, state, calculator) -> float:
+        target_vel = self.params.get("target_velocity", 0.6)
+        tracking_sigma = self.params.get("tracking_sigma", 0.15)
+
+        vel_world = getattr(state, "accurate_vel_world", None)
+        if vel_world is None:
+            vel_world = getattr(state, "vel_world", np.zeros(3))
+
+        y_vel = float(vel_world[1])
+        vel_error = np.square(target_vel - y_vel)
+        return np.exp(-vel_error / tracking_sigma)
+
+
+class OneHotVelocityTrackingComponent(RewardComponent):
+    """
+    Rewards tracking a target linear velocity along a commanded world direction.
+    The target world direction changes depending on the active one-hot steering command.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        target_vel = self.params.get("target_velocity", 0.8)
+        tracking_sigma = self.params.get("tracking_sigma", 0.2)
+        command_names = self.params.get(
+            "command_names", ["cmd_straight", "cmd_left", "cmd_right"]
+        )
+        directions = self.params.get(
+            "directions",
+            [
+                [0.0, 1.0, 0.0],   # North (+Y)
+                [-1.0, 0.0, 0.0],  # West (-X)
+                [1.0, 0.0, 0.0]    # East (+X)
+            ]
+        )
+
+        # Get active command index
+        active_idx = 0
+        try:
+            for i, name in enumerate(command_names):
+                if state.get_command_by_name(name) > 0.5:
+                    active_idx = i
+                    break
+        except (AttributeError, ValueError):
+            commands = getattr(state, "commands", np.array([1.0, 0.0, 0.0]))
+            for i, val in enumerate(commands[:len(command_names)]):
+                if val > 0.5:
+                    active_idx = i
+                    break
+
+        target_direction = np.asarray(directions[active_idx], dtype=np.float64)
+        target_direction = target_direction / (np.linalg.norm(target_direction) + 1e-8)
+
+        vel_world = getattr(state, "accurate_vel_world", None)
+        if vel_world is None:
+            vel_world = getattr(state, "vel_world", np.zeros(3))
+
+        # Project velocity onto target direction (XY plane)
+        projected_vel = float(np.dot(vel_world[:2], target_direction[:2]))
+
+        # Exponential tracking reward
+        vel_error = np.square(target_vel - projected_vel)
+        return np.exp(-vel_error / tracking_sigma)
+
+
+class WorldXVelocityPenaltyComponent(RewardComponent):
+    """Penalizes world-frame lateral drift along the global x axis."""
+
+    def calculate(self, state, calculator) -> float:
+        tracking_sigma = self.params.get("tracking_sigma", 0.10)
+
+        vel_world = getattr(state, "accurate_vel_world", None)
+        if vel_world is None:
+            vel_world = getattr(state, "vel_world", np.zeros(3))
+
+        x_vel = float(vel_world[0])
+        return -np.square(x_vel) / tracking_sigma
+
+
+class HeadingAlignmentComponent(RewardComponent):
+    """Rewards aligning the robot's forward heading with a target world direction."""
+
+    def calculate(self, state, calculator) -> float:
+        target_direction = np.asarray(
+            self.params.get("target_direction", [0.0, 1.0, 0.0]), dtype=np.float64
+        )
+        target_direction = target_direction / (np.linalg.norm(target_direction) + 1e-8)
+
+        body_forward = np.asarray(calculator.projected_forward_vec, dtype=np.float64)
+        world_forward = quat_apply(state.accurate_quat, body_forward)
+
+        world_forward_xy = world_forward[:2]
+        target_xy = target_direction[:2]
+
+        world_forward_xy = world_forward_xy / (
+            np.linalg.norm(world_forward_xy) + 1e-8
+        )
+        target_xy = target_xy / (np.linalg.norm(target_xy) + 1e-8)
+
+        alignment = float(np.dot(world_forward_xy, target_xy))
+        return 0.5 * (alignment + 1.0)
 
 
 class StateCoveringIntrinsicRewardComponent(RewardComponent):
@@ -795,6 +989,7 @@ COMPONENT_REGISTRY = {
     "orientation_reward": OrientationRewardComponent,
     "height_tracking": HeightTrackingComponent,
     "torso_contact_penalty": TorsoContactPenaltyComponent,
+    "low_height_penalty": LowHeightPenaltyComponent,
     "dof_position_tracking": DOFPositionTrackingComponent,
     "plateau_angular_velocity": PlateauAngularVelocityComponent,
     "plateau_spin": PlateauSpinComponent,
@@ -806,8 +1001,14 @@ COMPONENT_REGISTRY = {
     "windowed_displacement_efficiency": WindowedDisplacementEfficiencyComponent,
     "onehot_turning": OneHotTurningComponent,
     "onehot_forward": OneHotForwardComponent,
+    "onehot_heading": OneHotHeadingAlignmentComponent,
+    "onehot_velocity_tracking": OneHotVelocityTrackingComponent,
+    "projected_forward_velocity": ProjectedForwardVelocityComponent,
     "local_x_velocity": LocalXVelocityComponent,
     "global_speed": GlobalSpeedComponent,
+    "world_y_velocity_tracking": WorldYVelocityTrackingComponent,
+    "world_x_velocity_penalty": WorldXVelocityPenaltyComponent,
+    "heading_alignment": HeadingAlignmentComponent,
     "state_covering_intrinsic": StateCoveringIntrinsicRewardComponent,
 }
 
