@@ -205,6 +205,9 @@ class DerivedState:
         """Initialize DerivedState with specified number of degrees of freedom."""
         self.projected_gravities = np.zeros((num_dof, 3))
         self.projected_gravity = np.zeros(3)
+        self.height = np.zeros(1)
+        self.heading = np.zeros(1)
+        self.speed = np.zeros(1)
         self.local_vel_xy = np.zeros(2)
         self.yaw_rate = np.zeros(1)
 
