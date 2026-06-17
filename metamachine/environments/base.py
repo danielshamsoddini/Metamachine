@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -374,9 +375,9 @@ class Base(gym.Env, ABC):
         it will be used directly as the directory name. Otherwise, a directory name will be
         generated with date and component info.
         """
-        # If exp_name looks like a complete experiment name (contains date pattern), use it directly
-        if exp_name and "-" in exp_name and any(c.isdigit() for c in exp_name):
-            # exp_name is like "lego_tripod-20231223-222348", use directly
+        # Pre-formatted names embed YYYYMMDD, e.g. "lego_tripod-20231223-222348"
+        if exp_name and re.search(r"(?:^|[-_])\d{8}(?:[-_]|$)", exp_name):
+            # exp_name already includes a date stamp; use directly
             dir_name = exp_name
         else:
             # Generate directory name with date and component info (legacy behavior)

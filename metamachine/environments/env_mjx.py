@@ -52,6 +52,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
 import tempfile
+import re
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -242,7 +243,7 @@ class MJXMetaMachine:
     
     def _create_log_directory(self, log_dir: str, exp_name: Optional[str] = None) -> str:
         """Create a log directory with timestamp."""
-        if exp_name and "-" in exp_name and any(c.isdigit() for c in exp_name):
+        if exp_name and re.search(r"(?:^|[-_])\d{8}(?:[-_]|$)", exp_name):
             dir_name = exp_name
         else:
             date_str = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -883,6 +883,75 @@ class OneHotHeadingAlignmentComponent(RewardComponent):
         return 0.5 * (alignment + 1.0)
 
 
+def _resolve_hybrid_target_xy(state, params) -> np.ndarray:
+    """Resolve target travel direction from cardinal one-hot or cos/sin commands."""
+    command_names = params.get(
+        "command_names", ["cmd_straight", "cmd_left", "cmd_right"]
+    )
+    directions = params.get(
+        "directions",
+        [
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+    )
+
+    try:
+        for i, name in enumerate(command_names):
+            if state.get_command_by_name(name) > 0.5:
+                direction = np.asarray(directions[i], dtype=np.float64)
+                target_xy = direction[:2]
+                return target_xy / (np.linalg.norm(target_xy) + 1e-8)
+    except (AttributeError, ValueError):
+        commands = getattr(state, "commands", np.array([1.0, 0.0, 0.0]))
+        for i, val in enumerate(commands[: len(command_names)]):
+            if val > 0.5:
+                direction = np.asarray(directions[i], dtype=np.float64)
+                target_xy = direction[:2]
+                return target_xy / (np.linalg.norm(target_xy) + 1e-8)
+
+    cos_name = params.get("cos_command_name", "cmd_dir_cos")
+    sin_name = params.get("sin_command_name", "cmd_dir_sin")
+    cos_h = float(state.get_command_by_name(cos_name))
+    sin_h = float(state.get_command_by_name(sin_name))
+    target_xy = np.array([cos_h, sin_h], dtype=np.float64)
+    return target_xy / (np.linalg.norm(target_xy) + 1e-8)
+
+
+class HybridDirectionVelocityComponent(RewardComponent):
+    """Track velocity along cardinal one-hot or continuous commanded direction."""
+
+    def calculate(self, state, calculator) -> float:
+        target_vel = self.params.get("target_velocity", 0.8)
+        tracking_sigma = self.params.get("tracking_sigma", 0.2)
+        target_xy = _resolve_hybrid_target_xy(state, self.params)
+
+        vel_world = getattr(state, "accurate_vel_world", None)
+        if vel_world is None:
+            vel_world = getattr(state, "vel_world", np.zeros(3))
+
+        projected_vel = float(np.dot(np.asarray(vel_world)[:2], target_xy))
+        return np.exp(-np.square(target_vel - projected_vel) / tracking_sigma)
+
+
+class HybridDirectionHeadingComponent(RewardComponent):
+    """Align heading with cardinal one-hot or continuous commanded direction."""
+
+    def calculate(self, state, calculator) -> float:
+        target_xy = _resolve_hybrid_target_xy(state, self.params)
+
+        body_forward = np.asarray(calculator.projected_forward_vec, dtype=np.float64)
+        world_forward = quat_apply(state.accurate_quat, body_forward)
+        world_forward_xy = world_forward[:2]
+        world_forward_xy = world_forward_xy / (
+            np.linalg.norm(world_forward_xy) + 1e-8
+        )
+
+        alignment = float(np.dot(world_forward_xy, target_xy))
+        return 0.5 * (alignment + 1.0)
+
+
 class ProjectedForwardVelocityComponent(RewardComponent):
     """
     Rewards moving forward along the projected forward vector without a specific target, 
@@ -1203,6 +1272,8 @@ COMPONENT_REGISTRY = {
     "onehot_forward": OneHotForwardComponent,
     "onehot_heading": OneHotHeadingAlignmentComponent,
     "onehot_velocity_tracking": OneHotVelocityTrackingComponent,
+    "hybrid_direction_velocity": HybridDirectionVelocityComponent,
+    "hybrid_direction_heading": HybridDirectionHeadingComponent,
     "projected_forward_velocity": ProjectedForwardVelocityComponent,
     "local_x_velocity": LocalXVelocityComponent,
     "global_speed": GlobalSpeedComponent,
