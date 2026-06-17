@@ -159,7 +159,6 @@ class ActionFilterButter(ActionFilter):
           order: filter order
           num_joints: robot DOF
         """
-        highcut = [3.0]
         self.lowcut = (
             [float(x) for x in lowcut]
             if lowcut is not None
@@ -228,13 +227,13 @@ class ActionFilterButter(ActionFilter):
           b, a: parameters of a butterworth filter
         """
         # import ipdb; ipdb.set_trace()
-        nyq = 0.5 * fs
-        low = lowcut / nyq
-        high = highcut / nyq
+        nyq = 0.5 * float(fs)
+        low = float(lowcut) / nyq
+        high = float(highcut) / nyq
         if low:
             b, a = butter(order, [low, high], btype="band")
         else:
-            b, a = butter(order, [high], btype="low")
+            b, a = butter(order, high, btype="low")
         return b, a
 
 

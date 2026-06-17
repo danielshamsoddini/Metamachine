@@ -45,7 +45,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     "RewardComponentCallback",
-    "ProgressBarCallback", 
+    "ProgressBarCallback",
+    "resolve_env_log_dir",
+    "make_metamachine_vec_env",
     "setup_sb3_training",
     "SB3Trainer",
     "load_from_checkpoint",
@@ -54,6 +56,126 @@ __all__ = [
     "continue_training",
     "compare_configs",
 ]
+
+
+def resolve_env_log_dir(env: Any) -> Optional[str]:
+    """Return the primary log directory from a MetaMachine or SB3 VecEnv."""
+    if hasattr(env, "get_attr"):
+        try:
+            for log_dir in env.get_attr("_log_dir"):
+                if log_dir:
+                    return log_dir
+        except Exception:
+            pass
+    return getattr(env, "_log_dir", None)
+
+
+def _make_sb3_vec_render_compat(env: Any, video_cfg: dict[str, Any]) -> Any:
+    """Wrap MetaMachine so SB3 sees render_mode='none' while rank 0 records mp4."""
+    import gymnasium as gym
+
+    class _Compat(gym.Wrapper):
+        def __init__(self, wrapped: gym.Env, video_settings: dict[str, Any]) -> None:
+            super().__init__(wrapped)
+            inner = self.env
+            inner.render_mode = video_settings.get("render_mode", "mp4")
+            inner.sim_cfg.render_mode = inner.render_mode
+            inner.video_record_interval = video_settings.get(
+                "video_record_interval", 100
+            )
+            inner.video_name_pattern = video_settings.get(
+                "video_name_pattern", "episode_{episode}"
+            )
+            inner._setup_egl_environment()
+            inner._initialize_video_recording()
+
+        @property
+        def render_mode(self) -> str:
+            return "none"
+
+    return _Compat(env, video_cfg)
+
+
+def make_metamachine_vec_env(
+    config_path: str,
+    exp_name: str,
+    n_envs: int = 1,
+    seed: Optional[int] = 42,
+    vec_env_cls: str = "subproc",
+    parallel_render: bool = False,
+) -> "gym.Env":
+    """Create a MetaMachine environment, vectorized with SB3 when n_envs > 1."""
+    import tempfile
+
+    from metamachine.environments.configs.config_registry import ConfigRegistry
+    from metamachine.environments.env_sim import MetaMachine
+
+    config_path = os.path.abspath(config_path)
+    if n_envs <= 1:
+        cfg = ConfigRegistry.create_from_file(config_path)
+        cfg.logging.experiment_name = exp_name
+        return MetaMachine(cfg)
+
+    from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
+
+    def make_env(rank: int) -> Callable[[], "gym.Env"]:
+        def _init() -> "gym.Env":
+            cfg = ConfigRegistry.create_from_file(config_path)
+            cfg.logging.experiment_name = exp_name
+            is_primary = rank == 0
+
+            video_cfg = None
+            if is_primary and parallel_render:
+                video_cfg = {
+                    "render_mode": cfg.simulation.get("render_mode", "mp4"),
+                    "video_record_interval": cfg.simulation.get(
+                        "video_record_interval", 100
+                    ),
+                    "video_name_pattern": cfg.simulation.get(
+                        "video_name_pattern", "episode_{episode}"
+                    ),
+                }
+
+            # SB3 requires identical render_mode on every VecEnv worker.
+            cfg.simulation.render_mode = "none"
+            cfg.simulation.render = False
+            if not video_cfg:
+                cfg.simulation.video_record_interval = 0
+
+            if is_primary:
+                if not hasattr(cfg, "logging") or cfg.logging is None:
+                    from omegaconf import OmegaConf
+
+                    cfg.logging = OmegaConf.create({})
+                cfg.logging.create_log_dir = True
+                if not cfg.logging.get("data_dir"):
+                    cfg.logging.data_dir = "./logs"
+            else:
+                if not hasattr(cfg, "logging") or cfg.logging is None:
+                    from omegaconf import OmegaConf
+
+                    cfg.logging = OmegaConf.create({})
+                cfg.logging.create_log_dir = False
+                worker_tmp = os.path.join(
+                    tempfile.gettempdir(),
+                    "metamachine_workers",
+                    f"worker_{rank}_{os.getpid()}",
+                )
+                os.makedirs(worker_tmp, exist_ok=True)
+                cfg.logging.data_dir = worker_tmp
+
+            env = MetaMachine(cfg)
+            if video_cfg is not None:
+                return _make_sb3_vec_render_compat(env, video_cfg)
+            return env
+
+        return _init
+
+    vec_cls = DummyVecEnv if vec_env_cls == "dummy" else SubprocVecEnv
+    vec_env = VecMonitor(vec_cls([make_env(i) for i in range(n_envs)]))
+    if seed is not None:
+        vec_env.seed(seed)
+    return vec_env
 
 
 # =============================================================================
@@ -300,10 +422,15 @@ def setup_sb3_training(
     
     # Determine log directory
     if log_dir is None:
-        log_dir = getattr(env, "_log_dir", None)
+        log_dir = resolve_env_log_dir(env)
         if log_dir is None:
             log_dir = f"./logs/{exp_name.replace(' ', '_').lower()}"
             os.makedirs(log_dir, exist_ok=True)
+
+    n_envs = int(getattr(env, "num_envs", 1))
+    effective_checkpoint_freq = (
+        max(1, checkpoint_freq // n_envs) if checkpoint_freq > 0 else 0
+    )
     
     # Configure logger
     logger = configure(log_dir, logger_outputs)
@@ -313,9 +440,9 @@ def setup_sb3_training(
     callbacks = []
     
     # Checkpoint callback
-    if checkpoint_freq > 0:
+    if effective_checkpoint_freq > 0:
         checkpoint_cb = CheckpointCallback(
-            save_freq=checkpoint_freq,
+            save_freq=effective_checkpoint_freq,
             save_path=log_dir,
             name_prefix="rl_model",
             save_vecnormalize=True,
@@ -443,12 +570,13 @@ class SB3Trainer:
         
         # Determine log directory
         if log_dir is None:
-            self.log_dir = getattr(env, "_log_dir", None)
+            self.log_dir = resolve_env_log_dir(env)
             if self.log_dir is None:
                 self.log_dir = f"./logs/{exp_name.replace(' ', '_').lower()}"
         else:
             self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
+        self.n_envs = int(getattr(env, "num_envs", 1))
         
         # Get algorithm class
         if isinstance(algorithm, str):

@@ -101,6 +101,9 @@ class CommandManager:
         self.hybrid_cardinal_heading_mode = self.command_cfg.get(
             "hybrid_cardinal_heading_mode", False
         )
+        self.cardinal_heading_mode = self.command_cfg.get(
+            "cardinal_heading_mode", False
+        )
 
         # Initialize command specifications
         self._setup_command_specs()
@@ -233,6 +236,8 @@ class CommandManager:
         """
         if self.hybrid_cardinal_heading_mode:
             self._sample_hybrid_cardinal_heading_commands()
+        elif self.cardinal_heading_mode:
+            self._sample_cardinal_heading_commands()
         elif self.onehot_mode:
             # One-hot sampling: randomly select one command to be active
             self._sample_onehot_commands()
@@ -257,6 +262,28 @@ class CommandManager:
         # Randomly select one index to be active
         selected_idx = np.random.randint(self.num_commands)
         self.commands[selected_idx] = 1.0
+
+    def _sample_cardinal_heading_commands(self) -> None:
+        """Sample a random cardinal world heading into cos/sin command dims."""
+        directions = self.command_cfg.get(
+            "cardinal_directions",
+            [
+                [0.0, 1.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+            ],
+        )
+        cos_name = str(self.command_cfg.get("cos_command_name", "cmd_dir_cos"))
+        sin_name = str(self.command_cfg.get("sin_command_name", "cmd_dir_sin"))
+
+        self.commands = np.zeros(self.num_commands, dtype=np.float64)
+        direction = np.asarray(
+            directions[int(np.random.randint(len(directions)))], dtype=np.float64
+        )
+        heading = float(np.arctan2(direction[1], direction[0]))
+        self.commands[self.command_names.index(cos_name)] = float(np.cos(heading))
+        self.commands[self.command_names.index(sin_name)] = float(np.sin(heading))
 
     def _sample_hybrid_cardinal_heading_commands(self) -> None:
         """Sample cardinal one-hot targets or a random continuous heading.
