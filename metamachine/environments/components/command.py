@@ -104,6 +104,9 @@ class CommandManager:
         self.cardinal_heading_mode = self.command_cfg.get(
             "cardinal_heading_mode", False
         )
+        self.one_of_each_per_episode = bool(
+            self.command_cfg.get("one_of_each_per_episode", False)
+        )
 
         # Initialize command specifications
         self._setup_command_specs()
@@ -119,6 +122,10 @@ class CommandManager:
 
         # Initialize command vector
         self.commands = np.zeros(self.num_commands, dtype=object)
+        self._episode_direction_plan: list[int] = []
+        self._episode_plan_idx = 0
+        self._one_of_each_active = False
+        self._prepare_episode_direction_plan()
         self._sample_all_commands()
 
     def _setup_command_specs(self) -> None:
@@ -258,28 +265,140 @@ class CommandManager:
         """
         # Reset all commands to 0
         self.commands = np.zeros(self.num_commands, dtype=np.float64)
-        
-        # Randomly select one index to be active
-        selected_idx = np.random.randint(self.num_commands)
+
+        weights = self._get_cardinal_direction_weights(self.num_commands)
+        if (
+            self._one_of_each_active
+            and self._get_cardinal_direction_count() == self.num_commands
+        ):
+            selected_idx = self._sample_cardinal_direction_index()
+        else:
+            selected_idx = int(np.random.choice(self.num_commands, p=weights))
         self.commands[selected_idx] = 1.0
+
+    def _get_max_episode_steps(self) -> int:
+        """Episode horizon used for per-episode command planning."""
+        term = self.task_cfg.get("termination_conditions", {})
+        return int(term.get("max_episode_steps", 1000))
+
+    def _get_cardinal_direction_count(self) -> int:
+        """Number of cardinal directions in the active command mode."""
+        if self.cardinal_heading_mode or self.hybrid_cardinal_heading_mode:
+            directions = self.command_cfg.get(
+                "cardinal_directions", self._default_cardinal_directions()
+            )
+            return len(directions)
+        if self.onehot_mode:
+            return self.num_commands
+        return 0
+
+    def _one_of_each_per_episode_feasible(self) -> bool:
+        """True when each direction can occupy at least one resampling window."""
+        if not self.one_of_each_per_episode:
+            return False
+        if not (
+            self.cardinal_heading_mode
+            or self.hybrid_cardinal_heading_mode
+            or self.onehot_mode
+        ):
+            return False
+        n_directions = self._get_cardinal_direction_count()
+        if n_directions <= 0:
+            return False
+        if self.resampling_interval <= 0:
+            return False
+        return self.resampling_interval * n_directions <= self._get_max_episode_steps()
+
+    def _prepare_episode_direction_plan(self) -> None:
+        """Shuffle one instance of each cardinal direction for this episode."""
+        self._episode_plan_idx = 0
+        self._one_of_each_active = self._one_of_each_per_episode_feasible()
+        if self._one_of_each_active:
+            n_directions = self._get_cardinal_direction_count()
+            self._episode_direction_plan = np.random.permutation(n_directions).tolist()
+        else:
+            self._episode_direction_plan = []
+            if self.one_of_each_per_episode and not getattr(
+                self, "_warned_one_of_each_infeasible", False
+            ):
+                n_directions = self._get_cardinal_direction_count()
+                needed = self.resampling_interval * max(n_directions, 1)
+                print(
+                    "one_of_each_per_episode disabled for this config: "
+                    f"resampling_interval ({self.resampling_interval}) * "
+                    f"num_directions ({n_directions}) = {needed} > "
+                    f"max_episode_steps ({self._get_max_episode_steps()})"
+                )
+                self._warned_one_of_each_infeasible = True
+
+    def _default_cardinal_directions(self) -> list[list[float]]:
+        return [
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ]
+
+    def _get_cardinal_direction_weights(self, n_directions: int) -> np.ndarray:
+        """Sampling weights for cardinal_directions (or one-hot command indices)."""
+        weights_cfg = self.command_cfg.get("cardinal_direction_weights")
+        if weights_cfg is not None:
+            weights = np.asarray(weights_cfg, dtype=np.float64).reshape(-1)
+        else:
+            weights = np.ones(n_directions, dtype=np.float64)
+            south_weight = self.command_cfg.get("cardinal_oversample_south")
+            if south_weight is not None:
+                directions = np.asarray(
+                    self.command_cfg.get(
+                        "cardinal_directions", self._default_cardinal_directions()
+                    ),
+                    dtype=np.float64,
+                )
+                for i, direction in enumerate(directions):
+                    if np.allclose(direction[:2], [0.0, -1.0], atol=1e-6):
+                        if i < n_directions:
+                            weights[i] = float(south_weight)
+                        break
+
+        if weights.shape[0] != n_directions:
+            raise ValueError(
+                f"cardinal_direction_weights length ({weights.shape[0]}) must "
+                f"match number of directions ({n_directions})"
+            )
+        if np.any(weights < 0):
+            raise ValueError("cardinal_direction_weights must be non-negative")
+        total = float(weights.sum())
+        if total <= 0:
+            raise ValueError("cardinal_direction_weights must sum to a positive value")
+        return weights / total
+
+    def _sample_cardinal_direction_index(self) -> int:
+        directions = self.command_cfg.get(
+            "cardinal_directions", self._default_cardinal_directions()
+        )
+        n_directions = len(directions)
+        if (
+            self._one_of_each_active
+            and self._episode_plan_idx < len(self._episode_direction_plan)
+        ):
+            selected_idx = int(self._episode_direction_plan[self._episode_plan_idx])
+            self._episode_plan_idx += 1
+            return selected_idx
+
+        weights = self._get_cardinal_direction_weights(n_directions)
+        return int(np.random.choice(n_directions, p=weights))
 
     def _sample_cardinal_heading_commands(self) -> None:
         """Sample a random cardinal world heading into cos/sin command dims."""
         directions = self.command_cfg.get(
-            "cardinal_directions",
-            [
-                [0.0, 1.0, 0.0],
-                [-1.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [0.0, -1.0, 0.0],
-            ],
+            "cardinal_directions", self._default_cardinal_directions()
         )
         cos_name = str(self.command_cfg.get("cos_command_name", "cmd_dir_cos"))
         sin_name = str(self.command_cfg.get("sin_command_name", "cmd_dir_sin"))
 
         self.commands = np.zeros(self.num_commands, dtype=np.float64)
         direction = np.asarray(
-            directions[int(np.random.randint(len(directions)))], dtype=np.float64
+            directions[self._sample_cardinal_direction_index()], dtype=np.float64
         )
         heading = float(np.arctan2(direction[1], direction[0]))
         self.commands[self.command_names.index(cos_name)] = float(np.cos(heading))
@@ -313,7 +432,7 @@ class CommandManager:
         self.commands = np.zeros(self.num_commands, dtype=np.float64)
 
         if np.random.random() < cardinal_prob:
-            active_idx = int(np.random.randint(len(cardinal_names)))
+            active_idx = self._sample_cardinal_direction_index()
             for i, name in enumerate(cardinal_names):
                 self.commands[self.command_names.index(name)] = (
                     1.0 if i == active_idx else 0.0
@@ -364,6 +483,7 @@ class CommandManager:
         """Reset command manager to initial state."""
         self.step_count = 0
         self.last_resample_step = 0
+        self._prepare_episode_direction_plan()
         self._sample_all_commands()
 
     def set_command(self, index: int, value: float) -> None:

@@ -70,6 +70,15 @@ def resolve_env_log_dir(env: Any) -> Optional[str]:
     return getattr(env, "_log_dir", None)
 
 
+def _scale_video_record_interval_for_vec_env(
+    interval: int, n_envs: int, *, parallel_render: bool
+) -> int:
+    """Map YAML interval (global episodes) to rank-0 local episode cadence."""
+    if interval <= 0 or not parallel_render or n_envs <= 1:
+        return interval
+    return max(1, interval // n_envs)
+
+
 def _make_sb3_vec_render_compat(env: Any, video_cfg: dict[str, Any]) -> Any:
     """Wrap MetaMachine so SB3 sees render_mode='none' while rank 0 records mp4."""
     import gymnasium as gym
@@ -126,11 +135,21 @@ def make_metamachine_vec_env(
 
             video_cfg = None
             if is_primary and parallel_render:
+                base_interval = int(
+                    cfg.simulation.get("video_record_interval", 100)
+                )
+                scaled_interval = _scale_video_record_interval_for_vec_env(
+                    base_interval, n_envs, parallel_render=True
+                )
+                if base_interval > 0 and scaled_interval != base_interval:
+                    print(
+                        f"Video recording: every {base_interval} global episodes "
+                        f"-> rank-0 interval {scaled_interval} "
+                        f"({n_envs} parallel envs)"
+                    )
                 video_cfg = {
                     "render_mode": cfg.simulation.get("render_mode", "mp4"),
-                    "video_record_interval": cfg.simulation.get(
-                        "video_record_interval", 100
-                    ),
+                    "video_record_interval": scaled_interval,
                     "video_name_pattern": cfg.simulation.get(
                         "video_name_pattern", "episode_{episode}"
                     ),
