@@ -27,6 +27,7 @@ from metamachine.environments.components.reward import (
     ContactPenaltyComponent,
     DOFAccelerationPenaltyComponent,
     DOFVelocityPenaltyComponent,
+    HybridDirectionLateralPenaltyComponent,
     LinearVelocityTrackingComponent,
     RewardCalculator,
     RewardComponent,
@@ -235,6 +236,56 @@ class TestDOFAccelerationPenaltyComponent:
         # Divided by dt: (-2.0, 2.0, 0.0), squared: (4.0, 4.0, 0.0), sum: 8.0, negative: -8.0
         expected_reward = -8.0
         assert reward == pytest.approx(expected_reward)
+
+
+class TestHybridDirectionLateralPenaltyComponent:
+    """Test command-aligned lateral velocity penalty."""
+
+    def _component(self) -> HybridDirectionLateralPenaltyComponent:
+        return HybridDirectionLateralPenaltyComponent(
+            "lateral_drift_penalty",
+            weight=1.0,
+            tracking_sigma=0.10,
+            command_names=[],
+            cos_command_name="cmd_dir_cos",
+            sin_command_name="cmd_dir_sin",
+        )
+
+    def test_penalizes_lateral_velocity(self):
+        component = self._component()
+        state = Mock()
+        state.get_command_by_name = Mock(
+            side_effect=lambda name: 0.0 if name == "cmd_dir_cos" else 1.0
+        )
+        state.accurate_vel_world = np.array([0.3, 0.8, 0.0])
+
+        reward = component.calculate(state, Mock())
+
+        assert reward == pytest.approx(-0.9)
+
+    def test_no_penalty_along_command(self):
+        component = self._component()
+        state = Mock()
+        state.get_command_by_name = Mock(
+            side_effect=lambda name: 0.0 if name == "cmd_dir_cos" else 1.0
+        )
+        state.accurate_vel_world = np.array([0.0, 0.8, 0.0])
+
+        reward = component.calculate(state, Mock())
+
+        assert reward == pytest.approx(0.0)
+
+    def test_penalizes_lateral_for_x_command(self):
+        component = self._component()
+        state = Mock()
+        state.get_command_by_name = Mock(
+            side_effect=lambda name: 1.0 if name == "cmd_dir_cos" else 0.0
+        )
+        state.accurate_vel_world = np.array([0.8, 0.2, 0.0])
+
+        reward = component.calculate(state, Mock())
+
+        assert reward == pytest.approx(-0.4)
 
 
 class TestContactPenaltyComponent:

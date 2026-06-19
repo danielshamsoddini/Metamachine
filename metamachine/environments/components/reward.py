@@ -935,6 +935,23 @@ class HybridDirectionVelocityComponent(RewardComponent):
         return np.exp(-np.square(target_vel - projected_vel) / tracking_sigma)
 
 
+class HybridDirectionLateralPenaltyComponent(RewardComponent):
+    """Penalizes world-frame velocity perpendicular to the commanded travel direction."""
+
+    def calculate(self, state, calculator) -> float:
+        tracking_sigma = max(float(self.params.get("tracking_sigma", 0.10)), 1e-6)
+        target_xy = _resolve_hybrid_target_xy(state, self.params)
+
+        vel_world = getattr(state, "accurate_vel_world", None)
+        if vel_world is None:
+            vel_world = getattr(state, "vel_world", np.zeros(3))
+
+        vel_xy = np.asarray(vel_world, dtype=np.float64)[:2]
+        lateral_vel = vel_xy - np.dot(vel_xy, target_xy) * target_xy
+        lateral_speed_sq = float(np.dot(lateral_vel, lateral_vel))
+        return -lateral_speed_sq / tracking_sigma
+
+
 class HybridDirectionHeadingComponent(RewardComponent):
     """Align heading with cardinal one-hot or continuous commanded direction."""
 
@@ -1273,6 +1290,7 @@ COMPONENT_REGISTRY = {
     "onehot_heading": OneHotHeadingAlignmentComponent,
     "onehot_velocity_tracking": OneHotVelocityTrackingComponent,
     "hybrid_direction_velocity": HybridDirectionVelocityComponent,
+    "hybrid_direction_lateral_penalty": HybridDirectionLateralPenaltyComponent,
     "hybrid_direction_heading": HybridDirectionHeadingComponent,
     "projected_forward_velocity": ProjectedForwardVelocityComponent,
     "local_x_velocity": LocalXVelocityComponent,

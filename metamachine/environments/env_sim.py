@@ -1559,6 +1559,9 @@ class MetaMachine(Base, MujocoEnv):
             self.wheel_joint_indices = []
             self.wheel_action_scale = 1.0
 
+        # Baseline gains for domain randomization (preserves per-joint ratios).
+        self._nominal_kps = np.asarray(self.kps, dtype=np.float32).copy()
+        self._nominal_kds = np.asarray(self.kds, dtype=np.float32).copy()
 
     def _initialize_control_state(self) -> None:
         """Initialize control state tracking."""
@@ -2994,27 +2997,58 @@ class MetaMachine(Base, MujocoEnv):
         if self._log_dir is not None:
             self.xml_compiler.save(os.path.join(self._log_dir, "reloaded_robot_debug.xml"))
 
+    def _randomize_pd_gains(self, pd_cfg: dict) -> None:
+        """Randomize PD gains as a multiplicative scale around nominal per-joint values.
+
+        Like mass randomization, a single episode-level scale is drawn and applied to
+        every joint's nominal kp/kd so hip/ankle ratios from per_joint_control are
+        preserved. Legacy absolute kp_range/kd_range configs still work: the sampled
+        absolute value is converted to a scale relative to control.kp / control.kd.
+        """
+        base_kp = float(getattr(self.cfg.control, "kp", self.kp))
+        base_kd = float(getattr(self.cfg.control, "kd", self.kd))
+        nominal_kps = getattr(self, "_nominal_kps", None)
+        nominal_kds = getattr(self, "_nominal_kds", None)
+
+        percentage = pd_cfg.get("percentage")
+        if percentage is not None:
+            pct = float(percentage)
+            kp_scale = np.random.uniform(1.0 - pct, 1.0 + pct)
+            kd_scale = np.random.uniform(1.0 - pct, 1.0 + pct)
+        elif pd_cfg.get("scale_mode", False):
+            kp_scale = np.random.uniform(*pd_cfg.get("kp_range", [1.0, 1.0]))
+            kd_scale = np.random.uniform(*pd_cfg.get("kd_range", [1.0, 1.0]))
+        else:
+            kp_val = np.random.uniform(*pd_cfg.get("kp_range", [base_kp, base_kp]))
+            kd_val = np.random.uniform(*pd_cfg.get("kd_range", [base_kd, base_kd]))
+            kp_scale = kp_val / base_kp if base_kp != 0 else 1.0
+            kd_scale = kd_val / base_kd if base_kd != 0 else 1.0
+
+        self.kp = base_kp * kp_scale
+        self.kd = base_kd * kd_scale
+
+        if nominal_kps is not None:
+            self.kps = (nominal_kps * kp_scale).astype(np.float32)
+            self.kds = (nominal_kds * kd_scale).astype(np.float32)
+            if self.joint_control_modes is not None:
+                for i, mode in enumerate(self.joint_control_modes):
+                    if mode == "velocity":
+                        self.kps[i] = 0.0
+        else:
+            self.kps = np.full(
+                self.num_act * self.num_envs, self.kp, dtype=np.float32
+            )
+            self.kds = np.full(
+                self.num_act * self.num_envs, self.kd, dtype=np.float32
+            )
+
     def _apply_domain_randomization(self) -> None:
         """Apply domain randomization parameters."""
         # PD controller randomization
         randomization_cfg = getattr(self.cfg, "randomization", {})
         pd_cfg = randomization_cfg.get("pd_controller", {})
         if pd_cfg.get("enabled", False):
-            self.kp = np.random.uniform(*pd_cfg.get("kp_range", [8.0, 8.0]))
-            self.kd = np.random.uniform(*pd_cfg.get("kd_range", [0.2, 0.2]))
-            
-            # Preserve per-joint control settings when randomizing
-            if self.joint_control_modes is not None:
-                # Only randomize position-controlled joints
-                for i, mode in enumerate(self.joint_control_modes):
-                    if mode == 'position':
-                        self.kps[i] = self.kp
-                        self.kds[i] = self.kd
-                    # Velocity-controlled joints keep their original kd
-            else:
-                # Original behavior: uniform gains
-                self.kps = np.full(self.num_act * self.num_envs, self.kp, dtype=np.float32)
-                self.kds = np.full(self.num_act * self.num_envs, self.kd, dtype=np.float32)
+            self._randomize_pd_gains(pd_cfg)
 
         # Latency randomization
         if self.sim_cfg.get("random_latency_scheme", False):

@@ -834,18 +834,50 @@ class MJXMetaMachine:
             rng, key1, key2 = jax.random.split(rng, 3)
             kp_range = pd_cfg.get("kp_range", [6.0, 10.0])
             kd_range = pd_cfg.get("kd_range", [0.15, 0.3])
-            
-            # Randomize as scale or absolute value
-            if pd_cfg.get("scale_mode", False):
-                kp_scale = jax.random.uniform(key1, minval=kp_range[0], maxval=kp_range[1])
-                kd_scale = jax.random.uniform(key2, minval=kd_range[0], maxval=kd_range[1])
-                kp = self._original_kp * kp_scale
-                kd = self._original_kd * kd_scale
+
+            has_per_joint_gains = not jp.allclose(
+                self._original_kp, self._original_kp[0]
+            ) or not jp.allclose(self._original_kd, self._original_kd[0])
+            use_scale_mode = pd_cfg.get("scale_mode", False) or (
+                pd_cfg.get("percentage") is not None
+            ) or has_per_joint_gains
+
+            if pd_cfg.get("percentage") is not None:
+                pct = float(pd_cfg["percentage"])
+                kp_scale = jax.random.uniform(
+                    key1, minval=1.0 - pct, maxval=1.0 + pct
+                )
+                kd_scale = jax.random.uniform(
+                    key2, minval=1.0 - pct, maxval=1.0 + pct
+                )
+            elif use_scale_mode:
+                if pd_cfg.get("scale_mode", False):
+                    kp_scale = jax.random.uniform(
+                        key1, minval=kp_range[0], maxval=kp_range[1]
+                    )
+                    kd_scale = jax.random.uniform(
+                        key2, minval=kd_range[0], maxval=kd_range[1]
+                    )
+                else:
+                    kp_val = jax.random.uniform(
+                        key1, minval=kp_range[0], maxval=kp_range[1]
+                    )
+                    kd_val = jax.random.uniform(
+                        key2, minval=kd_range[0], maxval=kd_range[1]
+                    )
+                    base_kp = float(self.cfg.control.kp)
+                    base_kd = float(self.cfg.control.kd)
+                    kp_scale = kp_val / base_kp if base_kp != 0 else 1.0
+                    kd_scale = kd_val / base_kd if base_kd != 0 else 1.0
             else:
                 kp_val = jax.random.uniform(key1, minval=kp_range[0], maxval=kp_range[1])
                 kd_val = jax.random.uniform(key2, minval=kd_range[0], maxval=kd_range[1])
                 kp = jp.full_like(self._original_kp, kp_val)
                 kd = jp.full_like(self._original_kd, kd_val)
+                return model, kp, kd
+
+            kp = self._original_kp * kp_scale
+            kd = self._original_kd * kd_scale
         
         return model, kp, kd
     
