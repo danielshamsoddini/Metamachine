@@ -241,7 +241,7 @@ class TestDOFAccelerationPenaltyComponent:
 class TestHybridDirectionLateralPenaltyComponent:
     """Test command-aligned lateral velocity penalty."""
 
-    def _component(self) -> HybridDirectionLateralPenaltyComponent:
+    def _component(self, **kwargs) -> HybridDirectionLateralPenaltyComponent:
         return HybridDirectionLateralPenaltyComponent(
             "lateral_drift_penalty",
             weight=1.0,
@@ -249,10 +249,11 @@ class TestHybridDirectionLateralPenaltyComponent:
             command_names=[],
             cos_command_name="cmd_dir_cos",
             sin_command_name="cmd_dir_sin",
+            **kwargs,
         )
 
     def test_penalizes_lateral_velocity(self):
-        component = self._component()
+        component = self._component(mode="velocity")
         state = Mock()
         state.get_command_by_name = Mock(
             side_effect=lambda name: 0.0 if name == "cmd_dir_cos" else 1.0
@@ -264,7 +265,7 @@ class TestHybridDirectionLateralPenaltyComponent:
         assert reward == pytest.approx(-0.9)
 
     def test_no_penalty_along_command(self):
-        component = self._component()
+        component = self._component(mode="velocity")
         state = Mock()
         state.get_command_by_name = Mock(
             side_effect=lambda name: 0.0 if name == "cmd_dir_cos" else 1.0
@@ -276,7 +277,7 @@ class TestHybridDirectionLateralPenaltyComponent:
         assert reward == pytest.approx(0.0)
 
     def test_penalizes_lateral_for_x_command(self):
-        component = self._component()
+        component = self._component(mode="velocity")
         state = Mock()
         state.get_command_by_name = Mock(
             side_effect=lambda name: 1.0 if name == "cmd_dir_cos" else 0.0
@@ -286,6 +287,72 @@ class TestHybridDirectionLateralPenaltyComponent:
         reward = component.calculate(state, Mock())
 
         assert reward == pytest.approx(-0.4)
+
+    def test_windowed_ignores_oscillating_velocity(self):
+        component = self._component(
+            mode="windowed_displacement",
+            tracking_sigma=0.25,
+            window_size=4,
+            use_weld_cluster=False,
+        )
+        calculator = Mock()
+        calculator.dt = 0.05
+
+        state = Mock()
+        state.get_command_by_name = Mock(
+            side_effect=lambda name: 0.0 if name == "cmd_dir_cos" else 1.0
+        )
+        state.mj_model = None
+        state.mj_data = None
+        state.accurate = Mock()
+        state.raw = Mock()
+
+        positions = [
+            np.array([0.0, 0.0]),
+            np.array([0.1, 0.1]),
+            np.array([0.0, 0.2]),
+            np.array([0.0, 0.3]),
+        ]
+        rewards = []
+        for pos in positions:
+            state.accurate.pos_world = np.array([pos[0], pos[1], 0.0])
+            state.raw.pos_world = state.accurate.pos_world
+            rewards.append(component.calculate(state, calculator))
+
+        assert rewards[-1] == pytest.approx(0.0, abs=1e-6)
+
+    def test_windowed_penalizes_sustained_drift(self):
+        component = self._component(
+            mode="windowed_displacement",
+            tracking_sigma=0.25,
+            window_size=4,
+            use_weld_cluster=False,
+        )
+        calculator = Mock()
+        calculator.dt = 0.05
+
+        state = Mock()
+        state.get_command_by_name = Mock(
+            side_effect=lambda name: 0.0 if name == "cmd_dir_cos" else 1.0
+        )
+        state.mj_model = None
+        state.mj_data = None
+        state.accurate = Mock()
+        state.raw = Mock()
+
+        positions = [
+            np.array([0.0, 0.0]),
+            np.array([0.1, 0.1]),
+            np.array([0.2, 0.2]),
+            np.array([0.3, 0.3]),
+        ]
+        reward = 0.0
+        for pos in positions:
+            state.accurate.pos_world = np.array([pos[0], pos[1], 0.0])
+            state.raw.pos_world = state.accurate.pos_world
+            reward = component.calculate(state, calculator)
+
+        assert reward == pytest.approx(-0.36)
 
 
 class TestContactPenaltyComponent:

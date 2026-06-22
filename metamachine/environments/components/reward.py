@@ -936,9 +936,32 @@ class HybridDirectionVelocityComponent(RewardComponent):
 
 
 class HybridDirectionLateralPenaltyComponent(RewardComponent):
-    """Penalizes world-frame velocity perpendicular to the commanded travel direction."""
+    """Penalizes off-axis motion relative to the commanded travel direction.
 
-    def calculate(self, state, calculator) -> float:
+    Modes:
+    - windowed_displacement (default): net lateral displacement over a sliding
+      window. Allows step-to-step lateral oscillation during gait learning.
+    - velocity: instantaneous lateral speed (harsh; can block gait discovery).
+    """
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.pos_history: list[np.ndarray] = []
+
+    def _get_planar_position(self, state) -> np.ndarray:
+        use_weld_cluster = self.params.get("use_weld_cluster", False)
+        if use_weld_cluster and state.mj_model is not None and state.mj_data is not None:
+            from ...utils.mujoco_utils import get_largest_weld_cluster_average_pos
+
+            result = get_largest_weld_cluster_average_pos(state.mj_model, state.mj_data)
+            if result[1] is not None:
+                return np.asarray(result[1][:2], dtype=np.float32)
+
+        if state.accurate.pos_world is not None:
+            return np.asarray(state.accurate.pos_world[:2], dtype=np.float32)
+        return np.asarray(state.raw.pos_world[:2], dtype=np.float32)
+
+    def _lateral_velocity_penalty(self, state) -> float:
         tracking_sigma = max(float(self.params.get("tracking_sigma", 0.10)), 1e-6)
         target_xy = _resolve_hybrid_target_xy(state, self.params)
 
@@ -950,6 +973,37 @@ class HybridDirectionLateralPenaltyComponent(RewardComponent):
         lateral_vel = vel_xy - np.dot(vel_xy, target_xy) * target_xy
         lateral_speed_sq = float(np.dot(lateral_vel, lateral_vel))
         return -lateral_speed_sq / tracking_sigma
+
+    def _windowed_displacement_penalty(self, state, calculator) -> float:
+        tracking_sigma = max(float(self.params.get("tracking_sigma", 0.25)), 1e-6)
+        window_size = int(self.params.get("window_size", 50))
+        target_xy = _resolve_hybrid_target_xy(state, self.params)
+
+        self.pos_history.append(self._get_planar_position(state))
+        if len(self.pos_history) > window_size:
+            self.pos_history.pop(0)
+
+        if len(self.pos_history) < 2:
+            return 0.0
+
+        net_disp = self.pos_history[-1] - self.pos_history[0]
+        lateral_disp = net_disp - np.dot(net_disp, target_xy) * target_xy
+        lateral_drift_sq = float(np.dot(lateral_disp, lateral_disp))
+        return -lateral_drift_sq / tracking_sigma
+
+    def calculate(self, state, calculator) -> float:
+        mode = str(self.params.get("mode", "windowed_displacement")).lower()
+        if mode == "velocity":
+            return self._lateral_velocity_penalty(state)
+        if mode == "windowed_displacement":
+            return self._windowed_displacement_penalty(state, calculator)
+        raise ValueError(
+            f"Unknown hybrid_direction_lateral_penalty mode '{mode}'. "
+            "Use 'windowed_displacement' or 'velocity'."
+        )
+
+    def reset(self) -> None:
+        self.pos_history = []
 
 
 class HybridDirectionHeadingComponent(RewardComponent):
