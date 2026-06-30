@@ -3410,6 +3410,8 @@ class MetaMachine(Base, MujocoEnv):
         # Get current metrics
         # metrics = self._get_current_metrics()
         # np.array2string(self.state.action_history.last_action, precision=2, separator=',', suppress_small=True)
+        speed = float(np.asarray(self.state.speed).reshape(-1)[0])
+        height_z = float(np.asarray(self.state.height).reshape(-1)[0])
         metrics = {
             "Action": np.array2string(
                 self.state.action_history.last_action,
@@ -3418,10 +3420,18 @@ class MetaMachine(Base, MujocoEnv):
                 suppress_small=True,
             ),
             "Reward": f"{self.state.reward_history.last_reward:.2f}",
-            "Speed": f"{self.state.speed[0]:.2f}",
+            "Speed": f"{speed:.2f}",
+            "Height": f"{height_z:.3f}",
             "Step": self.step_count,
             "Episode": self.episode_counter + 1,
         }
+
+        vel_world = getattr(self.state, "vel_world", None)
+        if vel_world is not None:
+            vel_world = np.asarray(vel_world, dtype=np.float64).reshape(-1)
+            if vel_world.size >= 3:
+                metrics["Y-Vel"] = f"{vel_world[1]:.2f}"
+                metrics["Vz"] = f"{vel_world[2]:+.3f}"
 
         if self.goal_task_enabled and self.goal_position_world is not None:
             metrics["GoalDist"] = f"{self.goal_distance:.3f}"

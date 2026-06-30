@@ -58,16 +58,56 @@ __all__ = [
 ]
 
 
+def _unwrap_metamachine_env(env: Any) -> Any:
+    """Walk gym wrappers to the underlying MetaMachine env."""
+    seen: set[int] = set()
+    current = env
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if current.__class__.__name__ == "MetaMachine":
+            return current
+        current = getattr(current, "env", None)
+    return env
+
+
 def resolve_env_log_dir(env: Any) -> Optional[str]:
-    """Return the primary log directory from a MetaMachine or SB3 VecEnv."""
+    """Return the primary (rank-0) log directory from a MetaMachine or SB3 VecEnv."""
     if hasattr(env, "get_attr"):
         try:
-            for log_dir in env.get_attr("_log_dir"):
-                if log_dir:
-                    return log_dir
+            try:
+                log_dirs = env.get_attr("_log_dir", indices=[0])
+            except TypeError:
+                log_dirs = env.get_attr("_log_dir")
+            if log_dirs:
+                rank0 = log_dirs[0] if isinstance(log_dirs, list) else log_dirs
+                if rank0:
+                    return rank0
         except Exception:
             pass
-    return getattr(env, "_log_dir", None)
+    return getattr(_unwrap_metamachine_env(env), "_log_dir", None)
+
+
+def sync_env_log_dir(env: Any, log_dir: str) -> str:
+    """Point rank-0 MetaMachine logging/video output at the same folder as SB3."""
+    log_dir = os.path.abspath(log_dir)
+    os.makedirs(log_dir, exist_ok=True)
+    if hasattr(env, "set_attr"):
+        try:
+            try:
+                env.set_attr("_log_dir", log_dir, indices=[0])
+            except TypeError:
+                env.set_attr("_log_dir", log_dir)
+            try:
+                env.set_attr("video_path", log_dir, indices=[0])
+            except Exception:
+                pass
+        except Exception:
+            pass
+    inner = _unwrap_metamachine_env(env)
+    inner._log_dir = log_dir
+    if hasattr(inner, "video_path"):
+        inner.video_path = log_dir
+    return log_dir
 
 
 def _scale_video_record_interval_for_vec_env(
@@ -101,6 +141,22 @@ def _make_sb3_vec_render_compat(env: Any, video_cfg: dict[str, Any]) -> Any:
         @property
         def render_mode(self) -> str:
             return "none"
+
+        @property
+        def _log_dir(self) -> Optional[str]:
+            return self.env._log_dir
+
+        @_log_dir.setter
+        def _log_dir(self, value: Optional[str]) -> None:
+            self.env._log_dir = value
+
+        @property
+        def video_path(self) -> Optional[str]:
+            return self.env.video_path
+
+        @video_path.setter
+        def video_path(self, value: Optional[str]) -> None:
+            self.env.video_path = value
 
     return _Compat(env, video_cfg)
 
@@ -587,14 +643,14 @@ class SB3Trainer:
         self.exp_name = exp_name
         self.checkpoint_freq = checkpoint_freq
         
-        # Determine log directory
+        # Determine log directory (keep SB3 checkpoints and rank-0 videos together)
         if log_dir is None:
             self.log_dir = resolve_env_log_dir(env)
             if self.log_dir is None:
                 self.log_dir = f"./logs/{exp_name.replace(' ', '_').lower()}"
         else:
             self.log_dir = log_dir
-        os.makedirs(self.log_dir, exist_ok=True)
+        self.log_dir = sync_env_log_dir(env, self.log_dir)
         self.n_envs = int(getattr(env, "num_envs", 1))
         
         # Get algorithm class
@@ -754,14 +810,10 @@ class SB3Trainer:
         trainer.env = env
         trainer.exp_name = exp_name
         trainer.model = model
-        trainer.log_dir = new_log_dir or getattr(
-            env,
-            "_log_dir",
-            f"./logs/{exp_name.replace(' ', '_').lower()}",
-        )
-        os.makedirs(trainer.log_dir, exist_ok=True)
-        if hasattr(env, "_log_dir"):
-            env._log_dir = trainer.log_dir
+        trainer.log_dir = new_log_dir or resolve_env_log_dir(env)
+        if trainer.log_dir is None:
+            trainer.log_dir = f"./logs/{exp_name.replace(' ', '_').lower()}"
+        trainer.log_dir = sync_env_log_dir(env, trainer.log_dir)
         trainer.checkpoint_freq = kwargs.get("checkpoint_freq", 100000)
         
         # Setup callbacks for continued training
