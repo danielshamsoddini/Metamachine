@@ -76,8 +76,9 @@ class AngularVelocityTrackingComponent(RewardComponent):
         accurate_projected_gravity = quat_rotate_inverse(
             state.accurate_quat, calculator.gravity_vec
         )
+        # Match state.derived.yaw_rate: rotation about the gravity/up axis.
         projected_z_ang = np.dot(
-            state.accurate_ang_vel_body, accurate_projected_gravity
+            -accurate_projected_gravity, state.accurate_ang_vel_body
         )
         ang_vel_error = np.sum(np.square(target_ang_vel - projected_z_ang))
         return np.exp(-ang_vel_error / tracking_sigma)
@@ -118,18 +119,33 @@ class ContactFlightTimeComponent(RewardComponent):
         super().__init__(name, weight, **kwargs)
         self.contact_counter = {}
 
+    def _active_floor_contacts(self, state) -> list[int]:
+        contact_source = self.params.get("contact_source", "socks")
+        if contact_source == "geoms":
+            contacts = list(getattr(state, "contact_floor_geoms", []))
+        else:
+            contacts = list(getattr(state, "contact_floor_socks", []))
+
+        geom_filters = self.params.get("geom_name_contains")
+        if geom_filters and state.mj_model is not None:
+            contacts = [
+                geom
+                for geom in contacts
+                if any(token in state.mj_model.geom(geom).name for token in geom_filters)
+            ]
+        return contacts
+
     def calculate(self, state, calculator) -> float:
         allowed_contacts = self.params.get("allowed_num_contacts", 1)
+        active_contacts = self._active_floor_contacts(state)
 
         # Update contact counters
         for key in self.contact_counter:
             self.contact_counter[key] += 1
-        for c in state.contact_floor_socks:
-            self.contact_counter[c] = 0
+        for contact_geom in active_contacts:
+            self.contact_counter[contact_geom] = 0
 
-        if len(state.contact_floor_socks) >= allowed_contacts + 1 or len(
-            state.contact_floor_balls
-        ):
+        if len(active_contacts) >= allowed_contacts + 1:
             self.contact_counter = dict.fromkeys(self.contact_counter, 0)
 
         feet_air_time = np.array(list(self.contact_counter.values())) * calculator.dt
@@ -171,8 +187,28 @@ class DOFAccelerationPenaltyComponent(RewardComponent):
 class ContactPenaltyComponent(RewardComponent):
     """Penalizes unwanted contacts."""
 
+    def _active_floor_contacts(self, state) -> list[int]:
+        contact_source = self.params.get("contact_source", "balls")
+        if contact_source == "geoms":
+            contacts = list(getattr(state, "contact_floor_geoms", []))
+        elif contact_source == "joint_floor":
+            return []  # handled in calculate()
+        else:
+            contacts = list(getattr(state, "contact_floor_balls", []))
+
+        geom_filters = self.params.get("geom_name_contains")
+        if geom_filters and state.mj_model is not None:
+            contacts = [
+                geom
+                for geom in contacts
+                if any(token in state.mj_model.geom(geom).name for token in geom_filters)
+            ]
+        return contacts
+
     def calculate(self, state, calculator) -> float:
-        return -len(state.contact_floor_balls)
+        if self.params.get("contact_source") == "joint_floor":
+            return -float(getattr(state, "num_jointfloor_contact", 0))
+        return -len(self._active_floor_contacts(state))
 
 
 class JumpRewardComponent(RewardComponent):
@@ -690,7 +726,7 @@ class WindowedTurningCurveTrackingComponent(RewardComponent):
         )
 
         target_metric = target_turn_rate
-        actual_metric = actual_turn_rate
+        integrated_turn_rate = net_heading_change / max(time_elapsed, 1e-6)
         if (
             target_forward_speed is not None
             and abs(target_forward_speed) >= min_forward_speed
@@ -698,6 +734,10 @@ class WindowedTurningCurveTrackingComponent(RewardComponent):
         ):
             target_metric = target_turn_rate / target_forward_speed
             actual_metric = net_heading_change / path_len
+        else:
+            # Net rotation over the window, not mean |ω|. Stops in-place wiggle
+            # from earning spin reward without visible turning.
+            actual_metric = integrated_turn_rate
 
         tracking_reward = np.exp(-np.square(target_metric - actual_metric) / tracking_sigma)
 
