@@ -614,9 +614,17 @@ class WindowedTurningCurveTrackingComponent(RewardComponent):
     def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
         super().__init__(name, weight, **kwargs)
         self.pos_history: list[np.ndarray] = []
-        self.heading_history: list[float] = []
-        self._last_heading: float | None = None
-        self._unwrapped_heading: float | None = None
+        self.yaw_rate_history: list[float] = []
+
+    def _get_yaw_rate(self, state, calculator) -> float:
+        yaw_rate = getattr(state.derived, "yaw_rate", None)
+        if yaw_rate is not None:
+            return float(np.asarray(yaw_rate, dtype=np.float32).reshape(-1)[0])
+
+        accurate_projected_gravity = quat_rotate_inverse(
+            state.accurate_quat, calculator.gravity_vec
+        )
+        return float(np.dot(-accurate_projected_gravity, state.accurate_ang_vel_body))
 
     def _resolve_target(self, value: Any, state) -> float:
         if isinstance(value, str) and value.startswith("cmd:"):
@@ -648,39 +656,27 @@ class WindowedTurningCurveTrackingComponent(RewardComponent):
         min_path_length = float(self.params.get("min_path_length", 0.05))
         min_forward_speed = float(self.params.get("min_forward_speed", 0.05))
 
-        heading = float(np.asarray(state.derived.heading, dtype=np.float32).reshape(-1)[0])
         curr_pos = self._get_planar_position(state)
-
-        if self._last_heading is None or self._unwrapped_heading is None:
-            self._unwrapped_heading = heading
-        else:
-            heading_delta = normalize_angle(
-                np.array([heading - self._last_heading], dtype=np.float32)
-            )[0]
-            self._unwrapped_heading += float(heading_delta)
-        self._last_heading = heading
+        yaw_rate = self._get_yaw_rate(state, calculator)
 
         self.pos_history.append(curr_pos)
-        self.heading_history.append(float(self._unwrapped_heading))
+        self.yaw_rate_history.append(yaw_rate)
 
         if len(self.pos_history) > window_size:
             self.pos_history.pop(0)
-            self.heading_history.pop(0)
+            self.yaw_rate_history.pop(0)
 
         if len(self.pos_history) < 2:
             return 0.0
 
-        net_heading_change = self.heading_history[-1] - self.heading_history[0]
-        heading_path = sum(
-            abs(self.heading_history[i + 1] - self.heading_history[i])
-            for i in range(len(self.heading_history) - 1)
-        )
+        time_elapsed = calculator.dt * max(1, len(self.yaw_rate_history) - 1)
+        actual_turn_rate = float(np.mean(self.yaw_rate_history))
+        net_heading_change = float(np.sum(self.yaw_rate_history)) * calculator.dt
+        heading_path = float(np.sum(np.abs(self.yaw_rate_history))) * calculator.dt
         path_len = sum(
             np.linalg.norm(self.pos_history[i + 1] - self.pos_history[i])
             for i in range(len(self.pos_history) - 1)
         )
-        time_elapsed = calculator.dt * max(1, len(self.heading_history) - 1)
-        actual_turn_rate = net_heading_change / max(time_elapsed, 1e-6)
 
         target_turn_rate = self._resolve_target(
             self.params.get("target_turn_rate", 0.0),
@@ -716,9 +712,7 @@ class WindowedTurningCurveTrackingComponent(RewardComponent):
 
     def reset(self) -> None:
         self.pos_history = []
-        self.heading_history = []
-        self._last_heading = None
-        self._unwrapped_heading = None
+        self.yaw_rate_history = []
 
 
 class OneHotTurningComponent(RewardComponent):
