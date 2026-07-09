@@ -211,6 +211,37 @@ class ContactPenaltyComponent(RewardComponent):
         return -len(self._active_floor_contacts(state))
 
 
+class SingleLegSupportPenaltyComponent(RewardComponent):
+    """Penalizes the single-leg support exploit while spinning."""
+
+    def _active_floor_contacts(self, state) -> list[int]:
+        contact_source = self.params.get("contact_source", "geoms")
+        if contact_source == "geoms":
+            contacts = list(getattr(state, "contact_floor_geoms", []))
+        elif contact_source == "balls":
+            contacts = list(getattr(state, "contact_floor_balls", []))
+        elif contact_source == "socks":
+            contacts = list(getattr(state, "contact_floor_socks", []))
+        else:
+            contacts = list(getattr(state, "contact_floor_geoms", []))
+
+        geom_filters = self.params.get("geom_name_contains")
+        if geom_filters and state.mj_model is not None:
+            contacts = [
+                geom
+                for geom in contacts
+                if any(token in state.mj_model.geom(geom).name for token in geom_filters)
+            ]
+        return contacts
+
+    def calculate(self, state, calculator) -> float:
+        n_contacts = len(self._active_floor_contacts(state))
+        # Main exploit guard: leaning or tapping with exactly one foot.
+        if n_contacts == 1:
+            return -1.0
+        return 0.0
+
+
 class JumpRewardComponent(RewardComponent):
     """Rewards upward velocity."""
 
@@ -1353,6 +1384,7 @@ COMPONENT_REGISTRY = {
     "dof_velocity_penalty": DOFVelocityPenaltyComponent,
     "dof_acceleration_penalty": DOFAccelerationPenaltyComponent,
     "contact_penalty": ContactPenaltyComponent,
+    "single_leg_support_penalty": SingleLegSupportPenaltyComponent,
     "jump_reward": JumpRewardComponent,
     "orientation_reward": OrientationRewardComponent,
     "height_tracking": HeightTrackingComponent,
