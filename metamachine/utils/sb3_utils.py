@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "RewardComponentCallback",
+    "RewardPlotCallback",
     "ProgressBarCallback",
     "resolve_env_log_dir",
     "make_metamachine_vec_env",
@@ -85,6 +86,93 @@ def resolve_env_log_dir(env: Any) -> Optional[str]:
         except Exception:
             pass
     return getattr(_unwrap_metamachine_env(env), "_log_dir", None)
+
+
+def _get_logging_cfg_from_env(env: Any) -> dict[str, Any]:
+    """Read logging settings from rank-0 MetaMachine config when available."""
+    if hasattr(env, "get_attr"):
+        try:
+            try:
+                cfgs = env.get_attr("cfg", indices=[0])
+            except TypeError:
+                cfgs = env.get_attr("cfg")
+            if cfgs:
+                cfg = cfgs[0] if isinstance(cfgs, list) else cfgs
+                if cfg is not None and hasattr(cfg, "get"):
+                    logging_cfg = cfg.get("logging", {})
+                    if logging_cfg is not None:
+                        return dict(logging_cfg)
+        except Exception:
+            pass
+
+    inner = _unwrap_metamachine_env(env)
+    if inner is not None and hasattr(inner, "cfg"):
+        logging_cfg = inner.cfg.get("logging", {})
+        if logging_cfg is not None:
+            return dict(logging_cfg)
+    return {}
+
+
+def _get_rank0_env_attr(env: Any, attr: str, default: Any = None) -> Any:
+    """Read an attribute from the rank-0 VecEnv worker when available."""
+    if hasattr(env, "get_attr"):
+        try:
+            try:
+                values = env.get_attr(attr, indices=[0])
+            except TypeError:
+                values = env.get_attr(attr)
+            if values:
+                return values[0] if isinstance(values, list) else values
+        except Exception:
+            pass
+
+    inner = _unwrap_metamachine_env(env)
+    return getattr(inner, attr, default)
+
+
+def _get_simulation_cfg_from_env(env: Any) -> dict[str, Any]:
+    """Read simulation settings from rank-0 MetaMachine config when available."""
+    if hasattr(env, "get_attr"):
+        try:
+            try:
+                cfgs = env.get_attr("cfg", indices=[0])
+            except TypeError:
+                cfgs = env.get_attr("cfg")
+            if cfgs:
+                cfg = cfgs[0] if isinstance(cfgs, list) else cfgs
+                if cfg is not None and hasattr(cfg, "get"):
+                    simulation_cfg = cfg.get("simulation", {})
+                    if simulation_cfg is not None:
+                        return dict(simulation_cfg)
+        except Exception:
+            pass
+
+    inner = _unwrap_metamachine_env(env)
+    if inner is not None and hasattr(inner, "cfg"):
+        simulation_cfg = inner.cfg.get("simulation", {})
+        if simulation_cfg is not None:
+            return dict(simulation_cfg)
+    return {}
+
+
+def _get_video_record_interval_from_env(env: Any) -> int:
+    """Return the rank-0 video cadence used during training, if any."""
+    interval = _get_rank0_env_attr(env, "video_record_interval")
+    if interval is not None:
+        return int(interval)
+    return int(_get_simulation_cfg_from_env(env).get("video_record_interval", 0))
+
+
+def _crossed_video_save_boundary(
+    last_saved_counter: int, current_counter: int, interval: int
+) -> bool:
+    """True when rank-0 has finished an episode that wrote a video since last save."""
+    if interval <= 0 or current_counter <= last_saved_counter:
+        return False
+    for counter in range(last_saved_counter + 1, current_counter + 1):
+        if counter == 1 or (counter > 0 and counter % interval == 0):
+            return True
+    return False
 
 
 def sync_env_log_dir(env: Any, log_dir: str) -> str:
@@ -168,6 +256,7 @@ def make_metamachine_vec_env(
     seed: Optional[int] = 42,
     vec_env_cls: str = "subproc",
     parallel_render: bool = False,
+    video_name_pattern: Optional[str] = None,
 ) -> "gym.Env":
     """Create a MetaMachine environment, vectorized with SB3 when n_envs > 1."""
     import tempfile
@@ -179,6 +268,8 @@ def make_metamachine_vec_env(
     if n_envs <= 1:
         cfg = ConfigRegistry.create_from_file(config_path)
         cfg.logging.experiment_name = exp_name
+        if video_name_pattern is not None:
+            cfg.simulation.video_name_pattern = video_name_pattern
         return MetaMachine(cfg)
 
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
@@ -187,6 +278,8 @@ def make_metamachine_vec_env(
         def _init() -> "gym.Env":
             cfg = ConfigRegistry.create_from_file(config_path)
             cfg.logging.experiment_name = exp_name
+            if video_name_pattern is not None:
+                cfg.simulation.video_name_pattern = video_name_pattern
             is_primary = rank == 0
 
             video_cfg = None
@@ -442,6 +535,183 @@ class EpisodeStatsCallback:
         return _EpisodeStatsCallback(verbose)
 
 
+class RewardPlotCallback:
+    """Save rollout reward curves to the training log directory."""
+
+    def __new__(cls, log_dir: str, env: Any = None, verbose: int = 0):
+        from stable_baselines3.common.callbacks import BaseCallback
+
+        class _RewardPlotCallback(BaseCallback):
+            def __init__(self, log_dir: str, env: Any = None, verbose: int = 0):
+                super().__init__(verbose)
+                self._env_ref = env
+                self.log_dir = os.path.abspath(log_dir)
+                os.makedirs(self.log_dir, exist_ok=True)
+                self.csv_path = os.path.join(self.log_dir, "reward_over_time.csv")
+                self.plot_path = os.path.join(self.log_dir, "reward_over_time.png")
+                self.video_record_interval = _get_video_record_interval_from_env(env)
+                self._last_saved_episode_counter = 0
+                self.timesteps: list[int] = []
+                self.rollout_ep_rew_mean: list[float] = []
+                self.episode_total_reward: list[float] = []
+                self.reward_components: dict[str, list[float]] = {}
+
+            def _record_metrics(self) -> None:
+                name_to_value = getattr(self.logger, "name_to_value", {}) or {}
+                self.timesteps.append(int(self.num_timesteps))
+
+                rollout_mean = name_to_value.get("rollout/ep_rew_mean")
+                self.rollout_ep_rew_mean.append(
+                    float(rollout_mean) if rollout_mean is not None else float("nan")
+                )
+
+                episode_mean = name_to_value.get("episode/total_reward")
+                self.episode_total_reward.append(
+                    float(episode_mean) if episode_mean is not None else float("nan")
+                )
+
+                updated_components: set[str] = set()
+                for key, value in name_to_value.items():
+                    if not key.startswith("reward/"):
+                        continue
+                    comp_name = key[len("reward/") :]
+                    self.reward_components.setdefault(comp_name, []).append(float(value))
+                    updated_components.add(comp_name)
+
+                for comp_name in self.reward_components:
+                    if comp_name not in updated_components:
+                        self.reward_components[comp_name].append(float("nan"))
+
+            def _save_csv(self) -> None:
+                import csv
+
+                component_names = sorted(self.reward_components.keys())
+                fieldnames = [
+                    "timesteps",
+                    "rollout_ep_rew_mean",
+                    "episode_total_reward",
+                    *component_names,
+                ]
+                with open(self.csv_path, "w", newline="") as fp:
+                    writer = csv.DictWriter(fp, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for idx, timestep in enumerate(self.timesteps):
+                        row = {
+                            "timesteps": timestep,
+                            "rollout_ep_rew_mean": self.rollout_ep_rew_mean[idx],
+                            "episode_total_reward": self.episode_total_reward[idx],
+                        }
+                        for comp_name in component_names:
+                            values = self.reward_components[comp_name]
+                            row[comp_name] = values[idx] if idx < len(values) else ""
+                        writer.writerow(row)
+
+            def _save_plot(self) -> None:
+                if not self.timesteps:
+                    return
+
+                import matplotlib
+
+                try:
+                    if matplotlib.get_backend().lower() != "agg":
+                        matplotlib.use("Agg", force=True)
+                except Exception:
+                    pass
+
+                import matplotlib.pyplot as plt
+                import numpy as np
+
+                x = np.asarray(self.timesteps, dtype=np.int64)
+                fig, axes = plt.subplots(
+                    2 if self.reward_components else 1,
+                    1,
+                    figsize=(10, 8 if self.reward_components else 4),
+                    sharex=True,
+                    squeeze=False,
+                )
+                ax_total = axes[0, 0]
+                ax_total.plot(
+                    x,
+                    self.rollout_ep_rew_mean,
+                    label="rollout/ep_rew_mean",
+                    linewidth=2.0,
+                )
+                if any(np.isfinite(self.episode_total_reward)):
+                    ax_total.plot(
+                        x,
+                        self.episode_total_reward,
+                        label="episode/total_reward",
+                        linewidth=1.5,
+                        alpha=0.8,
+                    )
+                ax_total.set_title("Training Reward Over Time")
+                ax_total.set_ylabel("Reward")
+                ax_total.grid(True, linestyle="--", alpha=0.4)
+                ax_total.legend(loc="best")
+
+                if self.reward_components:
+                    ax_components = axes[1, 0]
+                    for comp_name in sorted(self.reward_components.keys()):
+                        ax_components.plot(
+                            x,
+                            self.reward_components[comp_name],
+                            label=comp_name,
+                            linewidth=1.5,
+                            alpha=0.9,
+                        )
+                    ax_components.set_title("Reward Components Over Time")
+                    ax_components.set_xlabel("Timesteps")
+                    ax_components.set_ylabel("Component value")
+                    ax_components.grid(True, linestyle="--", alpha=0.4)
+                    ax_components.legend(loc="best", fontsize=8)
+                else:
+                    ax_total.set_xlabel("Timesteps")
+
+                fig.tight_layout()
+                fig.savefig(self.plot_path, bbox_inches="tight", dpi=150)
+                plt.close(fig)
+
+            def _on_step(self) -> bool:
+                return True
+
+            def _on_training_start(self) -> None:
+                env = getattr(self, "training_env", None) or self._env_ref
+                self.video_record_interval = _get_video_record_interval_from_env(env)
+
+            def _should_write_files(self) -> bool:
+                interval = self.video_record_interval
+                if interval <= 0:
+                    return False
+
+                env = getattr(self, "training_env", None) or self._env_ref
+                episode_counter = _get_rank0_env_attr(env, "episode_counter")
+                if episode_counter is None:
+                    return False
+
+                episode_counter = int(episode_counter)
+                if not _crossed_video_save_boundary(
+                    self._last_saved_episode_counter, episode_counter, interval
+                ):
+                    return False
+
+                self._last_saved_episode_counter = episode_counter
+                return True
+
+            def _on_rollout_end(self) -> None:
+                self._record_metrics()
+                if self._should_write_files():
+                    self._save_csv()
+                    self._save_plot()
+
+            def _on_training_end(self) -> None:
+                self._save_csv()
+                self._save_plot()
+                if self.verbose:
+                    print(f"[RewardPlot] Saved reward curves to {self.plot_path}")
+
+        return _RewardPlotCallback(log_dir=log_dir, env=env, verbose=verbose)
+
+
 # =============================================================================
 # Setup Functions
 # =============================================================================
@@ -456,6 +726,7 @@ def setup_sb3_training(
     show_progress_bar: bool = True,
     terminal_status_freq: int = 10000,
     log_episode_stats: bool = True,
+    plot_reward_over_time: Optional[bool] = None,
     logger_outputs: List[str] = ["stdout", "csv", "tensorboard"],
     extra_callbacks: Optional[List["BaseCallback"]] = None,
 ) -> List["BaseCallback"]:
@@ -550,6 +821,13 @@ def setup_sb3_training(
     if log_episode_stats:
         stats_cb = EpisodeStatsCallback()
         callbacks.append(stats_cb)
+
+    if plot_reward_over_time is None:
+        plot_reward_over_time = bool(
+            _get_logging_cfg_from_env(env).get("plot_reward_over_time", False)
+        )
+    if plot_reward_over_time:
+        callbacks.append(RewardPlotCallback(log_dir=log_dir, env=env))
     
     # Add extra callbacks
     if extra_callbacks:
