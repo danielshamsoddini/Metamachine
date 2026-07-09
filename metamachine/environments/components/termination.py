@@ -27,6 +27,7 @@ class TerminationStrategy(Enum):
     BALLANCE_UPSIDEDOWN = "ballance_upsidedown"
     BALLANCE_UP = "ballance_up"
     BALLANCE_AUTO = "ballance_auto"
+    BALLANCE_AUTO_OR_BODY_CONTACT_FLOOR = "ballance_auto_or_body_contact_floor"
     TORSO_FALL = "torso_fall"
     THREE_FEET = "three_feet"
     BALL_FALL = "ball_fall"
@@ -114,6 +115,8 @@ class TerminationChecker:
             TerminationStrategy.BALLANCE_UPSIDEDOWN: self._check_ballance_upsidedown,
             TerminationStrategy.BALLANCE_UP: self._check_ballance_up,
             TerminationStrategy.BALLANCE_AUTO: self._check_ballance_auto,
+            TerminationStrategy.BALLANCE_AUTO_OR_BODY_CONTACT_FLOOR:
+                self._check_ballance_auto_or_body_contact_floor,
             TerminationStrategy.TORSO_FALL: self._check_torso_fall,
             TerminationStrategy.THREE_FEET: self._check_three_feet,
             TerminationStrategy.BALL_FALL: self._check_ball_fall,
@@ -233,6 +236,10 @@ class TerminationChecker:
             )
             < self.orientation_threshold
         )
+
+    def _check_ballance_auto_or_body_contact_floor(self, state) -> bool:
+        """Terminate if balance is lost or any configured body/geom contacts floor."""
+        return self._check_ballance_auto(state) or self._check_body_contact_floor(state)
 
     def _check_torso_fall(self, state) -> bool:
         return bool(1 in state.contact_floor_balls or 20 in state.contact_floor_balls)
