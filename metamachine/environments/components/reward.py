@@ -211,6 +211,64 @@ class ContactPenaltyComponent(RewardComponent):
         return -len(self._active_floor_contacts(state))
 
 
+class TimedContactPenaltyComponent(ContactPenaltyComponent):
+    """Penalize selected floor contacts only after an initial grace period."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        if calculator.step_counter * calculator.dt < start_time:
+            return 0.0
+        return super().calculate(state, calculator)
+
+
+class TimedAirborneSpinComponent(RewardComponent):
+    """Reward commanded yaw only while airborne, after a launch period."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        if calculator.step_counter * calculator.dt < start_time:
+            return 0.0
+
+        contacts = list(getattr(state, "contact_floor_geoms", []))
+        filters = self.params.get("geom_name_contains")
+        if filters and state.mj_model is not None:
+            contacts = [
+                geom
+                for geom in contacts
+                if any(token in state.mj_model.geom(geom).name for token in filters)
+            ]
+        if contacts:
+            return 0.0
+
+        target = self.params.get("target_angular_velocity", 0.0)
+        if isinstance(target, str) and target.startswith("cmd:"):
+            target = state.get_command_by_name(target[4:])
+        sigma = float(self.params.get("tracking_sigma", 0.01))
+        projected_gravity = quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
+        yaw_rate = np.dot(-projected_gravity, state.accurate_ang_vel_body)
+        return float(np.exp(-np.square(float(target) - yaw_rate) / sigma))
+
+
+class TimedHeightTrackingComponent(RewardComponent):
+    """Apply height tracking only during a configured time interval."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        end_time = self.params.get("end_time")
+        elapsed = calculator.step_counter * calculator.dt
+        if elapsed < start_time or (end_time is not None and elapsed >= float(end_time)):
+            return 0.0
+        desired_height = self.params.get("desired_height")
+        if desired_height is None or desired_height == -1:
+            desired_height = state.sim_init_pos[2]
+        tracking_sigma = self.params.get("tracking_sigma", 0.005)
+        return isaac_reward(
+            desired_height,
+            state.accurate_pos_world[2],
+            tracking_sigma,
+        )
+
+
 class SingleLegSupportPenaltyComponent(RewardComponent):
     """Penalizes the single-leg support exploit while spinning."""
 
@@ -1249,6 +1307,20 @@ class WorldXVelocityPenaltyComponent(RewardComponent):
         return -np.square(x_vel) / tracking_sigma
 
 
+class WorldYVelocityPenaltyComponent(RewardComponent):
+    """Penalizes world-frame drift along the global y axis."""
+
+    def calculate(self, state, calculator) -> float:
+        tracking_sigma = self.params.get("tracking_sigma", 0.10)
+
+        vel_world = getattr(state, "accurate_vel_world", None)
+        if vel_world is None:
+            vel_world = getattr(state, "vel_world", np.zeros(3))
+
+        y_vel = float(vel_world[1])
+        return -np.square(y_vel) / tracking_sigma
+
+
 class HeadingAlignmentComponent(RewardComponent):
     """Rewards aligning the robot's forward heading with a target world direction."""
 
@@ -1384,6 +1456,9 @@ COMPONENT_REGISTRY = {
     "dof_velocity_penalty": DOFVelocityPenaltyComponent,
     "dof_acceleration_penalty": DOFAccelerationPenaltyComponent,
     "contact_penalty": ContactPenaltyComponent,
+    "timed_contact_penalty": TimedContactPenaltyComponent,
+    "timed_airborne_spin": TimedAirborneSpinComponent,
+    "timed_height_tracking": TimedHeightTrackingComponent,
     "single_leg_support_penalty": SingleLegSupportPenaltyComponent,
     "jump_reward": JumpRewardComponent,
     "orientation_reward": OrientationRewardComponent,
@@ -1417,6 +1492,7 @@ COMPONENT_REGISTRY = {
     "global_speed": GlobalSpeedComponent,
     "world_y_velocity_tracking": WorldYVelocityTrackingComponent,
     "world_x_velocity_penalty": WorldXVelocityPenaltyComponent,
+    "world_y_velocity_penalty": WorldYVelocityPenaltyComponent,
     "heading_alignment": HeadingAlignmentComponent,
     "state_covering_intrinsic": StateCoveringIntrinsicRewardComponent,
 }

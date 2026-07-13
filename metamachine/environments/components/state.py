@@ -561,6 +561,28 @@ class State:
         "last_last_last_reward": lambda s: s.reward_history.last_last_last_reward,
         "reward_history": lambda s: s.reward_history.get_history_vector(),
         "commands": lambda s: s.commands,
+        # Per-episode phase features for tasks with time-dependent objectives.
+        # phase_transition_time is configured in observation (seconds).
+        "launch_phase": lambda s: np.array([
+            float(
+                s.step_counter * s.dt
+                < float(getattr(s.cfg.observation, "phase_transition_time", 0.0))
+            )
+        ]),
+        "phase_progress": lambda s: np.array([
+            min(
+                s.step_counter * s.dt
+                / max(float(getattr(s.cfg.observation, "phase_transition_time", 1.0)), 1e-6),
+                1.0,
+            )
+        ]),
+        "preflight_phase": lambda s: np.array([
+            float(
+                float(getattr(s.cfg.observation, "preflight_start_time", 0.0))
+                <= s.step_counter * s.dt
+                < float(getattr(s.cfg.observation, "phase_transition_time", 0.0))
+            )
+        ]),
         "vel_body": lambda s: s.raw.vel_body,
         "height": lambda s: s.derived.height,
         "heading": lambda s: s.derived.heading,
