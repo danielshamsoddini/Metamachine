@@ -1146,6 +1146,33 @@ class HybridDirectionHeadingComponent(RewardComponent):
         return 0.5 * (alignment + 1.0)
 
 
+class HybridDirectionYawTrackingComponent(RewardComponent):
+    """Reward yawing toward the commanded world heading."""
+
+    def calculate(self, state, calculator) -> float:
+        target_xy = _resolve_hybrid_target_xy(state, self.params)
+
+        body_forward = np.asarray(calculator.projected_forward_vec, dtype=np.float64)
+        world_forward = quat_apply(state.accurate_quat, body_forward)
+        forward_xy = world_forward[:2]
+        forward_xy = forward_xy / (np.linalg.norm(forward_xy) + 1e-8)
+
+        cross_z = float(forward_xy[0] * target_xy[1] - forward_xy[1] * target_xy[0])
+        dot = float(np.clip(np.dot(forward_xy, target_xy), -1.0, 1.0))
+        heading_error = float(np.arctan2(cross_z, dot))
+
+        turn_gain = float(self.params.get("turn_gain", 2.0))
+        max_yaw_rate = abs(float(self.params.get("max_yaw_rate", 1.2)))
+        desired_yaw_rate = float(
+            np.clip(turn_gain * heading_error, -max_yaw_rate, max_yaw_rate)
+        )
+
+        tracking_sigma = max(float(self.params.get("tracking_sigma", 0.15)), 1e-6)
+        projected_gravity = quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
+        yaw_rate = float(np.dot(-projected_gravity, state.accurate_ang_vel_body))
+        return float(np.exp(-np.square(desired_yaw_rate - yaw_rate) / tracking_sigma))
+
+
 class ProjectedForwardVelocityComponent(RewardComponent):
     """
     Rewards moving forward along the projected forward vector without a specific target, 
@@ -1487,6 +1514,7 @@ COMPONENT_REGISTRY = {
     "hybrid_direction_velocity": HybridDirectionVelocityComponent,
     "hybrid_direction_lateral_penalty": HybridDirectionLateralPenaltyComponent,
     "hybrid_direction_heading": HybridDirectionHeadingComponent,
+    "hybrid_direction_yaw_tracking": HybridDirectionYawTrackingComponent,
     "projected_forward_velocity": ProjectedForwardVelocityComponent,
     "local_x_velocity": LocalXVelocityComponent,
     "global_speed": GlobalSpeedComponent,
