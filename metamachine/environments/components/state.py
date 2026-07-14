@@ -197,6 +197,8 @@ class DerivedState:
     projected_gravity: np.ndarray = field(default_factory=lambda: np.zeros(3))
     projected_gravities: np.ndarray = field(default_factory=lambda: np.zeros((1, 3)))
     heading: np.ndarray = field(default_factory=lambda: np.zeros(1))
+    heading_error: np.ndarray = field(default_factory=lambda: np.zeros(1))
+    initial_heading: np.ndarray = field(default_factory=lambda: np.zeros(1))
     speed: np.ndarray = field(default_factory=lambda: np.zeros(1))
     local_vel_xy: np.ndarray = field(default_factory=lambda: np.zeros(2))
     yaw_rate: np.ndarray = field(default_factory=lambda: np.zeros(1))
@@ -207,6 +209,8 @@ class DerivedState:
         self.projected_gravity = np.zeros(3)
         self.height = np.zeros(1)
         self.heading = np.zeros(1)
+        self.heading_error = np.zeros(1)
+        self.initial_heading = np.zeros(1)
         self.speed = np.zeros(1)
         self.local_vel_xy = np.zeros(2)
         self.yaw_rate = np.zeros(1)
@@ -586,6 +590,11 @@ class State:
         "vel_body": lambda s: s.raw.vel_body,
         "height": lambda s: s.derived.height,
         "heading": lambda s: s.derived.heading,
+        # Explicit global-heading alias plus the target-relative heading error.
+        # Both are angular scalars and are normally observed through sin/cos.
+        "global_heading": lambda s: s.derived.heading,
+        "heading_error": lambda s: s.derived.heading_error,
+        "initial_heading": lambda s: s.derived.initial_heading,
         "speed": lambda s: s.derived.speed,
         "local_vel_xy": lambda s: s.derived.local_vel_xy,
         "yaw_rate": lambda s: s.derived.yaw_rate,
@@ -1637,6 +1646,32 @@ class State:
         self.derived.heading = np.expand_dims(
             np.arctan2(forward[1], forward[0]), axis=0
         )
+
+        if self.step_counter == 0:
+            self.derived.initial_heading = self.derived.heading.copy()
+
+        # Expose the shortest signed turn to either the commanded world
+        # heading or the heading sampled at reset, depending on the task.
+        error_reference = str(
+            getattr(self.cfg.observation, "heading_error_reference", "command")
+        )
+        if error_reference == "initial_heading":
+            target_heading = float(self.derived.initial_heading[0])
+        else:
+            command_cfg = getattr(self.cfg.task, "commands", {})
+            cos_name = str(getattr(command_cfg, "cos_command_name", "cmd_dir_cos"))
+            sin_name = str(getattr(command_cfg, "sin_command_name", "cmd_dir_sin"))
+            try:
+                target_cos = self.get_command_by_name(cos_name)
+                target_sin = self.get_command_by_name(sin_name)
+                target_heading = np.arctan2(target_sin, target_cos)
+            except (AttributeError, ValueError):
+                target_heading = float(self.derived.heading[0])
+        heading_error = np.arctan2(
+            np.sin(target_heading - self.derived.heading[0]),
+            np.cos(target_heading - self.derived.heading[0]),
+        )
+        self.derived.heading_error = np.array([heading_error], dtype=np.float32)
 
         # Local planar velocity (in heading-aligned frame, not body frame)
         heading = float(self.derived.heading[0])
