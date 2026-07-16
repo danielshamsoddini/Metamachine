@@ -221,6 +221,21 @@ class TimedContactPenaltyComponent(ContactPenaltyComponent):
         return super().calculate(state, calculator)
 
 
+class ExponentialTimedContactPenaltyComponent(ContactPenaltyComponent):
+    """Penalize contacts after a grace period with an exponential time ramp."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        elapsed = calculator.step_counter * calculator.dt - start_time
+        if elapsed < 0.0:
+            return 0.0
+
+        exponent_rate = float(self.params.get("exponent_rate", 0.35))
+        max_multiplier = max(float(self.params.get("max_multiplier", 32.0)), 1.0)
+        multiplier = min(float(np.exp(exponent_rate * elapsed)), max_multiplier)
+        return multiplier * super().calculate(state, calculator)
+
+
 class TimedAirborneSpinComponent(RewardComponent):
     """Reward commanded yaw only while airborne, after a launch period."""
 
@@ -1484,6 +1499,7 @@ COMPONENT_REGISTRY = {
     "dof_acceleration_penalty": DOFAccelerationPenaltyComponent,
     "contact_penalty": ContactPenaltyComponent,
     "timed_contact_penalty": TimedContactPenaltyComponent,
+    "exponential_timed_contact_penalty": ExponentialTimedContactPenaltyComponent,
     "timed_airborne_spin": TimedAirborneSpinComponent,
     "timed_height_tracking": TimedHeightTrackingComponent,
     "single_leg_support_penalty": SingleLegSupportPenaltyComponent,
