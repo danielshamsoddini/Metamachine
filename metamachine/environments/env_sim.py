@@ -389,6 +389,18 @@ class MetaMachine(Base, MujocoEnv):
             
             self.mass_range = self.xml_compiler.get_mass_range(mass_percentage)
 
+        ankle_length_cfg = randomization_cfg.get("ankle_length", {})
+        if ankle_length_cfg.get("enabled", False):
+            ankle_length_percentage = ankle_length_cfg.get("percentage", 0.1)
+            self.ankle_length_range = self.xml_compiler.get_geom_length_range(
+                "ankle_geom", ankle_length_percentage
+            )
+            if not self.ankle_length_range:
+                raise ValueError(
+                    "randomization.ankle_length enabled, but no named fromto geoms "
+                    "containing 'ankle_geom' were found"
+                )
+
     def _load_draft_robot_asset_from_morphology(
         self, robot_type: Any, morphology: Any
     ) -> None:
@@ -679,6 +691,18 @@ class MetaMachine(Base, MujocoEnv):
                 mass_percentage = self.sim_cfg.get("random_mass_percentage", 0.1)
             
             self.mass_range = self.xml_compiler.get_mass_range(mass_percentage)
+
+        ankle_length_cfg = randomization_cfg.get("ankle_length", {})
+        if ankle_length_cfg.get("enabled", False):
+            ankle_length_percentage = ankle_length_cfg.get("percentage", 0.1)
+            self.ankle_length_range = self.xml_compiler.get_geom_length_range(
+                "ankle_geom", ankle_length_percentage
+            )
+            if not self.ankle_length_range:
+                raise ValueError(
+                    "randomization.ankle_length enabled, but no named fromto geoms "
+                    "containing 'ankle_geom' were found"
+                )
 
         self.xml_string = self.xml_compiler.get_string()
 
@@ -2899,6 +2923,9 @@ class MetaMachine(Base, MujocoEnv):
         randomization_cfg = getattr(self.cfg, "randomization", {})
         mass_enabled = randomization_cfg.get("mass", {}).get("enabled", False)
         damping_enabled = randomization_cfg.get("damping", {}).get("enabled", False)
+        ankle_length_enabled = randomization_cfg.get("ankle_length", {}).get(
+            "enabled", False
+        )
         
         # Fallback to old style for backward compatibility
         if not mass_enabled:
@@ -2910,6 +2937,7 @@ class MetaMachine(Base, MujocoEnv):
             [
                 mass_enabled,
                 damping_enabled,
+                ankle_length_enabled,
                 self.sim_cfg.get("add_scaffold_walls", False),
                 self.randomize_asset,
                 morphology_enabled,
@@ -2961,6 +2989,24 @@ class MetaMachine(Base, MujocoEnv):
                 for key, value in self.mass_range.items()
             }
             self.xml_compiler.update_mass(mass_dict)
+
+        # Each ankle is sampled independently, matching mass randomization.
+        ankle_length_cfg = randomization_cfg.get("ankle_length", {})
+        if (
+            ankle_length_cfg.get("enabled", False)
+            and hasattr(self, "ankle_length_range")
+            and hasattr(self, "xml_compiler")
+        ):
+            ankle_length_offset = ankle_length_cfg.get("offset", 0)
+            ankle_length_dict = {
+                key: np.random.uniform(*value) + ankle_length_offset
+                for key, value in self.ankle_length_range.items()
+            }
+            if any(length <= 0 for length in ankle_length_dict.values()):
+                raise ValueError(
+                    "randomization.ankle_length produced a non-positive geom length"
+                )
+            self.xml_compiler.update_geom_length(ankle_length_dict)
 
         # Damping randomization
         damping_cfg = randomization_cfg.get("damping", {})

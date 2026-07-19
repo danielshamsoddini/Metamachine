@@ -140,6 +140,40 @@ class XMLCompiler:
             if geoms:
                 geoms[0].set("mass", str(mass))
 
+    def get_geom_length_range(self, name_contains, percentage=0.1):
+        """Get absolute length ranges for named ``fromto`` geoms."""
+        length_range = {}
+        for geom in self.root.xpath('//geom[@name and @fromto]'):
+            name = geom.get("name")
+            if name_contains not in name:
+                continue
+            points = np.fromstring(geom.get("fromto"), sep=" ")
+            if points.size != 6:
+                continue
+            length = float(np.linalg.norm(points[3:] - points[:3]))
+            length_range[name] = [
+                length * (1 - percentage),
+                length * (1 + percentage),
+            ]
+        return length_range
+
+    def update_geom_length(self, length_dict) -> None:
+        """Set ``fromto`` geom lengths while preserving start and direction."""
+        for name, length in length_dict.items():
+            geoms = self.root.xpath(f'//geom[@name="{name}"]')
+            if not geoms or geoms[0].get("fromto") is None:
+                continue
+            geom = geoms[0]
+            points = np.fromstring(geom.get("fromto"), sep=" ")
+            if points.size != 6:
+                continue
+            direction = points[3:] - points[:3]
+            norm = np.linalg.norm(direction)
+            if norm <= 0:
+                continue
+            points[3:] = points[:3] + direction / norm * float(length)
+            geom.set("fromto", vec2string(points))
+
     def update_damping(self, armature, damping) -> None:
         # joints = self.root.find('default').findall('joint')
         # for joint in joints:
