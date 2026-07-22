@@ -637,6 +637,96 @@ class ActionRateRateComponent(RewardComponent):
         return action_rate_rate
 
 
+class ActionMagnitudePenaltyComponent(RewardComponent):
+    """Ant-style L2 control cost on the instantaneous action magnitude."""
+
+    def calculate(self, state, calculator) -> float:
+        action = np.asarray(state.action_history.last_action, dtype=np.float64)
+        action_limit = max(abs(float(self.params.get("action_limit", 1.0))), 1e-6)
+        return -float(np.sum(np.square(action / action_limit)))
+
+
+class WorldZVelocityPenaltyComponent(RewardComponent):
+    """Penalize vertical torso bouncing above a small free-motion allowance."""
+
+    def calculate(self, state, calculator) -> float:
+        free_velocity = abs(float(self.params.get("free_velocity", 0.0)))
+        tracking_sigma = max(float(self.params.get("tracking_sigma", 0.25)), 1e-6)
+        vel_world = getattr(state, "accurate_vel_world", None)
+        if vel_world is None:
+            vel_world = getattr(state, "vel_world", np.zeros(3))
+        excess = max(abs(float(np.asarray(vel_world)[2])) - free_velocity, 0.0)
+        return -np.square(excess) / tracking_sigma
+
+
+class RollPitchAngularVelocityPenaltyComponent(RewardComponent):
+    """Penalize excessive roll/pitch rate while leaving yaw motion unpenalized."""
+
+    def calculate(self, state, calculator) -> float:
+        free_angular_velocity = abs(
+            float(self.params.get("free_angular_velocity", 0.0))
+        )
+        tracking_sigma = max(float(self.params.get("tracking_sigma", 1.0)), 1e-6)
+        up_body = -quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
+        up_body = up_body / (np.linalg.norm(up_body) + 1e-8)
+        angular_velocity = np.asarray(state.accurate_ang_vel_body, dtype=np.float64)
+        yaw_rate = float(np.dot(angular_velocity, up_body))
+        roll_pitch_rate = float(
+            np.sqrt(
+                max(
+                    float(np.dot(angular_velocity, angular_velocity)) - yaw_rate**2,
+                    0.0,
+                )
+            )
+        )
+        excess = max(roll_pitch_rate - free_angular_velocity, 0.0)
+        return -np.square(excess) / tracking_sigma
+
+
+class ContactForcePenaltyComponent(RewardComponent):
+    """Penalize excessive clipped floor-contact force without punishing stance."""
+
+    def calculate(self, state, calculator) -> float:
+        model = getattr(state, "mj_model", None)
+        data = getattr(state, "mj_data", None)
+        if model is None or data is None:
+            return 0.0
+
+        import mujoco
+
+        threshold = max(float(self.params.get("force_threshold", 0.0)), 0.0)
+        force_clip = max(
+            float(self.params.get("force_clip", 250.0)), threshold + 1e-6
+        )
+        floor_tokens = self.params.get("floor_geom_name_contains", ["floor"])
+        geom_filters = self.params.get("geom_name_contains")
+        total_cost = 0.0
+
+        for contact_index in range(int(data.ncon)):
+            contact = data.contact[contact_index]
+            geom1_name = model.geom(contact.geom1).name or ""
+            geom2_name = model.geom(contact.geom2).name or ""
+            geom1_is_floor = any(token in geom1_name for token in floor_tokens)
+            geom2_is_floor = any(token in geom2_name for token in floor_tokens)
+            if not (geom1_is_floor or geom2_is_floor):
+                continue
+
+            non_floor_name = geom2_name if geom1_is_floor else geom1_name
+            if geom_filters and not any(token in non_floor_name for token in geom_filters):
+                continue
+
+            contact_force = np.zeros(6, dtype=np.float64)
+            mujoco.mj_contactForce(model, data, contact_index, contact_force)
+            force_norm = float(np.linalg.norm(contact_force[:3]))
+            normalized_excess = np.clip(
+                (force_norm - threshold) / (force_clip - threshold), 0.0, 1.0
+            )
+            total_cost += float(np.square(normalized_excess))
+
+        return -total_cost
+
+
+
 def _get_valid_goal_distance(state) -> Optional[float]:
     """Read a usable goal distance from state, if available."""
     distance = float(getattr(state.raw, "goal_distance", -1.0))
@@ -1568,6 +1658,10 @@ COMPONENT_REGISTRY = {
     "action_rate": ActionRateComponent,
     "action_rate_rate": ActionRateRateComponent,
     "action_acceleration": ActionRateRateComponent,
+    "action_magnitude_penalty": ActionMagnitudePenaltyComponent,
+    "contact_force_penalty": ContactForcePenaltyComponent,
+    "world_z_velocity_penalty": WorldZVelocityPenaltyComponent,
+    "roll_pitch_angular_velocity_penalty": RollPitchAngularVelocityPenaltyComponent,
     "goal_distance_penalty": GoalDistancePenaltyComponent,
     "goal_progress": GoalProgressComponent,
     "goal_success_bonus": GoalSuccessBonusComponent,
