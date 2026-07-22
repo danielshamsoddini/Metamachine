@@ -155,6 +155,164 @@ class ContactFlightTimeComponent(RewardComponent):
         self.contact_counter = {}
 
 
+class PersistentFootAirTimePenaltyComponent(RewardComponent):
+    """Penalize a foot only when its airborne interval becomes abnormally long.
+
+    Ordinary swing phases are free for ``grace_time`` seconds.  Beyond that,
+    each foot's cost ramps smoothly to one, independently, so a policy cannot
+    obtain a cheap tripod gait by parking one particular leg in the air.
+    """
+
+    DEFAULT_FOOT_GEOM_NAMES = (
+        "front_right_ankle_geom",
+        "front_left_ankle_geom",
+        "rear_left_ankle_geom",
+        "rear_right_ankle_geom",
+    )
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.foot_geom_ids: dict[str, int] = {}
+        self.air_times: dict[str, float] = {}
+        self._model_identity: int | None = None
+
+    def _resolve_foot_geoms(self, model) -> None:
+        requested_names = tuple(
+            self.params.get("foot_geom_names", self.DEFAULT_FOOT_GEOM_NAMES)
+        )
+        available = {
+            model.geom(geom_id).name: geom_id
+            for geom_id in range(int(model.ngeom))
+            if model.geom(geom_id).name
+        }
+        missing = [name for name in requested_names if name not in available]
+        if missing:
+            raise ValueError(
+                "persistent_foot_air_time_penalty could not find foot geoms: "
+                + ", ".join(missing)
+            )
+        self.foot_geom_ids = {name: available[name] for name in requested_names}
+        self.air_times = dict.fromkeys(requested_names, 0.0)
+        self._model_identity = id(model)
+
+    def calculate(self, state, calculator) -> float:
+        model = getattr(state, "mj_model", None)
+        if model is None:
+            return 0.0
+        if not self.foot_geom_ids or self._model_identity != id(model):
+            self._resolve_foot_geoms(model)
+
+        active_contacts = set(getattr(state, "contact_floor_geoms", []))
+        grace_time = max(float(self.params.get("grace_time", 0.35)), 0.0)
+        ramp_time = max(float(self.params.get("ramp_time", 0.65)), 1e-6)
+        power = max(float(self.params.get("power", 2.0)), 1.0)
+        total_cost = 0.0
+
+        for foot_name, geom_id in self.foot_geom_ids.items():
+            if geom_id in active_contacts:
+                self.air_times[foot_name] = 0.0
+            else:
+                self.air_times[foot_name] += calculator.dt
+            normalized_excess = np.clip(
+                (self.air_times[foot_name] - grace_time) / ramp_time,
+                0.0,
+                1.0,
+            )
+            total_cost += float(normalized_excess**power)
+
+        return -total_cost
+
+    def reset(self) -> None:
+        self.air_times = dict.fromkeys(self.foot_geom_ids, 0.0)
+
+
+class ExcessiveFootHeightPenaltyComponent(RewardComponent):
+    """Penalize ankle geoms lifted far above ordinary swing clearance.
+
+    ``reference_mode=median_other_feet`` makes the measurement invariant to
+    whole-body crouching by comparing each ankle with the other three ankles.
+    ``reference_mode=torso`` compares against torso-center height.  The default
+    ``floor`` mode preserves existing configuration behavior.
+    """
+
+    DEFAULT_FOOT_GEOM_NAMES = PersistentFootAirTimePenaltyComponent.DEFAULT_FOOT_GEOM_NAMES
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.foot_geom_ids: dict[str, int] = {}
+        self._model_identity: int | None = None
+
+    def _resolve_foot_geoms(self, model) -> None:
+        requested_names = tuple(
+            self.params.get("foot_geom_names", self.DEFAULT_FOOT_GEOM_NAMES)
+        )
+        available = {
+            model.geom(geom_id).name: geom_id
+            for geom_id in range(int(model.ngeom))
+            if model.geom(geom_id).name
+        }
+        missing = [name for name in requested_names if name not in available]
+        if missing:
+            raise ValueError(
+                "excessive_foot_height_penalty could not find foot geoms: "
+                + ", ".join(missing)
+            )
+        self.foot_geom_ids = {name: available[name] for name in requested_names}
+        self._model_identity = id(model)
+
+    def calculate(self, state, calculator) -> float:
+        model = getattr(state, "mj_model", None)
+        data = getattr(state, "mj_data", None)
+        if model is None or data is None:
+            return 0.0
+        if not self.foot_geom_ids or self._model_identity != id(model):
+            self._resolve_foot_geoms(model)
+
+        start_time = max(float(self.params.get("start_time", 0.5)), 0.0)
+        if calculator.step_counter * calculator.dt < start_time:
+            return 0.0
+
+        reference_mode = str(self.params.get("reference_mode", "floor"))
+        free_height = float(
+            self.params.get(
+                "free_relative_height",
+                self.params.get("free_height", 0.22),
+            )
+        )
+        height_scale = max(float(self.params.get("height_scale", 0.18)), 1e-6)
+        floor_height = float(self.params.get("floor_height", 0.0))
+        power = max(float(self.params.get("power", 2.0)), 1.0)
+        total_cost = 0.0
+        foot_heights = {
+            foot_name: float(data.geom_xpos[geom_id][2])
+            for foot_name, geom_id in self.foot_geom_ids.items()
+        }
+        for foot_name, height_world in foot_heights.items():
+            if reference_mode == "median_other_feet":
+                other_heights = [
+                    other_height
+                    for other_name, other_height in foot_heights.items()
+                    if other_name != foot_name
+                ]
+                height = height_world - float(np.median(other_heights))
+            elif reference_mode == "torso":
+                height = height_world - float(state.accurate_pos_world[2])
+            elif reference_mode == "floor":
+                height = height_world - floor_height
+            else:
+                raise ValueError(
+                    "excessive_foot_height_penalty reference_mode must be "
+                    "floor, torso, or median_other_feet"
+                )
+            normalized_excess = np.clip(
+                (height - free_height) / height_scale,
+                0.0,
+                1.0,
+            )
+            total_cost += float(normalized_excess**power)
+        return -total_cost
+
+
 class DOFVelocityPenaltyComponent(RewardComponent):
     """Penalizes excessive DOF velocities."""
 
@@ -417,13 +575,20 @@ class LowHeightPenaltyComponent(RewardComponent):
     """Penalizes torso getting too close to the ground."""
 
     def calculate(self, state, calculator) -> float:
-        min_height = self.params.get("min_height", 0.4)
-        height = state.accurate_pos_world[2]
-        
-        if height < min_height:
-            # Quadratic penalty that gets worse as it gets closer to ground
-            return -np.square(min_height - height)
-        return 0.0
+        min_height = float(self.params.get("min_height", 0.4))
+        height = float(state.accurate_pos_world[2])
+        deficit = max(min_height - height, 0.0)
+        if deficit == 0.0:
+            return 0.0
+
+        # penalty_scale makes the hinge independent of raw meter units.  The
+        # default 1.0 preserves the historical behavior for existing configs.
+        penalty_scale = max(float(self.params.get("penalty_scale", 1.0)), 1e-6)
+        penalty = np.square(deficit / penalty_scale)
+        max_penalty = self.params.get("max_penalty")
+        if max_penalty is not None:
+            penalty = min(penalty, abs(float(max_penalty)))
+        return -float(penalty)
 
 
 class DOFPositionTrackingComponent(RewardComponent):
@@ -1634,6 +1799,8 @@ COMPONENT_REGISTRY = {
     # 'linear_velocity_cmd_tracking': LinearVelocityTrackingCMDComponent,
     # 'angular_velocity_cmd_tracking': AngularVelocityTrackingCMDComponent,
     "contact_flight_time": ContactFlightTimeComponent,
+    "persistent_foot_air_time_penalty": PersistentFootAirTimePenaltyComponent,
+    "excessive_foot_height_penalty": ExcessiveFootHeightPenaltyComponent,
     "dof_velocity_penalty": DOFVelocityPenaltyComponent,
     "dof_acceleration_penalty": DOFAccelerationPenaltyComponent,
     "contact_penalty": ContactPenaltyComponent,
