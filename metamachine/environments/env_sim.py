@@ -2429,6 +2429,17 @@ class MetaMachine(Base, MujocoEnv):
         # Apply torque-velocity constraints only to motor actuators.
         torques = self._apply_torque_constraints(torques, dof_vel)
 
+        # Optional phase-gated motor release. A spin-launch task can use this
+        # to make the second phase genuinely passive: after the configured
+        # release time, policy position targets no longer inject motor torque.
+        # It is opt-in and applies only to torque-driven actuators.
+        release_cfg = self.cfg.control.get("phase_actuator_release", None)
+        if release_cfg and bool(release_cfg.get("enabled", False)):
+            start_time = float(release_cfg.get("start_time", 0.0))
+            if self.step_count * self.cfg.control.dt >= start_time:
+                torque_scale = float(release_cfg.get("torque_scale", 0.0))
+                torques = torques * np.clip(torque_scale, 0.0, 1.0)
+
         # For MuJoCo <position> actuators ctrl is the target position, not a torque.
         # Override the PD result with the (possibly coupled) target position directly.
         ctrl = torques

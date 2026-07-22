@@ -31,6 +31,7 @@ class TerminationStrategy(Enum):
     BALLANCE_AUTO_OR_BODY_CONTACT_FLOOR_AFTER_GRACE = (
         "ballance_auto_or_body_contact_floor_after_grace"
     )
+    BODY_CONTACT_FLOOR_AFTER_GRACE = "body_contact_floor_after_grace"
     TORSO_FALL = "torso_fall"
     THREE_FEET = "three_feet"
     BALL_FALL = "ball_fall"
@@ -123,6 +124,8 @@ class TerminationChecker:
                 self._check_ballance_auto_or_body_contact_floor,
             TerminationStrategy.BALLANCE_AUTO_OR_BODY_CONTACT_FLOOR_AFTER_GRACE:
                 self._check_ballance_auto_or_body_contact_floor_after_grace,
+            TerminationStrategy.BODY_CONTACT_FLOOR_AFTER_GRACE:
+                self._check_body_contact_floor_after_grace,
             TerminationStrategy.TORSO_FALL: self._check_torso_fall,
             TerminationStrategy.THREE_FEET: self._check_three_feet,
             TerminationStrategy.BALL_FALL: self._check_ball_fall,
@@ -251,6 +254,18 @@ class TerminationChecker:
         """Allow launch contacts, then end the episode on configured contact."""
         if self._check_ballance_auto(state):
             return True
+        return (
+            self.current_step >= self.contact_grace_steps
+            and self._check_body_contact_floor(state)
+        )
+
+    def _check_body_contact_floor_after_grace(self, state) -> bool:
+        """Allow launch contacts, then end only on configured floor contact.
+
+        This supports phased no-contact tasks: the configuration chooses which
+        geoms must stay clear, without also imposing an unrelated upright or
+        balance termination.
+        """
         return (
             self.current_step >= self.contact_grace_steps
             and self._check_body_contact_floor(state)

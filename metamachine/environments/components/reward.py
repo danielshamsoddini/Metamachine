@@ -264,6 +264,55 @@ class TimedAirborneSpinComponent(RewardComponent):
         return float(np.exp(-np.square(float(target) - yaw_rate) / sigma))
 
 
+class TimedContactFreeSpinComponent(RewardComponent):
+    """Dense signed yaw reward for a post-release, contact-free phase.
+
+    Unlike ``timed_airborne_spin``, a stopped robot earns an explicit negative
+    value instead of merely losing a small positive tracking reward. This
+    prevents a quiet survival pose from replacing the desired passive coast.
+    Omit ``geom_name_contains`` to require that *no* robot geom touches the
+    floor; provide a filter only for tasks that intentionally permit a body
+    contact.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        if calculator.step_counter * calculator.dt < start_time:
+            return 0.0
+
+        contacts = list(getattr(state, "contact_floor_geoms", []))
+        filters = self.params.get("geom_name_contains")
+        if filters and state.mj_model is not None:
+            contacts = [
+                geom
+                for geom in contacts
+                if any(token in state.mj_model.geom(geom).name for token in filters)
+            ]
+        if contacts:
+            return float(self.params.get("contact_value", -1.0))
+
+        target = self.params.get("target_angular_velocity", 0.0)
+        if isinstance(target, str) and target.startswith("cmd:"):
+            target = state.get_command_by_name(target[4:])
+        target = float(target)
+        direction = 1.0 if target >= 0.0 else -1.0
+        target_speed = max(abs(target), 1e-6)
+        min_speed = float(
+            self.params.get("min_angular_velocity", 0.5 * target_speed)
+        )
+        min_speed = min(max(min_speed, 0.0), target_speed - 1e-6)
+
+        projected_gravity = quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
+        yaw_rate = float(np.dot(-projected_gravity, state.accurate_ang_vel_body))
+        directed_rate = direction * yaw_rate
+
+        # The score is negative when stalled/reversed, rises continuously in
+        # the useful coast range, and saturates at the target spin rate.
+        stalled_cap = abs(float(self.params.get("stalled_penalty", 1.0)))
+        score = (directed_rate - min_speed) / max(target_speed - min_speed, 1e-6)
+        return float(np.clip(score, -stalled_cap, 1.0))
+
+
 class TimedHeightTrackingComponent(RewardComponent):
     """Apply height tracking only during a configured time interval."""
 
@@ -1501,6 +1550,7 @@ COMPONENT_REGISTRY = {
     "timed_contact_penalty": TimedContactPenaltyComponent,
     "exponential_timed_contact_penalty": ExponentialTimedContactPenaltyComponent,
     "timed_airborne_spin": TimedAirborneSpinComponent,
+    "timed_contact_free_spin": TimedContactFreeSpinComponent,
     "timed_height_tracking": TimedHeightTrackingComponent,
     "single_leg_support_penalty": SingleLegSupportPenaltyComponent,
     "jump_reward": JumpRewardComponent,
