@@ -321,6 +321,32 @@ class DOFVelocityPenaltyComponent(RewardComponent):
         return -np.sum((np.abs(state.dof_vel) - velocity_limit).clip(0, 1e5))
 
 
+class TimedDOFVelocityPenaltyComponent(RewardComponent):
+    """Applies a bounded joint-motion cost after a phase transition."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        elapsed = calculator.step_counter * calculator.dt - start_time
+        if elapsed < 0.0:
+            return 0.0
+
+        ramp_time = max(float(self.params.get("ramp_time", 0.0)), 0.0)
+        ramp = (
+            1.0
+            if ramp_time == 0.0
+            else float(np.clip(elapsed / ramp_time, 0.0, 1.0))
+        )
+        free_velocity = max(float(self.params.get("free_velocity", 1.0)), 0.0)
+        velocity_scale = max(float(self.params.get("velocity_scale", 4.0)), 1e-6)
+        max_penalty = max(float(self.params.get("max_penalty", 4.0)), 0.0)
+        excess = np.maximum(
+            np.abs(np.asarray(state.dof_vel)) - free_velocity,
+            0.0,
+        )
+        penalty = float(np.mean(np.square(excess / velocity_scale)))
+        return -ramp * min(penalty, max_penalty)
+
+
 class DOFAccelerationPenaltyComponent(RewardComponent):
     """Penalizes DOF accelerations."""
 
@@ -392,6 +418,26 @@ class ExponentialTimedContactPenaltyComponent(ContactPenaltyComponent):
         max_multiplier = max(float(self.params.get("max_multiplier", 32.0)), 1.0)
         multiplier = min(float(np.exp(exponent_rate * elapsed)), max_multiplier)
         return multiplier * super().calculate(state, calculator)
+
+
+class RampedContactPenaltyComponent(ContactPenaltyComponent):
+    """Bounded contact cost with a smooth phase-in period."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        elapsed = calculator.step_counter * calculator.dt - start_time
+        if elapsed < 0.0:
+            return 0.0
+
+        ramp_time = max(float(self.params.get("ramp_time", 0.0)), 0.0)
+        ramp = 1.0 if ramp_time == 0.0 else float(
+            np.clip(elapsed / ramp_time, 0.0, 1.0)
+        )
+        max_contacts = max(float(self.params.get("max_contacts", 4.0)), 0.0)
+        contact_cost = max(
+            float(super().calculate(state, calculator)), -max_contacts
+        )
+        return ramp * contact_cost
 
 
 class TimedAirborneSpinComponent(RewardComponent):
@@ -469,6 +515,45 @@ class TimedContactFreeSpinComponent(RewardComponent):
         stalled_cap = abs(float(self.params.get("stalled_penalty", 1.0)))
         score = (directed_rate - min_speed) / max(target_speed - min_speed, 1e-6)
         return float(np.clip(score, -stalled_cap, 1.0))
+
+
+class TimedSpinRetentionComponent(RewardComponent):
+    """Signed post-launch spin reward independent of limb contacts."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        elapsed = calculator.step_counter * calculator.dt - start_time
+        if elapsed < 0.0:
+            return 0.0
+
+        target = self.params.get("target_angular_velocity", 0.0)
+        if isinstance(target, str) and target.startswith("cmd:"):
+            target = state.get_command_by_name(target[4:])
+        target = float(target)
+        direction = 1.0 if target >= 0.0 else -1.0
+        target_speed = max(abs(target), 1e-6)
+        min_speed = float(
+            self.params.get("min_angular_velocity", 0.5 * target_speed)
+        )
+        min_speed = min(max(min_speed, 0.0), target_speed - 1e-6)
+
+        projected_gravity = quat_rotate_inverse(
+            state.accurate_quat, calculator.gravity_vec
+        )
+        yaw_rate = float(
+            np.dot(-projected_gravity, state.accurate_ang_vel_body)
+        )
+        directed_rate = direction * yaw_rate
+        stalled_cap = abs(float(self.params.get("stalled_penalty", 1.0)))
+        score = (directed_rate - min_speed) / max(
+            target_speed - min_speed, 1e-6
+        )
+
+        ramp_time = max(float(self.params.get("ramp_time", 0.0)), 0.0)
+        ramp = 1.0 if ramp_time == 0.0 else float(
+            np.clip(elapsed / ramp_time, 0.0, 1.0)
+        )
+        return ramp * float(np.clip(score, -stalled_cap, 1.0))
 
 
 class TimedHeightTrackingComponent(RewardComponent):
@@ -596,13 +681,48 @@ class DOFPositionTrackingComponent(RewardComponent):
 
     def calculate(self, state, calculator) -> float:
         tracking_sigma = self.params.get("tracking_sigma", 10.0)
-        target_positions = self.params.get("target_positions", state.default_dof_pos)
+        target_positions = self.params.get("target_positions")
+        if target_positions is None:
+            target_positions = state.cfg.control.default_dof_pos
 
         return isaac_reward(
             normalize_angle(np.array(target_positions)),
             normalize_angle(state.accurate_dof_pos),
             tracking_sigma,
         )
+
+
+class TimedDOFPositionTrackingComponent(DOFPositionTrackingComponent):
+    """Dense bounded joint-pose score activated after a launch phase."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        elapsed = calculator.step_counter * calculator.dt - start_time
+        if elapsed < 0.0:
+            return 0.0
+        end_time = self.params.get("end_time")
+        if (
+            end_time is not None
+            and calculator.step_counter * calculator.dt >= float(end_time)
+        ):
+            return 0.0
+
+        target_positions = self.params.get("target_positions")
+        if target_positions is None:
+            target_positions = state.cfg.control.default_dof_pos
+        error = normalize_angle(np.asarray(target_positions)) - normalize_angle(
+            np.asarray(state.accurate_dof_pos)
+        )
+        tracking_scale = max(float(self.params.get("tracking_scale", 0.75)), 1e-6)
+        max_penalty = max(float(self.params.get("max_penalty", 2.0)), 0.0)
+        pose_score = 1.0 - float(np.mean(np.square(error / tracking_scale)))
+        pose_score = float(np.clip(pose_score, -max_penalty, 1.0))
+
+        ramp_time = max(float(self.params.get("ramp_time", 0.0)), 0.0)
+        ramp = 1.0 if ramp_time == 0.0 else float(
+            np.clip(elapsed / ramp_time, 0.0, 1.0)
+        )
+        return ramp * pose_score
 
 
 class PlateauAngularVelocityComponent(RewardComponent):
@@ -1802,12 +1922,15 @@ COMPONENT_REGISTRY = {
     "persistent_foot_air_time_penalty": PersistentFootAirTimePenaltyComponent,
     "excessive_foot_height_penalty": ExcessiveFootHeightPenaltyComponent,
     "dof_velocity_penalty": DOFVelocityPenaltyComponent,
+    "timed_dof_velocity_penalty": TimedDOFVelocityPenaltyComponent,
     "dof_acceleration_penalty": DOFAccelerationPenaltyComponent,
     "contact_penalty": ContactPenaltyComponent,
     "timed_contact_penalty": TimedContactPenaltyComponent,
     "exponential_timed_contact_penalty": ExponentialTimedContactPenaltyComponent,
+    "ramped_contact_penalty": RampedContactPenaltyComponent,
     "timed_airborne_spin": TimedAirborneSpinComponent,
     "timed_contact_free_spin": TimedContactFreeSpinComponent,
+    "timed_spin_retention": TimedSpinRetentionComponent,
     "timed_height_tracking": TimedHeightTrackingComponent,
     "single_leg_support_penalty": SingleLegSupportPenaltyComponent,
     "jump_reward": JumpRewardComponent,
@@ -1816,6 +1939,7 @@ COMPONENT_REGISTRY = {
     "torso_contact_penalty": TorsoContactPenaltyComponent,
     "low_height_penalty": LowHeightPenaltyComponent,
     "dof_position_tracking": DOFPositionTrackingComponent,
+    "timed_dof_position_tracking": TimedDOFPositionTrackingComponent,
     "plateau_angular_velocity": PlateauAngularVelocityComponent,
     "plateau_spin": PlateauSpinComponent,
     "plateau_height": PlateauHeightComponent,

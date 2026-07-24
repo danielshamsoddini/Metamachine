@@ -791,6 +791,7 @@ def setup_sb3_training(
             save_freq=effective_checkpoint_freq,
             save_path=log_dir,
             name_prefix="rl_model",
+            save_replay_buffer=hasattr(model, "save_replay_buffer"),
             save_vecnormalize=True,
         )
         callbacks.append(checkpoint_cb)
@@ -1034,6 +1035,18 @@ class SB3Trainer:
         
         self.model.save(path)
         print(f"[SB3Trainer] Model saved to: {path}")
+
+        replay_buffer = getattr(self.model, "replay_buffer", None)
+        if replay_buffer is not None and hasattr(self.model, "save_replay_buffer"):
+            model_base = str(path)
+            if model_base.endswith(".zip"):
+                model_base = model_base[:-4]
+            replay_buffer_path = f"{model_base}_replay_buffer.pkl"
+            self.model.save_replay_buffer(replay_buffer_path)
+            print(
+                "[SB3Trainer] Replay buffer saved to: "
+                f"{replay_buffer_path}"
+            )
         return path
     
     @classmethod
@@ -1063,6 +1076,9 @@ class SB3Trainer:
         Returns:
             SB3Trainer instance with loaded model
         """
+        replay_buffer_path = kwargs.pop("replay_buffer_path", None)
+        load_replay_buffer = bool(kwargs.pop("load_replay_buffer", True))
+
         # Detect algorithm from file (simple heuristic)
         # In practice, you might want to save metadata with the model
         from stable_baselines3.common.base_class import BaseAlgorithm
@@ -1082,12 +1098,51 @@ class SB3Trainer:
         
         if model is None:
             raise ValueError(f"Could not load model from {path}")
+
+        loaded_replay_buffer_path = None
+        if load_replay_buffer and hasattr(model, "load_replay_buffer"):
+            model_path = Path(path)
+            candidates = []
+            if replay_buffer_path is not None:
+                candidates.append(Path(replay_buffer_path))
+            else:
+                stem = model_path.stem
+                parts = stem.rsplit("_", 2)
+                if len(parts) == 3 and parts[1].isdigit() and parts[2] == "steps":
+                    candidates.append(
+                        model_path.with_name(
+                            f"{parts[0]}_replay_buffer_{parts[1]}_steps.pkl"
+                        )
+                    )
+                candidates.append(
+                    model_path.with_name(f"{stem}_replay_buffer.pkl")
+                )
+
+            for candidate in candidates:
+                if candidate.is_file():
+                    model.load_replay_buffer(str(candidate))
+                    loaded_replay_buffer_path = str(candidate)
+                    print(
+                        "[SB3Trainer] Loaded replay buffer: "
+                        f"{loaded_replay_buffer_path}"
+                    )
+                    break
+            if replay_buffer_path is not None and loaded_replay_buffer_path is None:
+                raise FileNotFoundError(
+                    f"Replay buffer not found: {replay_buffer_path}"
+                )
+            if loaded_replay_buffer_path is None:
+                print(
+                    "[SB3Trainer] Warning: no matching replay buffer found; "
+                    "use a replay warm-up and reduced learning rate before updates."
+                )
         
         # Create trainer wrapper
         trainer = cls.__new__(cls)
         trainer.env = env
         trainer.exp_name = exp_name
         trainer.model = model
+        trainer.loaded_replay_buffer_path = loaded_replay_buffer_path
         trainer.log_dir = new_log_dir or resolve_env_log_dir(env)
         if trainer.log_dir is None:
             trainer.log_dir = f"./logs/{exp_name.replace(' ', '_').lower()}"
