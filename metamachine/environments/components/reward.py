@@ -62,10 +62,31 @@ class LinearVelocityTrackingComponent(RewardComponent):
         return np.exp(-lin_vel_error / tracking_sigma)
 
 
+def _phase_fade_scale(params, calculator) -> float:
+    """Return a linear phase fade without changing pre-fade reward semantics."""
+    fade_start = params.get("fade_start_time")
+    end_time = params.get("end_time")
+    if fade_start is None or end_time is None:
+        return 1.0
+    fade_start = float(fade_start)
+    end_time = float(end_time)
+    elapsed = calculator.step_counter * calculator.dt
+    if end_time <= fade_start:
+        return float(elapsed < end_time)
+    return float(np.clip((end_time - elapsed) / (end_time - fade_start), 0.0, 1.0))
+
+
 class AngularVelocityTrackingComponent(RewardComponent):
     """Tracks angular velocity around gravity axis."""
 
     def calculate(self, state, calculator) -> float:
+        end_time = self.params.get("end_time")
+        if (
+            end_time is not None
+            and calculator.step_counter * calculator.dt >= float(end_time)
+        ):
+            return 0.0
+
         target_ang_vel = self.params.get("target_angular_velocity", 0.0)
         if isinstance(target_ang_vel, str) and target_ang_vel.startswith("cmd:"):
             target_ang_vel = state.get_command_by_name(target_ang_vel[4:])
@@ -81,7 +102,9 @@ class AngularVelocityTrackingComponent(RewardComponent):
             -accurate_projected_gravity, state.accurate_ang_vel_body
         )
         ang_vel_error = np.sum(np.square(target_ang_vel - projected_z_ang))
-        return np.exp(-ang_vel_error / tracking_sigma)
+        return _phase_fade_scale(self.params, calculator) * np.exp(
+            -ang_vel_error / tracking_sigma
+        )
 
 
 # class LinearVelocityTrackingCMDComponent(RewardComponent):
@@ -325,6 +348,10 @@ class TimedDOFVelocityPenaltyComponent(RewardComponent):
     """Applies a bounded joint-motion cost after a phase transition."""
 
     def calculate(self, state, calculator) -> float:
+        if self.params.get("require_phase_clearance_latched", False) and not bool(
+            getattr(state, "phase_clearance_latched", False)
+        ):
+            return 0.0
         start_time = float(self.params.get("start_time", 0.0))
         elapsed = calculator.step_counter * calculator.dt - start_time
         if elapsed < 0.0:
@@ -556,6 +583,396 @@ class TimedSpinRetentionComponent(RewardComponent):
         return ramp * float(np.clip(score, -stalled_cap, 1.0))
 
 
+class GatedPassiveSpinComponent(RewardComponent):
+    """Reward post-launch torso spin only while legs are clear and nearly still."""
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.clear_steps = 0
+
+    def _active_leg_contacts(self, state) -> list[int]:
+        contacts = list(getattr(state, "contact_floor_geoms", []) or [])
+        filters = self.params.get(
+            "geom_name_contains",
+            ["hip_geom", "upper_geom", "ankle_geom"],
+        )
+        if filters and state.mj_model is not None:
+            contacts = [
+                geom
+                for geom in contacts
+                if any(
+                    token in (state.mj_model.geom(int(geom)).name or "")
+                    for token in filters
+                )
+            ]
+        return contacts
+
+    def _has_required_support(self, state) -> bool:
+        filters = self.params.get("required_support_geom_name_contains")
+        if not filters:
+            return True
+        if state.mj_model is None:
+            return False
+        return any(
+            any(
+                token in (state.mj_model.geom(int(geom)).name or "")
+                for token in filters
+            )
+            for geom in (getattr(state, "contact_floor_geoms", []) or [])
+        )
+
+    def _whole_body_momentum_and_inertia(self, state, calculator) -> tuple[float, float]:
+        """Return signed axial angular momentum and effective system inertia."""
+        if state.mj_model is None or state.mj_data is None:
+            raise ValueError(
+                "gated_passive_spin whole_body_effective_yaw requires MuJoCo state"
+            )
+
+        import mujoco
+
+        model = state.mj_model
+        data = state.mj_data
+        masses = np.asarray(model.body_mass, dtype=np.float64)
+        body_ids = np.flatnonzero(masses > 0.0)
+        total_mass = float(np.sum(masses[body_ids]))
+        if total_mass <= 0.0:
+            return 0.0, 0.0
+
+        com_positions = np.asarray(data.xipos, dtype=np.float64)
+        system_com = np.sum(
+            masses[body_ids, None] * com_positions[body_ids],
+            axis=0,
+        ) / total_mass
+
+        up_axis = -np.asarray(calculator.gravity_vec, dtype=np.float64)
+        up_norm = float(np.linalg.norm(up_axis))
+        if up_norm <= 1e-9:
+            up_axis = np.array([0.0, 0.0, 1.0])
+        else:
+            up_axis /= up_norm
+
+        angular_momentum = np.zeros(3, dtype=np.float64)
+        effective_inertia = 0.0
+        spatial_velocity = np.zeros(6, dtype=np.float64)
+        for body_id in body_ids:
+            mujoco.mj_objectVelocity(
+                model,
+                data,
+                mujoco.mjtObj.mjOBJ_BODY,
+                int(body_id),
+                spatial_velocity,
+                0,
+            )
+            omega_world = spatial_velocity[:3].copy()
+            com_velocity = spatial_velocity[3:].copy()
+
+            inertia_rotation = np.asarray(
+                data.ximat[body_id],
+                dtype=np.float64,
+            ).reshape(3, 3)
+            inertia_world = (
+                inertia_rotation
+                @ np.diag(np.asarray(model.body_inertia[body_id], dtype=np.float64))
+                @ inertia_rotation.T
+            )
+            radius = com_positions[body_id] - system_com
+            angular_momentum += inertia_world @ omega_world
+            angular_momentum += np.cross(
+                radius,
+                masses[body_id] * com_velocity,
+            )
+            effective_inertia += float(up_axis @ inertia_world @ up_axis)
+            effective_inertia += float(
+                masses[body_id]
+                * (
+                    np.dot(radius, radius)
+                    - np.square(np.dot(up_axis, radius))
+                )
+            )
+
+        if effective_inertia <= 1e-9:
+            return 0.0, 0.0
+        axial_momentum = float(np.dot(up_axis, angular_momentum))
+        return axial_momentum, effective_inertia
+
+    def _whole_body_effective_spin_rate(self, state, calculator) -> float:
+        momentum, inertia = self._whole_body_momentum_and_inertia(state, calculator)
+        return 0.0 if inertia <= 1e-9 else momentum / inertia
+
+    def _spin_rate(self, state, calculator) -> float:
+        source = self.params.get("spin_measure", "torso_yaw")
+        if source == "whole_body_effective_yaw":
+            return self._whole_body_effective_spin_rate(state, calculator)
+        if source != "torso_yaw":
+            raise ValueError(
+                "gated_passive_spin spin_measure must be torso_yaw or "
+                "whole_body_effective_yaw"
+            )
+        projected_gravity = quat_rotate_inverse(
+            state.accurate_quat,
+            calculator.gravity_vec,
+        )
+        return float(
+            np.dot(-projected_gravity, state.accurate_ang_vel_body)
+        )
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        if calculator.step_counter * calculator.dt < start_time:
+            self.clear_steps = 0
+            return 0.0
+
+        if self._active_leg_contacts(state) or not self._has_required_support(state):
+            self.clear_steps = 0
+            return 0.0
+        self.clear_steps += 1
+
+        clearance_time = max(
+            float(self.params.get("continuous_clearance_time", 0.25)),
+            0.0,
+        )
+        clearance_gate = (
+            1.0
+            if clearance_time == 0.0
+            else float(
+                np.clip(
+                    self.clear_steps * calculator.dt / clearance_time,
+                    0.0,
+                    1.0,
+                )
+            )
+        )
+
+        free_velocity = max(
+            float(self.params.get("free_joint_velocity", 0.25)),
+            0.0,
+        )
+        velocity_scale = max(
+            float(self.params.get("joint_velocity_scale", 0.75)),
+            1e-6,
+        )
+        dof_velocity = np.abs(np.asarray(state.dof_vel, dtype=np.float64))
+        velocity_excess = np.maximum(dof_velocity - free_velocity, 0.0)
+        motion_gate = float(
+            np.exp(-np.mean(np.square(velocity_excess / velocity_scale)))
+        )
+
+        target = self.params.get("target_angular_velocity", 0.0)
+        if isinstance(target, str) and target.startswith("cmd:"):
+            target = state.get_command_by_name(target[4:])
+        target = float(target)
+        direction = 1.0 if target >= 0.0 else -1.0
+        target_speed = max(abs(target), 1e-6)
+        min_speed = float(
+            self.params.get("min_angular_velocity", 0.5 * target_speed)
+        )
+        min_speed = min(max(min_speed, 0.0), target_speed - 1e-6)
+
+        yaw_rate = self._spin_rate(state, calculator)
+        directed_rate = direction * yaw_rate
+        spin_score = float(
+            np.clip(
+                (directed_rate - min_speed)
+                / max(target_speed - min_speed, 1e-6),
+                0.0,
+                1.0,
+            )
+        )
+        return clearance_gate * motion_gate * spin_score
+
+    def reset(self) -> None:
+        self.clear_steps = 0
+
+
+class LatchedMomentumRetentionComponent(GatedPassiveSpinComponent):
+    """Retain real whole-body angular momentum after the achieved pose is latched."""
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.release_momentum = None
+        self.release_quality = 0.0
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        if calculator.step_counter * calculator.dt < start_time:
+            self.reset()
+            return 0.0
+        if not bool(getattr(state, "phase_clearance_latched", False)):
+            self.clear_steps = 0
+            return 0.0
+
+        momentum, inertia = self._whole_body_momentum_and_inertia(state, calculator)
+        target = self.params.get("target_angular_velocity", 0.0)
+        if isinstance(target, str) and target.startswith("cmd:"):
+            target = state.get_command_by_name(target[4:])
+        target = float(target)
+        direction = 1.0 if target >= 0.0 else -1.0
+        target_speed = max(abs(target), 1e-6)
+        directed_momentum = direction * momentum
+
+        if self.release_momentum is None:
+            self.release_momentum = max(directed_momentum, 1e-9)
+            release_rate = directed_momentum / max(inertia, 1e-9)
+            min_release_rate = max(
+                float(self.params.get("min_release_angular_velocity", 0.2)),
+                0.0,
+            )
+            required_release_rate = max(
+                float(
+                    self.params.get(
+                        "required_release_angular_velocity",
+                        min_release_rate,
+                    )
+                ),
+                min_release_rate,
+            )
+            # A weak release must never turn into a valid coast merely because
+            # it retains a large fraction of a tiny initial momentum.
+            if release_rate < required_release_rate:
+                self.release_quality = 0.0
+            else:
+                self.release_quality = float(
+                    np.clip(release_rate / target_speed, 0.0, 1.0)
+                )
+
+        if self._active_leg_contacts(state) or not self._has_required_support(state):
+            self.clear_steps = 0
+            return 0.0
+        self.clear_steps += 1
+
+        clearance_time = max(
+            float(self.params.get("continuous_clearance_time", 0.25)),
+            0.0,
+        )
+        clearance_gate = (
+            1.0
+            if clearance_time == 0.0
+            else float(
+                np.clip(
+                    self.clear_steps * calculator.dt / clearance_time,
+                    0.0,
+                    1.0,
+                )
+            )
+        )
+        free_velocity = max(
+            float(self.params.get("free_joint_velocity", 0.25)),
+            0.0,
+        )
+        velocity_scale = max(
+            float(self.params.get("joint_velocity_scale", 0.75)),
+            1e-6,
+        )
+        velocity_excess = np.maximum(
+            np.abs(np.asarray(state.dof_vel, dtype=np.float64)) - free_velocity,
+            0.0,
+        )
+        motion_gate = float(
+            np.exp(-np.mean(np.square(velocity_excess / velocity_scale)))
+        )
+        max_retention = max(float(self.params.get("max_retention", 1.1)), 0.0)
+        retention = float(
+            np.clip(
+                directed_momentum / max(self.release_momentum, 1e-9),
+                0.0,
+                max_retention,
+            )
+        )
+        return self.release_quality * retention * clearance_gate * motion_gate
+
+    def reset(self) -> None:
+        super().reset()
+        self.release_momentum = None
+        self.release_quality = 0.0
+
+
+class WholeBodyReleaseSpinComponent(GatedPassiveSpinComponent):
+    """Signed absolute whole-body spin objective around the release window."""
+
+    def calculate(self, state, calculator) -> float:
+        time_s = calculator.step_counter * calculator.dt
+        start_time = float(self.params.get("start_time", 0.0))
+        end_time = float(self.params.get("end_time", np.inf))
+        if time_s < start_time or time_s >= end_time:
+            return 0.0
+
+        target = self.params.get("target_angular_velocity", 0.0)
+        if isinstance(target, str) and target.startswith("cmd:"):
+            target = state.get_command_by_name(target[4:])
+        target = float(target)
+        direction = 1.0 if target >= 0.0 else -1.0
+        target_speed = max(abs(target), 1e-6)
+        directed_rate = (
+            direction * self._whole_body_effective_spin_rate(state, calculator)
+        )
+        stalled_cap = abs(float(self.params.get("stalled_penalty", 1.0)))
+        # Keep this dense all the way down to zero. The hard minimum belongs
+        # to the latch/retention gate, not to the launch-learning signal.
+        score = directed_rate / target_speed
+        return float(np.clip(score, -stalled_cap, 1.0))
+
+
+class ClearanceLatchPreparationComponent(GatedPassiveSpinComponent):
+    """Dense release preparation reward until the safe pose latch succeeds."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        end_time = float(self.params.get("end_time", np.inf))
+        time_s = calculator.step_counter * calculator.dt
+        if time_s < start_time or time_s >= end_time:
+            return 0.0
+        if bool(getattr(state, "phase_clearance_latched", False)):
+            return 0.0
+
+        max_contacts = max(float(self.params.get("max_contacts", 4.0)), 1.0)
+        contact_score = 1.0 - min(len(self._active_leg_contacts(state)) / max_contacts, 1.0)
+        support_score = 1.0 if self._has_required_support(state) else 0.0
+
+        limits = np.asarray(
+            self.params.get("joint_limits", np.ones_like(state.dof_pos)),
+            dtype=np.float64,
+        )
+        positions = np.asarray(state.dof_pos, dtype=np.float64)
+        margin = max(float(self.params.get("joint_limit_margin", 0.15)), 1e-6)
+        margin_score = float(
+            np.mean(np.clip((limits - np.abs(positions)) / margin, 0.0, 1.0))
+        )
+
+        clearance_time = max(
+            float(self.params.get("continuous_clearance_time", 0.25)),
+            calculator.dt,
+        )
+        progress = float(
+            np.clip(
+                float(getattr(state, "phase_clearance_steps", 0))
+                * calculator.dt
+                / clearance_time,
+                0.0,
+                1.0,
+            )
+        )
+        return float(
+            0.45 * contact_score
+            + 0.20 * support_score
+            + 0.20 * margin_score
+            + 0.15 * progress
+        )
+
+
+class PhaseLatchSuccessComponent(RewardComponent):
+    """Post-boundary success signal; failed release remains explicitly negative."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        if calculator.step_counter * calculator.dt < start_time:
+            return 0.0
+        return (
+            1.0
+            if bool(getattr(state, "phase_clearance_latched", False))
+            else -abs(float(self.params.get("failure_value", 1.0)))
+        )
+
+
 class TimedHeightTrackingComponent(RewardComponent):
     """Apply height tracking only during a configured time interval."""
 
@@ -750,6 +1167,13 @@ class PlateauSpinComponent(RewardComponent):
     """Plateau-style reward for spinning around gravity axis."""
 
     def calculate(self, state, calculator) -> float:
+        end_time = self.params.get("end_time")
+        if (
+            end_time is not None
+            and calculator.step_counter * calculator.dt >= float(end_time)
+        ):
+            return 0.0
+
         accurate_projected_gravity = quat_rotate_inverse(
             state.accurate_quat, calculator.gravity_vec
         )
@@ -758,11 +1182,12 @@ class PlateauSpinComponent(RewardComponent):
         target_spin = self.params.get("target_spin", 0.0)
 
         if target_spin > 0:
-            return plateau(spin_value, target_spin)
+            score = plateau(spin_value, target_spin)
         elif target_spin < 0:
-            return plateau(-spin_value, -target_spin)
+            score = plateau(-spin_value, -target_spin)
         else:
-            return -np.square(spin_value)
+            score = -np.square(spin_value)
+        return _phase_fade_scale(self.params, calculator) * score
 
 
 class PlateauHeightComponent(RewardComponent):
@@ -908,6 +1333,41 @@ class ActionRateComponent(RewardComponent):
         current_action = state.action_history.last_action
         action_rate = np.sum(np.square(current_action - last_action)) / calculator.dt
         return action_rate
+
+
+class TimedActionRatePenaltyComponent(RewardComponent):
+    """Bounded post-phase cost for continually changing position targets."""
+
+    def calculate(self, state, calculator) -> float:
+        if self.params.get("require_phase_clearance_latched", False) and not bool(
+            getattr(state, "phase_clearance_latched", False)
+        ):
+            return 0.0
+        start_time = float(self.params.get("start_time", 0.0))
+        elapsed = calculator.step_counter * calculator.dt - start_time
+        if elapsed < 0.0:
+            return 0.0
+
+        ramp_time = max(float(self.params.get("ramp_time", 0.0)), 0.0)
+        ramp = (
+            1.0
+            if ramp_time == 0.0
+            else float(np.clip(elapsed / ramp_time, 0.0, 1.0))
+        )
+        free_delta = max(float(self.params.get("free_action_delta", 0.01)), 0.0)
+        delta_scale = max(float(self.params.get("action_delta_scale", 0.10)), 1e-6)
+        max_penalty = max(float(self.params.get("max_penalty", 4.0)), 0.0)
+        current_action = np.asarray(
+            state.action_history.last_action,
+            dtype=np.float64,
+        )
+        last_action = np.asarray(
+            state.action_history.last_last_action,
+            dtype=np.float64,
+        )
+        excess = np.maximum(np.abs(current_action - last_action) - free_delta, 0.0)
+        penalty = float(np.mean(np.square(excess / delta_scale)))
+        return -ramp * min(penalty, max_penalty)
 
 
 class ActionRateRateComponent(RewardComponent):
@@ -1209,6 +1669,17 @@ class WindowedTurningCurveTrackingComponent(RewardComponent):
         return np.asarray(state.raw.pos_world[:2], dtype=np.float32)
 
     def calculate(self, state, calculator) -> float:
+        end_time = self.params.get("end_time")
+        if (
+            end_time is not None
+            and calculator.step_counter * calculator.dt >= float(end_time)
+        ):
+            self.pos_history = []
+            self.yaw_rate_history = []
+            return 0.0
+
+        phase_scale = _phase_fade_scale(self.params, calculator)
+
         window_size = int(self.params.get("window_size", 100))
         tracking_sigma = max(float(self.params.get("tracking_sigma", 0.5)), 1e-6)
         straight_tracking_sigma = max(
@@ -1272,11 +1743,11 @@ class WindowedTurningCurveTrackingComponent(RewardComponent):
         if abs(target_turn_rate) <= turn_command_deadband:
             leakage_rate = heading_path / max(time_elapsed, 1e-6)
             leakage_reward = np.exp(-np.square(leakage_rate) / straight_tracking_sigma)
-            return float(tracking_reward * leakage_reward)
+            return phase_scale * float(tracking_reward * leakage_reward)
 
         turning_consistency = abs(net_heading_change) / (heading_path + 1e-6)
         consistency_scale = (1.0 - consistency_weight) + consistency_weight * turning_consistency
-        return float(tracking_reward * consistency_scale)
+        return phase_scale * float(tracking_reward * consistency_scale)
 
     def reset(self) -> None:
         self.pos_history = []
@@ -1931,6 +2402,11 @@ COMPONENT_REGISTRY = {
     "timed_airborne_spin": TimedAirborneSpinComponent,
     "timed_contact_free_spin": TimedContactFreeSpinComponent,
     "timed_spin_retention": TimedSpinRetentionComponent,
+    "gated_passive_spin": GatedPassiveSpinComponent,
+    "latched_momentum_retention": LatchedMomentumRetentionComponent,
+    "whole_body_release_spin": WholeBodyReleaseSpinComponent,
+    "clearance_latch_preparation": ClearanceLatchPreparationComponent,
+    "phase_latch_success": PhaseLatchSuccessComponent,
     "timed_height_tracking": TimedHeightTrackingComponent,
     "single_leg_support_penalty": SingleLegSupportPenaltyComponent,
     "jump_reward": JumpRewardComponent,
@@ -1947,6 +2423,7 @@ COMPONENT_REGISTRY = {
     "jump_timer": JumpTimerComponent,
     "tripod_jump": TripodJumpComponent,
     "action_rate": ActionRateComponent,
+    "timed_action_rate_penalty": TimedActionRatePenaltyComponent,
     "action_rate_rate": ActionRateRateComponent,
     "action_acceleration": ActionRateRateComponent,
     "action_magnitude_penalty": ActionMagnitudePenaltyComponent,

@@ -2282,7 +2282,284 @@ class MetaMachine(Base, MujocoEnv):
             pos += self.np_random.normal(0, noise_std, size=pos.shape)
             vel += self.np_random.normal(0, noise_std, size=vel.shape)
 
+        velocity_guard = self.cfg.control.get(
+            "velocity_position_guard",
+            None,
+        )
+        if (
+            velocity_guard
+            and velocity_guard.get("enabled", False)
+            and self.joint_control_modes is not None
+        ):
+            limits = np.asarray(
+                velocity_guard.get("joint_limits"),
+                dtype=np.float64,
+            )
+            if limits.shape != vel.shape:
+                raise ValueError(
+                    "velocity_position_guard.joint_limits shape mismatch: "
+                    f"expected {vel.shape}, got {limits.shape}"
+                )
+            margin = max(float(velocity_guard.get("margin", 0.15)), 0.0)
+            recovery_gain = max(
+                float(velocity_guard.get("recovery_gain", 5.0)),
+                0.0,
+            )
+            max_recovery = max(
+                float(velocity_guard.get("max_recovery_velocity", 0.5)),
+                0.0,
+            )
+            dof_pos = np.asarray(
+                self.data.qpos[self.model.jnt_qposadr[self.joint_idx]],
+                dtype=np.float64,
+            )
+            velocity_mask = np.asarray(
+                [mode == "velocity" for mode in self.joint_control_modes]
+            )
+            safe_limit = np.maximum(limits - margin, 0.0)
+            excess = np.maximum(np.abs(dof_pos) - safe_limit, 0.0)
+            moving_outward = np.sign(dof_pos) * vel > 0.0
+            guarded = velocity_mask & (excess > 0.0) & moving_outward
+            recovery = -np.sign(dof_pos) * np.clip(
+                recovery_gain * excess,
+                0.0,
+                max_recovery,
+            )
+            vel[guarded] = recovery[guarded]
+
+        latch_cfg = self.cfg.control.get("phase_clearance_latch", None)
+        if latch_cfg and latch_cfg.get("enabled", False):
+            self._update_phase_clearance_latch(latch_cfg)
+            if self._phase_clearance_latched:
+                residual_limit = np.asarray(
+                    latch_cfg.get("residual_limit", 0.1),
+                    dtype=pos.dtype,
+                )
+                if np.any(residual_limit < 0.0):
+                    raise ValueError(
+                        "phase_clearance_latch residual_limit must be non-negative"
+                    )
+                constrained = self._phase_latched_dof_pos + np.clip(
+                    pos - self._phase_latched_dof_pos,
+                    -residual_limit,
+                    residual_limit,
+                )
+                if self.joint_control_modes is None:
+                    pos = constrained
+                else:
+                    position_mask = np.asarray(
+                        [mode != "velocity" for mode in self.joint_control_modes]
+                    )
+                    pos[position_mask] = constrained[position_mask]
+                    velocity_mask = ~position_mask
+                    velocity_limit = latch_cfg.get(
+                        "velocity_residual_limit",
+                        None,
+                    )
+                    if velocity_limit is not None:
+                        velocity_limit = np.asarray(
+                            velocity_limit,
+                            dtype=vel.dtype,
+                        )
+                        vel[velocity_mask] = np.clip(
+                            vel[velocity_mask],
+                            -velocity_limit,
+                            velocity_limit,
+                        )
+
+        residual_cfg = self.cfg.control.get("phase_position_residual", None)
+        if residual_cfg and residual_cfg.get("enabled", False):
+            start_time = float(residual_cfg.get("start_time", 0.0))
+            if self.step_count * self.dt >= start_time:
+                target = np.asarray(
+                    residual_cfg.get("target_positions"),
+                    dtype=pos.dtype,
+                )
+                if target.shape != pos.shape:
+                    raise ValueError(
+                        "phase_position_residual target_positions shape mismatch: "
+                        f"expected {pos.shape}, got {target.shape}"
+                    )
+                residual_limit = np.asarray(
+                    residual_cfg.get("residual_limit", 0.1),
+                    dtype=pos.dtype,
+                )
+                if np.any(residual_limit < 0.0):
+                    raise ValueError(
+                        "phase_position_residual residual_limit must be non-negative"
+                    )
+                constrained = target + np.clip(
+                    pos - target,
+                    -residual_limit,
+                    residual_limit,
+                )
+                if self.joint_control_modes is None:
+                    pos = constrained
+                else:
+                    position_mask = np.asarray(
+                        [mode != "velocity" for mode in self.joint_control_modes]
+                    )
+                    pos[position_mask] = constrained[position_mask]
+
         return pos, vel
+
+    def _whole_body_effective_spin_rate(self) -> float:
+        """Return total robot angular momentum divided by axial inertia."""
+        masses = np.asarray(self.model.body_mass, dtype=np.float64)
+        body_ids = np.flatnonzero(masses > 0.0)
+        total_mass = float(np.sum(masses[body_ids]))
+        if total_mass <= 0.0:
+            return 0.0
+
+        com_positions = np.asarray(self.data.xipos, dtype=np.float64)
+        system_com = np.sum(
+            masses[body_ids, None] * com_positions[body_ids],
+            axis=0,
+        ) / total_mass
+        up_axis = -np.asarray(
+            self.cfg.observation.get("gravity_vec", [0, 0, -1]),
+            dtype=np.float64,
+        )
+        up_norm = float(np.linalg.norm(up_axis))
+        up_axis = (
+            np.array([0.0, 0.0, 1.0])
+            if up_norm <= 1e-9
+            else up_axis / up_norm
+        )
+
+        angular_momentum = np.zeros(3, dtype=np.float64)
+        effective_inertia = 0.0
+        spatial_velocity = np.zeros(6, dtype=np.float64)
+        for body_id in body_ids:
+            mujoco.mj_objectVelocity(
+                self.model,
+                self.data,
+                mujoco.mjtObj.mjOBJ_BODY,
+                int(body_id),
+                spatial_velocity,
+                0,
+            )
+            omega_world = spatial_velocity[:3].copy()
+            com_velocity = spatial_velocity[3:].copy()
+            rotation = np.asarray(
+                self.data.ximat[body_id],
+                dtype=np.float64,
+            ).reshape(3, 3)
+            inertia_world = (
+                rotation
+                @ np.diag(
+                    np.asarray(self.model.body_inertia[body_id], dtype=np.float64)
+                )
+                @ rotation.T
+            )
+            radius = com_positions[body_id] - system_com
+            angular_momentum += inertia_world @ omega_world
+            angular_momentum += np.cross(
+                radius,
+                masses[body_id] * com_velocity,
+            )
+            effective_inertia += float(up_axis @ inertia_world @ up_axis)
+            effective_inertia += float(
+                masses[body_id]
+                * (
+                    np.dot(radius, radius)
+                    - np.square(np.dot(up_axis, radius))
+                )
+            )
+
+        if effective_inertia <= 1e-9:
+            return 0.0
+        return float(np.dot(up_axis, angular_momentum)) / effective_inertia
+
+    def _update_phase_clearance_latch(self, latch_cfg) -> None:
+        """Latch the achieved pose after a safe, continuously clear release."""
+        if self._phase_clearance_latched:
+            return
+        start_time = float(latch_cfg.get("start_time", 0.0))
+        if self.step_count * self.dt < start_time:
+            self._phase_clearance_steps = 0
+            return
+
+        floor_ids = set(getattr(self, "floor_geom_ids", [0]))
+        floor_contacts = [
+            tuple(int(g) for g in contact.geom)
+            for contact in self.data.contact
+            if int(contact.geom[0]) in floor_ids or int(contact.geom[1]) in floor_ids
+        ]
+        contact_geom_ids = {
+            geom
+            for pair in floor_contacts
+            for geom in pair
+            if geom not in floor_ids
+        }
+        contact_names = [
+            self.model.geom(int(geom_id)).name or ""
+            for geom_id in contact_geom_ids
+        ]
+        leg_tokens = latch_cfg.get(
+            "geom_name_contains",
+            ["hip_geom", "upper_geom", "ankle_geom"],
+        )
+        support_tokens = latch_cfg.get(
+            "required_support_geom_name_contains",
+            ["torso_geom"],
+        )
+        legs_clear = not any(
+            token in name for name in contact_names for token in leg_tokens
+        )
+        has_support = (
+            not support_tokens
+            or any(
+                token in name
+                for name in contact_names
+                for token in support_tokens
+            )
+        )
+
+        dof_pos = np.asarray(
+            self.data.qpos[self.model.jnt_qposadr[self.joint_idx]],
+            dtype=np.float64,
+        )
+        joint_margin = max(float(latch_cfg.get("joint_limit_margin", 0.15)), 0.0)
+        configured_limits = latch_cfg.get(
+            "joint_limits",
+            self.cfg.control.get("custom_limits", None),
+        )
+        limits = (
+            np.asarray(configured_limits, dtype=np.float64)
+            if configured_limits is not None
+            else np.full(self.num_joint, float(self.cfg.control.symmetric_limit))
+        )
+        safe_low = -limits + joint_margin
+        safe_high = limits - joint_margin
+        within_margin = bool(
+            np.all(dof_pos >= safe_low) and np.all(dof_pos <= safe_high)
+        )
+
+        minimum_spin = max(
+            float(latch_cfg.get("minimum_whole_body_spin_rate", 0.0)),
+            0.0,
+        )
+        spin_direction = float(latch_cfg.get("spin_direction", 1.0))
+        directed_spin = (
+            (1.0 if spin_direction >= 0.0 else -1.0)
+            * self._whole_body_effective_spin_rate()
+        )
+        spin_ready = directed_spin >= minimum_spin
+
+        if legs_clear and has_support and within_margin and spin_ready:
+            self._phase_clearance_steps += 1
+        else:
+            self._phase_clearance_steps = 0
+
+        clearance_time = max(
+            float(latch_cfg.get("continuous_clearance_time", 0.25)),
+            0.0,
+        )
+        required_steps = max(1, int(np.ceil(clearance_time / self.dt)))
+        if self._phase_clearance_steps >= required_steps:
+            self._phase_clearance_latched = True
+            self._phase_latched_dof_pos = dof_pos.copy()
 
     def _record_positions(self) -> dict[str, np.ndarray]:
         """Record current robot positions."""
@@ -2790,6 +3067,13 @@ class MetaMachine(Base, MujocoEnv):
             "adjusted_forward_vec": getattr(
                 self, "adjusted_forward_vec", self.forward_vec
             ),
+            "phase_clearance_latched": getattr(
+                self, "_phase_clearance_latched", False
+            ),
+            "phase_clearance_steps": getattr(self, "_phase_clearance_steps", 0),
+            "phase_latched_dof_pos": getattr(
+                self, "_phase_latched_dof_pos", self.default_dof_pos
+            ),
         }
 
         # Contact information
@@ -2873,6 +3157,9 @@ class MetaMachine(Base, MujocoEnv):
         self.last_vel_sim = np.zeros(self.num_joint)
         self.last_last_vel_sim = np.zeros(self.num_joint)
         self.last_com_pos = np.zeros(3)
+        self._phase_clearance_latched = False
+        self._phase_clearance_steps = 0
+        self._phase_latched_dof_pos = self.default_dof_pos.copy()
 
         # Initialize rendering filter
         self.render_lookat_filter = AverageFilter(10)
