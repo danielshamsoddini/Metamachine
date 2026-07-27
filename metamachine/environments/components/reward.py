@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 import numpy as np
+import mujoco
 from omegaconf import OmegaConf
 
 from ...utils.curves import isaac_reward, plateau
@@ -247,6 +248,63 @@ class PersistentFootAirTimePenaltyComponent(RewardComponent):
 
     def reset(self) -> None:
         self.air_times = dict.fromkeys(self.foot_geom_ids, 0.0)
+
+
+class FootSlipPenaltyComponent(RewardComponent):
+    """Penalize horizontal slip of ankle geoms while they contact the floor."""
+
+    DEFAULT_FOOT_GEOM_NAMES = PersistentFootAirTimePenaltyComponent.DEFAULT_FOOT_GEOM_NAMES
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.foot_geom_ids: dict[str, int] = {}
+        self._model_identity: int | None = None
+
+    def _resolve_foot_geoms(self, model) -> None:
+        requested_names = tuple(
+            self.params.get("foot_geom_names", self.DEFAULT_FOOT_GEOM_NAMES)
+        )
+        available = {
+            model.geom(geom_id).name: geom_id
+            for geom_id in range(int(model.ngeom))
+            if model.geom(geom_id).name
+        }
+        missing = [name for name in requested_names if name not in available]
+        if missing:
+            raise ValueError(
+                "foot_slip_penalty could not find foot geoms: "
+                + ", ".join(missing)
+            )
+        self.foot_geom_ids = {name: available[name] for name in requested_names}
+        self._model_identity = id(model)
+
+    def calculate(self, state, calculator) -> float:
+        model = getattr(state, "mj_model", None)
+        data = getattr(state, "mj_data", None)
+        if model is None or data is None:
+            return 0.0
+        if not self.foot_geom_ids or self._model_identity != id(model):
+            self._resolve_foot_geoms(model)
+
+        active_contacts = set(getattr(state, "contact_floor_geoms", []))
+        free_speed = max(float(self.params.get("free_speed", 0.08)), 0.0)
+        speed_scale = max(float(self.params.get("speed_scale", 0.35)), 1e-6)
+        power = max(float(self.params.get("power", 2.0)), 1.0)
+        total_cost = 0.0
+        spatial_velocity = np.empty(6, dtype=np.float64)
+
+        for geom_id in self.foot_geom_ids.values():
+            if geom_id not in active_contacts:
+                continue
+            mujoco.mj_objectVelocity(
+                model, data, mujoco.mjtObj.mjOBJ_GEOM, geom_id, spatial_velocity, 0
+            )
+            planar_speed = float(np.linalg.norm(spatial_velocity[3:5]))
+            normalized_excess = np.clip(
+                (planar_speed - free_speed) / speed_scale, 0.0, 1.0
+            )
+            total_cost += float(normalized_excess**power)
+        return -total_cost
 
 
 class ExcessiveFootHeightPenaltyComponent(RewardComponent):
@@ -802,12 +860,20 @@ class LatchedMomentumRetentionComponent(GatedPassiveSpinComponent):
             return 0.0
 
         momentum, inertia = self._whole_body_momentum_and_inertia(state, calculator)
-        target = self.params.get("target_angular_velocity", 0.0)
-        if isinstance(target, str) and target.startswith("cmd:"):
-            target = state.get_command_by_name(target[4:])
-        target = float(target)
-        direction = 1.0 if target >= 0.0 else -1.0
-        target_speed = max(abs(target), 1e-6)
+        # A passive coast should retain the momentum it actually earned, not
+        # repeatedly chase a prescribed angular speed. New configs therefore
+        # provide an explicit direction and an optional one-sided saturation
+        # rate for release quality. Keep the old target form as a fallback so
+        # existing experiments remain reproducible.
+        target = self.params.get("target_angular_velocity")
+        direction_param = self.params.get("spin_direction")
+        if direction_param is None:
+            if isinstance(target, str) and target.startswith("cmd:"):
+                target = state.get_command_by_name(target[4:])
+            target = float(0.0 if target is None else target)
+            direction = 1.0 if target >= 0.0 else -1.0
+        else:
+            direction = 1.0 if float(direction_param) >= 0.0 else -1.0
         directed_momentum = direction * momentum
 
         if self.release_momentum is None:
@@ -831,8 +897,17 @@ class LatchedMomentumRetentionComponent(GatedPassiveSpinComponent):
             if release_rate < required_release_rate:
                 self.release_quality = 0.0
             else:
+                saturation_rate = max(
+                    float(
+                        self.params.get(
+                            "quality_saturation_rate",
+                            abs(float(target)) if target is not None else required_release_rate,
+                        )
+                    ),
+                    required_release_rate,
+                )
                 self.release_quality = float(
-                    np.clip(release_rate / target_speed, 0.0, 1.0)
+                    np.clip(release_rate / saturation_rate, 0.0, 1.0)
                 )
 
         if self._active_leg_contacts(state) or not self._has_required_support(state):
@@ -896,19 +971,27 @@ class WholeBodyReleaseSpinComponent(GatedPassiveSpinComponent):
         if time_s < start_time or time_s >= end_time:
             return 0.0
 
-        target = self.params.get("target_angular_velocity", 0.0)
-        if isinstance(target, str) and target.startswith("cmd:"):
-            target = state.get_command_by_name(target[4:])
-        target = float(target)
-        direction = 1.0 if target >= 0.0 else -1.0
-        target_speed = max(abs(target), 1e-6)
+        target = self.params.get("target_angular_velocity")
+        direction_param = self.params.get("spin_direction")
+        if direction_param is None:
+            if isinstance(target, str) and target.startswith("cmd:"):
+                target = state.get_command_by_name(target[4:])
+            target = float(0.0 if target is None else target)
+            direction = 1.0 if target >= 0.0 else -1.0
+            saturation_rate = max(abs(target), 1e-6)
+        else:
+            direction = 1.0 if float(direction_param) >= 0.0 else -1.0
+            saturation_rate = max(
+                float(self.params.get("saturation_angular_velocity", 1.0)),
+                1e-6,
+            )
         directed_rate = (
             direction * self._whole_body_effective_spin_rate(state, calculator)
         )
         stalled_cap = abs(float(self.params.get("stalled_penalty", 1.0)))
         # Keep this dense all the way down to zero. The hard minimum belongs
         # to the latch/retention gate, not to the launch-learning signal.
-        score = directed_rate / target_speed
+        score = directed_rate / saturation_rate
         return float(np.clip(score, -stalled_cap, 1.0))
 
 
@@ -2391,6 +2474,7 @@ COMPONENT_REGISTRY = {
     # 'angular_velocity_cmd_tracking': AngularVelocityTrackingCMDComponent,
     "contact_flight_time": ContactFlightTimeComponent,
     "persistent_foot_air_time_penalty": PersistentFootAirTimePenaltyComponent,
+    "foot_slip_penalty": FootSlipPenaltyComponent,
     "excessive_foot_height_penalty": ExcessiveFootHeightPenaltyComponent,
     "dof_velocity_penalty": DOFVelocityPenaltyComponent,
     "timed_dof_velocity_penalty": TimedDOFVelocityPenaltyComponent,
