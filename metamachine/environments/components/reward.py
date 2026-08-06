@@ -77,6 +77,99 @@ def _phase_fade_scale(params, calculator) -> float:
     return float(np.clip((end_time - elapsed) / (end_time - fade_start), 0.0, 1.0))
 
 
+class CommandedRollFlipCompletionComponent(RewardComponent):
+    """Reward one commanded positive body-x roll, then a stable upright finish.
+
+    The component integrates positive body-frame x angular velocity while the
+    command is active.  Crossing ``target_turns * 2π`` before the deadline pays
+    a one-time completion bonus; the remaining episode rewards an upright,
+    low-angular-velocity settle.  With no command, it rewards staying upright
+    and still, so the command has a distinct observable behavior.
+    """
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.reset()
+
+    def reset(self) -> None:
+        self.roll_progress = 0.0
+        self.completed = False
+
+    @staticmethod
+    def _upright_alignment(state, calculator) -> float:
+        projected_gravity = quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
+        return float(np.clip(np.dot(calculator.projected_upward_vec, -projected_gravity), -1.0, 1.0))
+
+    def calculate(self, state, calculator) -> float:
+        command_name = str(self.params.get("command_name", "cmd_flip_x"))
+        command = float(state.get_command_by_name(command_name))
+        active_threshold = float(self.params.get("active_threshold", 0.5))
+        angular_velocity = np.asarray(state.accurate_ang_vel_body, dtype=np.float64)
+        x_rate = float(angular_velocity[0])
+        off_axis_rate = float(np.linalg.norm(angular_velocity[1:]))
+        upright = max(self._upright_alignment(state, calculator), 0.0)
+        total_rate = float(np.linalg.norm(angular_velocity))
+
+        stationary_sigma = max(float(self.params.get("stationary_sigma", 1.5)), 1e-6)
+        stationary = float(np.exp(-np.square(total_rate) / stationary_sigma))
+        idle_scale = float(self.params.get("idle_upright_scale", 0.5))
+        settle_scale = float(self.params.get("settle_upright_scale", 0.5))
+
+        if command < active_threshold:
+            return idle_scale * upright * stationary
+
+        if self.completed:
+            return settle_scale * upright * stationary
+
+        target_rate = max(float(self.params.get("target_roll_rate", 5.0)), 1e-6)
+        off_axis_sigma = max(float(self.params.get("off_axis_sigma", 4.0)), 1e-6)
+        roll_rate_score = float(np.clip(max(x_rate, 0.0) / target_rate, 0.0, 1.0))
+        axis_purity = float(np.exp(-np.square(off_axis_rate) / off_axis_sigma))
+        progress_scale = float(self.params.get("progress_rate_scale", 0.5))
+        reward = progress_scale * roll_rate_score * axis_purity
+
+        target_angle = 2.0 * np.pi * max(float(self.params.get("target_turns", 1.0)), 1e-6)
+        self.roll_progress = min(target_angle, self.roll_progress + max(x_rate, 0.0) * calculator.dt)
+        deadline = float(self.params.get("completion_deadline", np.inf))
+        if self.roll_progress >= target_angle:
+            self.completed = True
+            if calculator.step_counter * calculator.dt <= deadline:
+                reward += float(self.params.get("completion_bonus", 8.0))
+
+        return reward
+
+
+class CommandedAxisAngularVelocityComponent(RewardComponent):
+    """Track a command-scaled body-frame angular velocity about one axis.
+
+    A zero-valued command rewards stopping the chosen rotation. A nonzero
+    command requests ``command_scale * command`` radians/s about ``axis`` and
+    independently suppresses rotation about the other two body axes.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        command_name = str(self.params.get("command_name", "cmd_flip_x"))
+        command = float(state.get_command_by_name(command_name))
+        command_scale = float(self.params.get("command_scale", 1.0))
+        target_rate = command_scale * command
+
+        axis = np.asarray(self.params.get("axis", [1.0, 0.0, 0.0]), dtype=np.float64)
+        axis_norm = float(np.linalg.norm(axis))
+        if axis_norm <= 1e-8:
+            raise ValueError("commanded_axis_angular_velocity requires a nonzero axis")
+        axis /= axis_norm
+
+        angular_velocity = np.asarray(state.accurate_ang_vel_body, dtype=np.float64)
+        axis_rate = float(np.dot(angular_velocity, axis))
+        off_axis_rate = angular_velocity - axis_rate * axis
+
+        tracking_sigma = max(float(self.params.get("tracking_sigma", 1.0)), 1e-6)
+        off_axis_sigma = max(float(self.params.get("off_axis_sigma", 1.0)), 1e-6)
+        rate_reward = np.exp(-np.square(target_rate - axis_rate) / tracking_sigma)
+        axis_reward = np.exp(-np.dot(off_axis_rate, off_axis_rate) / off_axis_sigma)
+        return float(rate_reward * axis_reward)
+
+
 class AngularVelocityTrackingComponent(RewardComponent):
     """Tracks angular velocity around gravity axis."""
 
@@ -2470,6 +2563,8 @@ class StateCoveringIntrinsicRewardComponent(RewardComponent):
 COMPONENT_REGISTRY = {
     "linear_velocity_tracking": LinearVelocityTrackingComponent,
     "angular_velocity_tracking": AngularVelocityTrackingComponent,
+    "commanded_axis_angular_velocity": CommandedAxisAngularVelocityComponent,
+    "commanded_roll_flip_completion": CommandedRollFlipCompletionComponent,
     # 'linear_velocity_cmd_tracking': LinearVelocityTrackingCMDComponent,
     # 'angular_velocity_cmd_tracking': AngularVelocityTrackingCMDComponent,
     "contact_flight_time": ContactFlightTimeComponent,
