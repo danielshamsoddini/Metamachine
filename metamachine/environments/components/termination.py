@@ -75,6 +75,17 @@ class TerminationChecker:
         # Height threshold termination
         self.height_threshold = getattr(term_cfg, "height_threshold", None)
         self.contact_grace_steps = int(getattr(term_cfg, "contact_grace_steps", 0))
+        self.max_yaw_change_radians = getattr(term_cfg, "max_yaw_change_radians", None)
+        if self.max_yaw_change_radians is not None:
+            self.max_yaw_change_radians = abs(float(self.max_yaw_change_radians))
+        self.yaw_reference_command_names = list(
+            getattr(term_cfg, "yaw_reference_command_names", ["cmd_dir_cos", "cmd_dir_sin"])
+        )
+        self.yaw_reference_resets_on_command_change = bool(
+            getattr(term_cfg, "yaw_reference_resets_on_command_change", True)
+        )
+        self._yaw_reference = None
+        self._yaw_reference_command = None
 
         # Robot and observation parameters
         self.gravity_vec = np.array(cfg.observation.gravity_vec)
@@ -135,6 +146,38 @@ class TerminationChecker:
     def reset(self) -> None:
         """Reset the termination checker for a new episode."""
         self.current_step = 0
+        self._yaw_reference = None
+        self._yaw_reference_command = None
+
+    @staticmethod
+    def _world_yaw(quat) -> float:
+        """Return world-z yaw from the simulator's WXYZ quaternion."""
+        w, x, y, z = np.asarray(quat, dtype=np.float64).reshape(-1)[:4]
+        return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+    def _check_max_yaw_change(self, state) -> bool:
+        """End an episode once the torso exceeds its configured yaw budget."""
+        if self.max_yaw_change_radians is None:
+            return False
+        try:
+            command = tuple(
+                float(state.get_command_by_name(name))
+                for name in self.yaw_reference_command_names
+            )
+        except (AttributeError, KeyError):
+            command = None
+        yaw = self._world_yaw(state.accurate_quat)
+        command_changed = command != self._yaw_reference_command
+        if self._yaw_reference is None or (
+            self.yaw_reference_resets_on_command_change and command_changed
+        ):
+            self._yaw_reference = yaw
+            self._yaw_reference_command = command
+            return False
+        yaw_change = float(np.arctan2(
+            np.sin(yaw - self._yaw_reference), np.cos(yaw - self._yaw_reference)
+        ))
+        return abs(yaw_change) > self.max_yaw_change_radians
 
     def set_model(self, model) -> None:
         """Set up body/geom name to geom ID mapping from MuJoCo model.
@@ -195,6 +238,10 @@ class TerminationChecker:
         if self.height_threshold is not None and hasattr(state, "pos"):
             if state.pos[2] < self.height_threshold:  # z-coordinate below threshold
                 return True
+
+        # Enforce any configured torso-yaw budget before other termination rules.
+        if self._check_max_yaw_change(state):
+            return True
 
         # Check strategy-specific termination
         if self.termination_strategy is None:

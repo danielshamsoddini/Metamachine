@@ -1604,6 +1604,22 @@ class RollPitchAngularVelocityPenaltyComponent(RewardComponent):
         return -np.square(excess) / tracking_sigma
 
 
+class YawAngularVelocityPenaltyComponent(RewardComponent):
+    """Penalize excess turning about gravity while allowing small corrections."""
+
+    def calculate(self, state, calculator) -> float:
+        free_angular_velocity = abs(
+            float(self.params.get("free_angular_velocity", 0.0))
+        )
+        tracking_sigma = max(float(self.params.get("tracking_sigma", 1.0)), 1e-6)
+        up_body = -quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
+        up_body = up_body / (np.linalg.norm(up_body) + 1e-8)
+        angular_velocity = np.asarray(state.accurate_ang_vel_body, dtype=np.float64)
+        yaw_rate = abs(float(np.dot(angular_velocity, up_body)))
+        excess = max(yaw_rate - free_angular_velocity, 0.0)
+        return -np.square(excess) / tracking_sigma
+
+
 class ContactForcePenaltyComponent(RewardComponent):
     """Penalize excessive clipped floor-contact force without punishing stance."""
 
@@ -2609,6 +2625,7 @@ COMPONENT_REGISTRY = {
     "contact_force_penalty": ContactForcePenaltyComponent,
     "world_z_velocity_penalty": WorldZVelocityPenaltyComponent,
     "roll_pitch_angular_velocity_penalty": RollPitchAngularVelocityPenaltyComponent,
+    "yaw_angular_velocity_penalty": YawAngularVelocityPenaltyComponent,
     "goal_distance_penalty": GoalDistancePenaltyComponent,
     "goal_progress": GoalProgressComponent,
     "goal_success_bonus": GoalSuccessBonusComponent,
