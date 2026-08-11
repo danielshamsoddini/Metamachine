@@ -1620,6 +1620,127 @@ class YawAngularVelocityPenaltyComponent(RewardComponent):
         return -np.square(excess) / tracking_sigma
 
 
+class InitialHeadingStabilityComponent(RewardComponent):
+    """Penalize deviation from the torso heading sampled at reset."""
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.initial_heading = None
+    def reset(self) -> None:
+        self.initial_heading = None
+    def calculate(self, state, calculator) -> float:
+        heading = float(np.asarray(state.derived.heading).reshape(-1)[0])
+        if self.initial_heading is None:
+            self.initial_heading = heading
+            return 0.0
+        error = float(np.arctan2(np.sin(heading - self.initial_heading), np.cos(heading - self.initial_heading)))
+        free = abs(float(self.params.get("free_deviation_radians", 0.0)))
+        scale = max(float(self.params.get("tracking_sigma", 0.25)), 1e-6)
+        cost = float(np.square(max(abs(error) - free, 0.0) / scale))
+        return -min(cost, max(float(self.params.get("max_penalty", np.inf)), 0.0))
+
+
+class UnwrappedAxisRotationComponent(RewardComponent):
+    """Track signed unwrapped rotation about a body or gravity-aligned axis."""
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.reset()
+    def reset(self) -> None:
+        self.accumulated_rotation = 0.0
+        self.completed = False
+        self.success = False
+        self._completion_bonus_paid = False
+        self._success_bonus_paid = False
+    def _axis_rate(self, state, calculator):
+        angular_velocity = np.asarray(state.accurate_ang_vel_body, dtype=np.float64)
+        if str(self.params.get("axis_mode", "body")) == "gravity":
+            axis = -quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
+        else:
+            axis = np.asarray(self.params.get("axis", [1.0, 0.0, 0.0]), dtype=np.float64)
+        axis /= max(float(np.linalg.norm(axis)), 1e-8)
+        rate = float(np.dot(angular_velocity, axis))
+        return rate, float(np.linalg.norm(angular_velocity - rate * axis))
+    def calculate(self, state, calculator) -> float:
+        direction = 1.0 if float(self.params.get("direction", 1.0)) >= 0 else -1.0
+        rate, off_axis = self._axis_rate(state, calculator)
+        directed_rate = direction * rate
+        self.accumulated_rotation += directed_rate * calculator.dt
+        target_rate = max(float(self.params.get("target_rate", 4.0)), 1e-6)
+        progress = float(np.clip(max(directed_rate, 0.0) / target_rate, 0.0, 1.0))
+        off_axis_sigma = max(float(self.params.get("off_axis_sigma", 6.0)), 1e-6)
+        axis_purity = float(np.exp(-np.square(off_axis) / off_axis_sigma))
+        reward = progress * axis_purity
+        # Net-progress mode charges reverse rotation, so alternating positive and
+        # negative bursts cannot earn a large reward while accumulating zero turn.
+        if str(self.params.get("progress_mode", "positive_rate")) == "signed_rate":
+            reverse_scale = max(float(self.params.get("reverse_penalty_scale", 1.0)), 0.0)
+            normalized_rate = directed_rate / target_rate
+            reward = float(np.clip(normalized_rate, -reverse_scale, 1.0)) * axis_purity
+        if bool(self.params.get("continuous", False)):
+            return reward
+        target = 2.0 * np.pi * max(float(self.params.get("target_turns", 1.0)), 1e-6)
+        if self.accumulated_rotation >= target - abs(float(self.params.get("completion_tolerance_radians", 0.5))):
+            self.completed = True
+            if not self._completion_bonus_paid:
+                reward += float(self.params.get("completion_bonus", 10.0))
+                self._completion_bonus_paid = True
+        if self.completed:
+            upright = float(np.dot(calculator.projected_upward_vec, -quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)))
+            residual = float(np.linalg.norm(state.accurate_ang_vel_body))
+            settled = max(upright, 0.0) * float(np.exp(-np.square(residual) / max(float(self.params.get("settle_angular_sigma", 1.5)), 1e-6)))
+            reward += float(self.params.get("settle_scale", 1.0)) * settled
+            if settled >= float(self.params.get("success_settle_threshold", 0.8)):
+                self.success = True
+                if not self._success_bonus_paid:
+                    reward += float(self.params.get("success_bonus", 20.0))
+                    self._success_bonus_paid = True
+        return reward
+
+
+class JumpPeakRecoveryComponent(RewardComponent):
+    """Record peak height, air time and takeoff, optionally rewarding recovery."""
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.reset()
+    def reset(self) -> None:
+        self.initial_height = None
+        self.peak_height = 0.0
+        self.airborne_time = 0.0
+        self.takeoff_vertical_velocity = 0.0
+        self.was_airborne = False
+        self.success = False
+        self._success_bonus_paid = False
+    def calculate(self, state, calculator) -> float:
+        height = float(state.accurate_pos_world[2])
+        vel = np.asarray(state.accurate_vel_world, dtype=np.float64)
+        settle_time = max(float(self.params.get("baseline_after_seconds", 0.0)), 0.0)
+        if self.initial_height is None and calculator.step_counter * calculator.dt >= settle_time:
+            self.initial_height = height
+        if self.initial_height is None:
+            return 0.0
+        relative_height = height - self.initial_height
+        previous_peak = self.peak_height
+        self.peak_height = max(self.peak_height, relative_height)
+        airborne = len(getattr(state, "contact_floor_geoms", [])) == 0
+        if airborne:
+            self.airborne_time += calculator.dt
+            self.was_airborne = True
+            self.takeoff_vertical_velocity = max(self.takeoff_vertical_velocity, float(vel[2]))
+        # Pay only new peak height, not a standing reward every timestep.
+        reward = max(self.peak_height - previous_peak, 0.0) / max(float(self.params.get("peak_height_scale", 0.25)), 1e-6)
+        if not bool(self.params.get("require_recovery", False)):
+            return reward
+        upright = float(np.dot(calculator.projected_upward_vec, -quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)))
+        stable = (self.was_airborne and not airborne and relative_height >= -float(self.params.get("landing_height_tolerance", 0.12))
+                  and upright >= float(self.params.get("upright_threshold", 0.8))
+                  and float(np.linalg.norm(vel)) <= float(self.params.get("landing_velocity_threshold", 1.5))
+                  and float(np.linalg.norm(state.accurate_ang_vel_body)) <= float(self.params.get("landing_angular_velocity_threshold", 2.0)))
+        if stable and self.peak_height >= float(self.params.get("success_height", 0.20)):
+            self.success = True
+            if not self._success_bonus_paid:
+                reward += float(self.params.get("success_bonus", 10.0))
+                self._success_bonus_paid = True
+        return reward
+
 class ContactForcePenaltyComponent(RewardComponent):
     """Penalize excessive clipped floor-contact force without punishing stance."""
 
@@ -2626,6 +2747,9 @@ COMPONENT_REGISTRY = {
     "world_z_velocity_penalty": WorldZVelocityPenaltyComponent,
     "roll_pitch_angular_velocity_penalty": RollPitchAngularVelocityPenaltyComponent,
     "yaw_angular_velocity_penalty": YawAngularVelocityPenaltyComponent,
+    "initial_heading_stability": InitialHeadingStabilityComponent,
+    "unwrapped_axis_rotation": UnwrappedAxisRotationComponent,
+    "jump_peak_recovery": JumpPeakRecoveryComponent,
     "goal_distance_penalty": GoalDistancePenaltyComponent,
     "goal_progress": GoalProgressComponent,
     "goal_success_bonus": GoalSuccessBonusComponent,
