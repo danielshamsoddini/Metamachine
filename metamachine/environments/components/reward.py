@@ -1201,9 +1201,15 @@ class SingleLegSupportPenaltyComponent(RewardComponent):
 
 
 class JumpRewardComponent(RewardComponent):
-    """Rewards upward velocity."""
+    """Reward upward velocity only in the configured post-settle launch window."""
 
     def calculate(self, state, calculator) -> float:
+        elapsed = calculator.step_counter * calculator.dt
+        if elapsed < float(self.params.get("start_time", 0.0)):
+            return 0.0
+        end_time = self.params.get("end_time")
+        if end_time is not None and elapsed >= float(end_time):
+            return 0.0
         accurate_projected_gravity = quat_rotate_inverse(
             state.accurate_quat, calculator.gravity_vec
         )
@@ -1660,6 +1666,12 @@ class UnwrappedAxisRotationComponent(RewardComponent):
         rate = float(np.dot(angular_velocity, axis))
         return rate, float(np.linalg.norm(angular_velocity - rate * axis))
     def calculate(self, state, calculator) -> float:
+        elapsed = calculator.step_counter * calculator.dt
+        if elapsed < float(self.params.get("start_time", 0.0)):
+            return 0.0
+        end_time = self.params.get("end_time")
+        if end_time is not None and elapsed >= float(end_time):
+            return 0.0
         direction = 1.0 if float(self.params.get("direction", 1.0)) >= 0 else -1.0
         rate, off_axis = self._axis_rate(state, calculator)
         directed_rate = direction * rate
@@ -1709,14 +1721,24 @@ class JumpPeakRecoveryComponent(RewardComponent):
         self.was_airborne = False
         self.success = False
         self._success_bonus_paid = False
+        self._grounded_baseline_steps = 0
+        self.baseline_ready = False
     def calculate(self, state, calculator) -> float:
         height = float(state.accurate_pos_world[2])
         vel = np.asarray(state.accurate_vel_world, dtype=np.float64)
         settle_time = max(float(self.params.get("baseline_after_seconds", 0.0)), 0.0)
-        if self.initial_height is None and calculator.step_counter * calculator.dt >= settle_time:
-            self.initial_height = height
+        min_grounded_steps = max(int(self.params.get("baseline_grounded_steps", 1)), 1)
+        grounded = len(getattr(state, "contact_floor_geoms", [])) > 0
         if self.initial_height is None:
-            return 0.0
+            if calculator.step_counter * calculator.dt >= settle_time and grounded:
+                self._grounded_baseline_steps += 1
+                if self._grounded_baseline_steps >= min_grounded_steps:
+                    self.initial_height = height
+                    self.baseline_ready = True
+            else:
+                self._grounded_baseline_steps = 0
+            if self.initial_height is None:
+                return 0.0
         relative_height = height - self.initial_height
         previous_peak = self.peak_height
         self.peak_height = max(self.peak_height, relative_height)
@@ -2281,6 +2303,27 @@ class HybridDirectionVelocityComponent(RewardComponent):
         return np.exp(-np.square(target_vel - projected_vel) / tracking_sigma)
 
 
+class CommandedPlanarProgressComponent(RewardComponent):
+    """Reward signed commanded world-frame progress with a no-motion cost.
+
+    Zero velocity is never a positive reward. Progress is negative below the
+    minimum speed, zero at that threshold, and reaches one at target speed.
+    Backwards travel is clipped to a bounded negative value.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        target_xy = _resolve_hybrid_target_xy(state, self.params)
+        vel_world = getattr(state, "accurate_vel_world", None)
+        if vel_world is None:
+            vel_world = getattr(state, "vel_world", np.zeros(3))
+        along_speed = float(np.dot(np.asarray(vel_world, dtype=np.float64)[:2], target_xy))
+        minimum_speed = max(float(self.params.get("minimum_speed", 0.20)), 1e-6)
+        target_speed = max(float(self.params.get("target_speed", 0.80)), minimum_speed + 1e-6)
+        reverse_clip = max(float(self.params.get("reverse_clip", 1.0)), 0.0)
+        progress = (along_speed - minimum_speed) / (target_speed - minimum_speed)
+        return float(np.clip(progress, -reverse_clip, 1.0))
+
+
 class HybridDirectionLateralPenaltyComponent(RewardComponent):
     """Penalizes off-axis motion relative to the commanded travel direction.
 
@@ -2760,6 +2803,7 @@ COMPONENT_REGISTRY = {
     "onehot_heading": OneHotHeadingAlignmentComponent,
     "onehot_velocity_tracking": OneHotVelocityTrackingComponent,
     "hybrid_direction_velocity": HybridDirectionVelocityComponent,
+    "commanded_planar_progress": CommandedPlanarProgressComponent,
     "hybrid_direction_lateral_penalty": HybridDirectionLateralPenaltyComponent,
     "hybrid_direction_heading": HybridDirectionHeadingComponent,
     "hybrid_direction_yaw_tracking": HybridDirectionYawTrackingComponent,
