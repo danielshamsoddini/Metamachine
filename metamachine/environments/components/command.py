@@ -127,6 +127,41 @@ class CommandManager:
         self._one_of_each_active = False
         self._prepare_episode_direction_plan()
         self._sample_all_commands()
+        self._apply_timed_overrides()
+
+    def _apply_timed_overrides(self) -> None:
+        """Apply deterministic per-episode command windows after sampling.
+
+        ``task.commands.timed_overrides`` is a list of mappings with inclusive
+        ``start_step``, exclusive optional ``end_step``, and a ``values`` map.
+        It makes discrete skills explicitly commandable as off -> on -> off
+        pulses instead of presenting a permanently active command.
+        """
+        overrides = self.command_cfg.get("timed_overrides", [])
+        for override in overrides:
+            if isinstance(override, DictConfig):
+                override = OmegaConf.to_container(override, resolve=True)
+            if not isinstance(override, dict):
+                raise ValueError("commands.timed_overrides entries must be mappings")
+            start_step = int(override.get("start_step", 0))
+            end_step = override.get("end_step")
+            if self.step_count < start_step:
+                continue
+            if end_step is not None and self.step_count >= int(end_step):
+                continue
+            values = override.get("values", {})
+            if isinstance(values, DictConfig):
+                values = OmegaConf.to_container(values, resolve=True)
+            if not isinstance(values, dict):
+                raise ValueError("commands.timed_overrides.values must be a mapping")
+            for name, value in values.items():
+                try:
+                    index = self.command_names.index(str(name))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Timed command override references unknown command '{name}'"
+                    ) from exc
+                self.commands[index] = float(value)
 
     def _setup_command_specs(self) -> None:
         """Setup command specifications from configuration."""
@@ -464,6 +499,8 @@ class CommandManager:
         # Check if we need to resample commands
         if self.should_resample():
             self.resample()
+        else:
+            self._apply_timed_overrides()
 
     def should_resample(self) -> bool:
         """Check if commands should be resampled."""
@@ -477,6 +514,7 @@ class CommandManager:
     def resample(self) -> None:
         """Resample all commands."""
         self._sample_all_commands()
+        self._apply_timed_overrides()
         self.last_resample_step = self.step_count
 
     def reset(self) -> None:
@@ -485,6 +523,7 @@ class CommandManager:
         self.last_resample_step = 0
         self._prepare_episode_direction_plan()
         self._sample_all_commands()
+        self._apply_timed_overrides()
 
     def set_command(self, index: int, value: float) -> None:
         """Manually set a command value.

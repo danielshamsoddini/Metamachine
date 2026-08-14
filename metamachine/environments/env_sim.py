@@ -1137,6 +1137,22 @@ class MetaMachine(Base, MujocoEnv):
             self.video_frames_dict = {cam["name"]: [] for cam in self.recording_cameras}
             self.trajectory_xs = []
             self.trajectory_ys = []
+            self.trajectory_command_direction = None
+            if self.sim_cfg.get("plot_command_direction", True):
+                command_manager = getattr(self.state, "command_manager", None)
+                if command_manager is not None:
+                    names = command_manager.command_names
+                    command_cfg = getattr(command_manager, "command_cfg", {})
+                    cos_name = str(command_cfg.get("cos_command_name", "cmd_dir_cos"))
+                    sin_name = str(command_cfg.get("sin_command_name", "cmd_dir_sin"))
+                    if cos_name in names and sin_name in names:
+                        direction = np.asarray([
+                            command_manager.get_command_by_name(cos_name),
+                            command_manager.get_command_by_name(sin_name),
+                        ], dtype=np.float64)
+                        norm = float(np.linalg.norm(direction))
+                        if norm > 1e-6:
+                            self.trajectory_command_direction = direction / norm
             self.recording_active = True
             print(f"Video recording started for episode {self.episode_counter} (Cameras: {[c['name'] for c in self.recording_cameras]})")
         else:
@@ -1168,6 +1184,24 @@ class MetaMachine(Base, MujocoEnv):
                     plt.plot(self.trajectory_xs, self.trajectory_ys, label="Robot Trajectory", linewidth=2.5, color="blue", alpha=0.7)
                     plt.scatter(self.trajectory_xs[0], self.trajectory_ys[0], color="green", s=150, marker="o", label="Start", zorder=5)
                     plt.scatter(self.trajectory_xs[-1], self.trajectory_ys[-1], color="red", s=150, marker="X", label="End", zorder=5)
+                    command_direction = getattr(self, "trajectory_command_direction", None)
+                    if command_direction is not None:
+                        span = max(
+                            float(np.ptp(self.trajectory_xs)),
+                            float(np.ptp(self.trajectory_ys)),
+                            0.5,
+                        )
+                        arrow_length = 0.25 * span
+                        start_x, start_y = self.trajectory_xs[0], self.trajectory_ys[0]
+                        plt.arrow(
+                            start_x, start_y,
+                            arrow_length * command_direction[0],
+                            arrow_length * command_direction[1],
+                            color="darkorange", width=0.01 * arrow_length,
+                            head_width=0.06 * arrow_length,
+                            length_includes_head=True, zorder=6,
+                        )
+                        plt.scatter([], [], color="darkorange", marker=">", s=100, label="Command direction")
                     plt.title(f"Robot 2D Trajectory (Episode {self.episode_counter})")
                     plt.xlabel("X Position (meters)")
                     plt.ylabel("Y Position (meters)")

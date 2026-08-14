@@ -94,6 +94,10 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
     def reset(self) -> None:
         self.roll_progress = 0.0
         self.completed = False
+        self.success = False
+        self.command_seen = False
+        self._success_bonus_paid = False
+        self._missed_completion_penalty_paid = False
 
     @staticmethod
     def _upright_alignment(state, calculator) -> float:
@@ -115,25 +119,52 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
         idle_scale = float(self.params.get("idle_upright_scale", 0.5))
         settle_scale = float(self.params.get("settle_upright_scale", 0.5))
 
-        if command < active_threshold:
-            return idle_scale * upright * stationary
-
-        if self.completed:
-            return settle_scale * upright * stationary
+        if command >= active_threshold:
+            self.command_seen = True
 
         target_rate = max(float(self.params.get("target_roll_rate", 5.0)), 1e-6)
+        if self.completed:
+            # A discrete flip must settle once its single turn is complete.  The
+            # scheduled command pulse is normally off by this point; while it
+            # remains on, actively charge continued roll to prevent multi-turn
+            # spinning from replacing the landing phase.
+            if command >= active_threshold:
+                rate_cost = min(abs(x_rate) / target_rate, 1.0)
+                return -float(self.params.get("post_completion_rate_penalty", 1.0)) * rate_cost
+            settled = settle_scale * upright * stationary
+            if settled >= float(self.params.get("success_settle_threshold", 0.75)):
+                self.success = True
+                if not self._success_bonus_paid:
+                    settled += float(self.params.get("success_bonus", 20.0))
+                    self._success_bonus_paid = True
+            return settled
+
+        if command < active_threshold and not self.command_seen:
+            return idle_scale * upright * stationary
+
+        # A discrete command releases the initiation request; it must not erase
+        # the opportunity to finish the turn using the generated momentum.
+        deadline = float(self.params.get("completion_deadline", np.inf))
+        elapsed = calculator.step_counter * calculator.dt
+        if elapsed > deadline:
+            if not self._missed_completion_penalty_paid:
+                self._missed_completion_penalty_paid = True
+                return -float(self.params.get("missed_completion_penalty", 0.5))
+            return 0.0
+
         off_axis_sigma = max(float(self.params.get("off_axis_sigma", 4.0)), 1e-6)
         roll_rate_score = float(np.clip(max(x_rate, 0.0) / target_rate, 0.0, 1.0))
         axis_purity = float(np.exp(-np.square(off_axis_rate) / off_axis_sigma))
         progress_scale = float(self.params.get("progress_rate_scale", 0.5))
+        if command < active_threshold:
+            progress_scale *= float(self.params.get("coast_progress_scale", 0.5))
         reward = progress_scale * roll_rate_score * axis_purity
 
         target_angle = 2.0 * np.pi * max(float(self.params.get("target_turns", 1.0)), 1e-6)
         self.roll_progress = min(target_angle, self.roll_progress + max(x_rate, 0.0) * calculator.dt)
-        deadline = float(self.params.get("completion_deadline", np.inf))
         if self.roll_progress >= target_angle:
             self.completed = True
-            if calculator.step_counter * calculator.dt <= deadline:
+            if elapsed <= deadline:
                 reward += float(self.params.get("completion_bonus", 8.0))
 
         return reward
@@ -150,6 +181,13 @@ class CommandedAxisAngularVelocityComponent(RewardComponent):
     def calculate(self, state, calculator) -> float:
         command_name = str(self.params.get("command_name", "cmd_flip_x"))
         command = float(state.get_command_by_name(command_name))
+        zero_command_start_time = self.params.get("zero_command_start_time")
+        if (
+            zero_command_start_time is not None
+            and command <= 0.0
+            and calculator.step_counter * calculator.dt < float(zero_command_start_time)
+        ):
+            return 0.0
         command_scale = float(self.params.get("command_scale", 1.0))
         target_rate = command_scale * command
 
@@ -1210,6 +1248,15 @@ class JumpRewardComponent(RewardComponent):
         end_time = self.params.get("end_time")
         if end_time is not None and elapsed >= float(end_time):
             return 0.0
+        command_name = self.params.get("command_name")
+        if command_name is not None:
+            active_threshold = float(self.params.get("active_threshold", 0.5))
+            if float(state.get_command_by_name(str(command_name))) < active_threshold:
+                return 0.0
+        if bool(self.params.get("require_ground_contact", False)) and not getattr(
+            state, "contact_floor_geoms", []
+        ):
+            return 0.0
         accurate_projected_gravity = quat_rotate_inverse(
             state.accurate_quat, calculator.gravity_vec
         )
@@ -1749,7 +1796,16 @@ class JumpPeakRecoveryComponent(RewardComponent):
             self.takeoff_vertical_velocity = max(self.takeoff_vertical_velocity, float(vel[2]))
         # Pay only new peak height, not a standing reward every timestep.
         reward = max(self.peak_height - previous_peak, 0.0) / max(float(self.params.get("peak_height_scale", 0.25)), 1e-6)
-        if not bool(self.params.get("require_recovery", False)):
+        success_height = float(self.params.get("success_height", np.inf))
+        require_recovery = bool(self.params.get("require_recovery", False))
+        if not require_recovery:
+            # Maximum-height mode succeeds at the threshold immediately; it
+            # must not be gated by the landing/recovery-only branch below.
+            if self.peak_height >= success_height:
+                self.success = True
+                if not self._success_bonus_paid:
+                    reward += float(self.params.get("success_bonus", 20.0))
+                    self._success_bonus_paid = True
             return reward
         upright = float(np.dot(calculator.projected_upward_vec, -quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)))
         stable = (self.was_airborne and not airborne and relative_height >= -float(self.params.get("landing_height_tolerance", 0.12))
