@@ -78,13 +78,13 @@ def _phase_fade_scale(params, calculator) -> float:
 
 
 class CommandedRollFlipCompletionComponent(RewardComponent):
-    """Reward one commanded positive body-x roll, then a stable upright finish.
+    """Reward a commanded positive body-x rotation and a stable target orientation.
 
-    The component integrates positive body-frame x angular velocity while the
-    command is active.  Crossing ``target_turns * 2π`` before the deadline pays
-    a one-time completion bonus; the remaining episode rewards an upright,
-    low-angular-velocity settle.  With no command, it rewards staying upright
-    and still, so the command has a distinct observable behavior.
+    The component integrates positive body-frame x angular velocity until
+    ``target_turns * 2π``.  After completion it rewards a low-rate settle at
+    ``landing_alignment_target``: ``+1`` is upright and ``-1`` is inverted.
+    This makes a 180 degree X-axis flip distinguishable from a 360 degree
+    somersault that merely returns upright.
     """
 
     def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
@@ -111,7 +111,10 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
         angular_velocity = np.asarray(state.accurate_ang_vel_body, dtype=np.float64)
         x_rate = float(angular_velocity[0])
         off_axis_rate = float(np.linalg.norm(angular_velocity[1:]))
-        upright = max(self._upright_alignment(state, calculator), 0.0)
+        upright_raw = self._upright_alignment(state, calculator)
+        upright = max(upright_raw, 0.0)
+        landing_target = float(np.clip(self.params.get("landing_alignment_target", 1.0), -1.0, 1.0))
+        landing_alignment = max(landing_target * upright_raw, 0.0)
         total_rate = float(np.linalg.norm(angular_velocity))
 
         stationary_sigma = max(float(self.params.get("stationary_sigma", 1.5)), 1e-6)
@@ -131,7 +134,7 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
             if command >= active_threshold:
                 rate_cost = min(abs(x_rate) / target_rate, 1.0)
                 return -float(self.params.get("post_completion_rate_penalty", 1.0)) * rate_cost
-            settled = settle_scale * upright * stationary
+            settled = settle_scale * landing_alignment * stationary
             if settled >= float(self.params.get("success_settle_threshold", 0.75)):
                 self.success = True
                 if not self._success_bonus_paid:
@@ -1787,28 +1790,34 @@ class JumpPeakRecoveryComponent(RewardComponent):
             if self.initial_height is None:
                 return 0.0
         relative_height = height - self.initial_height
-        previous_peak = self.peak_height
-        self.peak_height = max(self.peak_height, relative_height)
         airborne = len(getattr(state, "contact_floor_geoms", [])) == 0
         if airborne:
             self.airborne_time += calculator.dt
             self.was_airborne = True
             self.takeoff_vertical_velocity = max(self.takeoff_vertical_velocity, float(vel[2]))
-        # Pay only new peak height, not a standing reward every timestep.
+
+        # For jump tasks, do not count a tall supported stance as a jump.  Peak
+        # height and its dense reward can be restricted to genuine flight.
+        previous_peak = self.peak_height
+        height_only_while_airborne = bool(self.params.get("height_only_while_airborne", False))
+        if airborne or not height_only_while_airborne:
+            self.peak_height = max(self.peak_height, relative_height)
         reward = max(self.peak_height - previous_peak, 0.0) / max(float(self.params.get("peak_height_scale", 0.25)), 1e-6)
         success_height = float(self.params.get("success_height", np.inf))
         require_recovery = bool(self.params.get("require_recovery", False))
+        min_airborne_time = max(float(self.params.get("min_airborne_time", 0.0)), 0.0)
+        enough_flight = self.airborne_time >= min_airborne_time
         if not require_recovery:
-            # Maximum-height mode succeeds at the threshold immediately; it
-            # must not be gated by the landing/recovery-only branch below.
-            if self.peak_height >= success_height:
+            # Maximum-height mode succeeds at the threshold immediately, but a
+            # supported extension cannot qualify when flight is required.
+            if self.peak_height >= success_height and enough_flight:
                 self.success = True
                 if not self._success_bonus_paid:
                     reward += float(self.params.get("success_bonus", 20.0))
                     self._success_bonus_paid = True
             return reward
         upright = float(np.dot(calculator.projected_upward_vec, -quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)))
-        stable = (self.was_airborne and not airborne and relative_height >= -float(self.params.get("landing_height_tolerance", 0.12))
+        stable = (self.was_airborne and enough_flight and not airborne and relative_height >= -float(self.params.get("landing_height_tolerance", 0.12))
                   and upright >= float(self.params.get("upright_threshold", 0.8))
                   and float(np.linalg.norm(vel)) <= float(self.params.get("landing_velocity_threshold", 1.5))
                   and float(np.linalg.norm(state.accurate_ang_vel_body)) <= float(self.params.get("landing_angular_velocity_threshold", 2.0)))
