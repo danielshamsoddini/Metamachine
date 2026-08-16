@@ -177,6 +177,9 @@ class Base(gym.Env, ABC):
         self._reset_robot()
         self.action_processor.reset(self.state)
         self.state.reset()
+        self.state.position_reference_target = (
+            self.action_processor.current_position_reference.copy()
+        )
         self.reward_calculator.reset()
         self.command_manager.reset()
 
@@ -251,6 +254,9 @@ class Base(gym.Env, ABC):
         # Process action
         processed_action = self.action_processor.process(action)
         self.last_action_flat = self.action_processor.last_action_flat
+        self.state.position_reference_target = (
+            self.action_processor.current_position_reference.copy()
+        )
 
         # Execute action
         action_info = self._perform_action(processed_action)

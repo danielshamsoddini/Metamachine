@@ -193,11 +193,20 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
         if command < active_threshold:
             progress_scale *= float(self.params.get("coast_progress_scale", 0.5))
         reward = progress_scale * roll_rate_score * axis_purity
-        # Dense pose guidance begins after the active command pulse, well before
-        # the binary inverted-settle check, so the landing configuration is learnable.
+        # A landing-pose reward must not give the policy a reason to stop short
+        # of the requested turn. Tasks can require the unwrapped roll integral
+        # to cross the completion target before pose emphasis begins.
         pose_start_time = float(self.params.get("landing_pose_start_time", np.inf))
         pose_reward_scale = max(float(self.params.get("landing_pose_reward_scale", 0.0)), 0.0)
-        if elapsed >= pose_start_time and command < active_threshold and pose_reward_scale > 0.0:
+        target_angle = 2.0 * np.pi * max(float(self.params.get("target_turns", 1.0)), 1e-6)
+        pose_requires_completion = bool(self.params.get("landing_pose_requires_completion", False))
+        pose_is_eligible = not pose_requires_completion or self.roll_progress >= target_angle
+        if (
+            pose_is_eligible
+            and elapsed >= pose_start_time
+            and command < active_threshold
+            and pose_reward_scale > 0.0
+        ):
             reward += pose_reward_scale * self.landing_pose_score
         # The configured signed body-X direction is forward.  Rotation in the
         # opposite direction is explicitly costly rather than merely unrewarded.
@@ -205,7 +214,6 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
         if directed_x_rate < 0.0 and reverse_penalty > 0.0:
             reward -= reverse_penalty * min(abs(directed_x_rate) / target_rate, 1.0)
 
-        target_angle = 2.0 * np.pi * max(float(self.params.get("target_turns", 1.0)), 1e-6)
         # Keep the signed, unwrapped progress: a reversal cancels prior rotation.
         self.roll_progress += directed_x_rate * calculator.dt
         if self.roll_progress >= target_angle:
@@ -1701,6 +1709,34 @@ class ActionMagnitudePenaltyComponent(RewardComponent):
         return -float(np.sum(np.square(action / action_limit)))
 
 
+class ReferenceActionTrackingComponent(RewardComponent):
+    """Reward a standalone policy for matching an observed position teacher."""
+
+    def calculate(self, state, calculator) -> float:
+        start_time = float(self.params.get("start_time", 0.0))
+        end_time = self.params.get("end_time")
+        elapsed = calculator.step_counter * calculator.dt
+        if elapsed < start_time or (
+            end_time is not None and elapsed >= float(end_time)
+        ):
+            return 0.0
+
+        reference = np.asarray(
+            getattr(state, "position_reference_target", np.zeros(state.num_act)),
+            dtype=np.float64,
+        ).reshape(-1)
+        default = np.asarray(
+            state.cfg.control.default_dof_pos,
+            dtype=np.float64,
+        ).reshape(-1)
+        action = np.asarray(state.action_history.last_action, dtype=np.float64).reshape(-1)
+        if reference.shape != action.shape or default.shape != action.shape:
+            raise ValueError("reference action and policy action must have matching DOF dimensions")
+        target_action = reference - default
+        scale = max(float(self.params.get("tracking_scale", 0.25)), 1e-6)
+        return float(np.exp(-np.mean(np.square((action - target_action) / scale))))
+
+
 class WorldZVelocityPenaltyComponent(RewardComponent):
     """Penalize vertical torso bouncing above a small free-motion allowance."""
 
@@ -2930,6 +2966,7 @@ COMPONENT_REGISTRY = {
     "action_rate_rate": ActionRateRateComponent,
     "action_acceleration": ActionRateRateComponent,
     "action_magnitude_penalty": ActionMagnitudePenaltyComponent,
+    "reference_action_tracking": ReferenceActionTrackingComponent,
     "contact_force_penalty": ContactForcePenaltyComponent,
     "world_z_velocity_penalty": WorldZVelocityPenaltyComponent,
     "roll_pitch_angular_velocity_penalty": RollPitchAngularVelocityPenaltyComponent,

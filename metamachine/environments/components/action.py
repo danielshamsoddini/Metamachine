@@ -334,6 +334,7 @@ class ActionProcessor:
         # Control settings
         self.control_mode = cfg.control.control_mode
         self.default_dof_pos = self._get_default_dof(cfg)
+        self._setup_position_reference(cfg)
 
         # Initialize filters
         self._setup_filters(cfg)
@@ -346,6 +347,57 @@ class ActionProcessor:
             (self.num_envs, self.total_joints)
         )  # Full joint space
         self.last_action_flat = np.zeros(self._total_dofs)
+
+    def _setup_position_reference(self, cfg: OmegaConf) -> None:
+        """Configure an optional scripted position baseline for residual RL.
+
+        The baseline is expressed as absolute position targets. The policy still
+        owns every joint: its bounded action is scaled and added as a residual
+        before the usual position filter and controller are applied. This is
+        deliberately opt-in so existing tasks retain their action semantics.
+        """
+        reference_cfg = cfg.control.get("position_reference", {}) or {}
+        self.use_position_reference = bool(reference_cfg.get("enabled", False))
+        self.apply_position_reference = bool(
+            reference_cfg.get("apply_to_actions", True)
+        )
+        self.position_reference_residual_scale = float(
+            reference_cfg.get("residual_scale", 1.0)
+        )
+        self._position_reference_step = 0
+        self._position_reference_keyframes: list[tuple[int, np.ndarray]] = []
+
+        if not self.use_position_reference:
+            self.current_position_reference = np.asarray(
+                self.default_dof_pos, dtype=np.float64
+            ).reshape(-1)
+            return
+
+        keyframes = reference_cfg.get("keyframes", [])
+        if not keyframes:
+            raise ValueError(
+                "control.position_reference.enabled=true requires non-empty keyframes"
+            )
+        for keyframe in keyframes:
+            step = int(keyframe.get("start_step", 0))
+            target = np.asarray(keyframe.get("targets"), dtype=np.float64).reshape(-1)
+            if target.size != self.total_joints:
+                raise ValueError(
+                    "position_reference keyframe target length must equal control.num_actions"
+                )
+            self._position_reference_keyframes.append((step, target))
+        self._position_reference_keyframes.sort(key=lambda item: item[0])
+        if self._position_reference_keyframes[0][0] != 0:
+            raise ValueError("position_reference must provide a start_step: 0 keyframe")
+        self.current_position_reference = self._reference_target_for_step(0)
+
+    def _reference_target_for_step(self, step: int) -> np.ndarray:
+        target = self._position_reference_keyframes[0][1]
+        for start_step, candidate in self._position_reference_keyframes:
+            if step < start_step:
+                break
+            target = candidate
+        return target.copy()
 
     def _get_default_dof(self, cfg) -> np.ndarray:
         """Get default joint positions from config."""
@@ -377,6 +429,9 @@ class ActionProcessor:
         self.last_action.fill(0)
         self.last_action_full.fill(0)
         self.last_action_flat.fill(0)
+        self._position_reference_step = 0
+        if self.use_position_reference:
+            self.current_position_reference = self._reference_target_for_step(0)
 
         # Reset frozen joints processor
         self.frozen_processor.reset(self.cfg.control.dt)
@@ -406,6 +461,22 @@ class ActionProcessor:
 
         # Apply frozen joint patterns
         action_full = self.frozen_processor.apply_frozen_patterns(action_full)
+
+        # A scripted trajectory can either be an action baseline for residual
+        # RL or a teacher signal for a standalone actor. In both cases expose
+        # the current target and advance its clock; only baseline mode changes
+        # the motor action.
+        if self.use_position_reference:
+            reference = self._reference_target_for_step(
+                self._position_reference_step
+            )
+            self.current_position_reference = reference.copy()
+            if self.apply_position_reference:
+                residual = action_full * self.position_reference_residual_scale
+                action_full = self.action_bounds.clip(
+                    reference - self.default_dof_pos + residual
+                )
+            self._position_reference_step += 1
 
         # Store full action
         self.last_action_full = action_full.copy()

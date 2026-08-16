@@ -565,6 +565,12 @@ class State:
         "last_last_last_reward": lambda s: s.reward_history.last_last_last_reward,
         "reward_history": lambda s: s.reward_history.get_history_vector(),
         "commands": lambda s: s.commands,
+        # Absolute target from an optional scripted position-reference
+        # baseline. This makes residual policies phase-aware without hiding
+        # the open-loop packet currently being executed.
+        "position_reference": lambda s: np.asarray(
+            getattr(s, "position_reference_target", np.zeros(s.num_act))
+        ),
         # Per-episode phase features for tasks with time-dependent objectives.
         # phase_transition_time is configured in observation (seconds).
         "launch_phase": lambda s: np.array([
