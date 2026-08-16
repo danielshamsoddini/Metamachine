@@ -92,9 +92,12 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
         self.reset()
 
     def reset(self) -> None:
+        # Signed integral of body-X angular velocity is an unwrapped half-turn
+        # coordinate: reverse rotation subtracts progress rather than being ignored.
         self.roll_progress = 0.0
         self.completed = False
         self.success = False
+        self.settle_time = 0.0
         self.command_seen = False
         self._success_bonus_paid = False
         self._missed_completion_penalty_paid = False
@@ -135,7 +138,13 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
                 rate_cost = min(abs(x_rate) / target_rate, 1.0)
                 return -float(self.params.get("post_completion_rate_penalty", 1.0)) * rate_cost
             settled = settle_scale * landing_alignment * stationary
-            if settled >= float(self.params.get("success_settle_threshold", 0.75)):
+            threshold = float(self.params.get("success_settle_threshold", 0.75))
+            required_hold = max(float(self.params.get("success_settle_hold_seconds", 0.0)), 0.0)
+            require_floor_contact = bool(self.params.get("require_floor_contact_for_success", False))
+            has_floor_contact = bool(getattr(state, "contact_floor_geoms", []) or [])
+            is_settling = settled >= threshold and (not require_floor_contact or has_floor_contact)
+            self.settle_time = self.settle_time + calculator.dt if is_settling else 0.0
+            if self.settle_time >= required_hold:
                 self.success = True
                 if not self._success_bonus_paid:
                     settled += float(self.params.get("success_bonus", 20.0))
@@ -164,7 +173,8 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
         reward = progress_scale * roll_rate_score * axis_purity
 
         target_angle = 2.0 * np.pi * max(float(self.params.get("target_turns", 1.0)), 1e-6)
-        self.roll_progress = min(target_angle, self.roll_progress + max(x_rate, 0.0) * calculator.dt)
+        # Keep the signed, unwrapped progress: a reversal cancels prior rotation.
+        self.roll_progress += x_rate * calculator.dt
         if self.roll_progress >= target_angle:
             self.completed = True
             if elapsed <= deadline:
