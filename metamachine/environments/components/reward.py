@@ -78,7 +78,7 @@ def _phase_fade_scale(params, calculator) -> float:
 
 
 class CommandedRollFlipCompletionComponent(RewardComponent):
-    """Reward a commanded positive body-x rotation and a stable target orientation.
+    """Reward a commanded signed body-X rotation and a stable target orientation.
 
     The component integrates positive body-frame x angular velocity until
     ``target_turns * 2π``.  After completion it rewards a low-rate settle at
@@ -98,6 +98,7 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
         self.completed = False
         self.success = False
         self.settle_time = 0.0
+        self.landing_pose_score = 0.0
         self.command_seen = False
         self._success_bonus_paid = False
         self._missed_completion_penalty_paid = False
@@ -113,6 +114,8 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
         active_threshold = float(self.params.get("active_threshold", 0.5))
         angular_velocity = np.asarray(state.accurate_ang_vel_body, dtype=np.float64)
         x_rate = float(angular_velocity[0])
+        direction = 1.0 if float(self.params.get("rotation_direction", 1.0)) >= 0.0 else -1.0
+        directed_x_rate = direction * x_rate
         off_axis_rate = float(np.linalg.norm(angular_velocity[1:]))
         upright_raw = self._upright_alignment(state, calculator)
         upright = max(upright_raw, 0.0)
@@ -122,6 +125,20 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
 
         stationary_sigma = max(float(self.params.get("stationary_sigma", 1.5)), 1e-6)
         stationary = float(np.exp(-np.square(total_rate) / stationary_sigma))
+        landing_joint_target = self.params.get("landing_joint_target")
+        if landing_joint_target is None:
+            self.landing_pose_score = 1.0
+        else:
+            target = np.asarray(landing_joint_target, dtype=np.float64).reshape(-1)
+            positions = np.asarray(state.accurate_dof_pos, dtype=np.float64).reshape(-1)
+            if target.shape != positions.shape:
+                raise ValueError(
+                    "landing_joint_target must have one value per actuated DOF "
+                    f"({target.size} provided, expected {positions.size})"
+                )
+            joint_error = np.arctan2(np.sin(positions - target), np.cos(positions - target))
+            joint_scale = max(float(self.params.get("landing_joint_tracking_scale", 0.5)), 1e-6)
+            self.landing_pose_score = float(np.exp(-np.mean(np.square(joint_error / joint_scale))))
         idle_scale = float(self.params.get("idle_upright_scale", 0.5))
         settle_scale = float(self.params.get("settle_upright_scale", 0.5))
 
@@ -137,12 +154,17 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
             if command >= active_threshold:
                 rate_cost = min(abs(x_rate) / target_rate, 1.0)
                 return -float(self.params.get("post_completion_rate_penalty", 1.0)) * rate_cost
-            settled = settle_scale * landing_alignment * stationary
+            settled = settle_scale * landing_alignment * stationary * self.landing_pose_score
             threshold = float(self.params.get("success_settle_threshold", 0.75))
             required_hold = max(float(self.params.get("success_settle_hold_seconds", 0.0)), 0.0)
             require_floor_contact = bool(self.params.get("require_floor_contact_for_success", False))
             has_floor_contact = bool(getattr(state, "contact_floor_geoms", []) or [])
-            is_settling = settled >= threshold and (not require_floor_contact or has_floor_contact)
+            min_pose_score = float(self.params.get("landing_joint_min_score", 0.0))
+            is_settling = (
+                settled >= threshold
+                and self.landing_pose_score >= min_pose_score
+                and (not require_floor_contact or has_floor_contact)
+            )
             self.settle_time = self.settle_time + calculator.dt if is_settling else 0.0
             if self.settle_time >= required_hold:
                 self.success = True
@@ -165,16 +187,27 @@ class CommandedRollFlipCompletionComponent(RewardComponent):
             return 0.0
 
         off_axis_sigma = max(float(self.params.get("off_axis_sigma", 4.0)), 1e-6)
-        roll_rate_score = float(np.clip(max(x_rate, 0.0) / target_rate, 0.0, 1.0))
+        roll_rate_score = float(np.clip(max(directed_x_rate, 0.0) / target_rate, 0.0, 1.0))
         axis_purity = float(np.exp(-np.square(off_axis_rate) / off_axis_sigma))
         progress_scale = float(self.params.get("progress_rate_scale", 0.5))
         if command < active_threshold:
             progress_scale *= float(self.params.get("coast_progress_scale", 0.5))
         reward = progress_scale * roll_rate_score * axis_purity
+        # Dense pose guidance begins after the active command pulse, well before
+        # the binary inverted-settle check, so the landing configuration is learnable.
+        pose_start_time = float(self.params.get("landing_pose_start_time", np.inf))
+        pose_reward_scale = max(float(self.params.get("landing_pose_reward_scale", 0.0)), 0.0)
+        if elapsed >= pose_start_time and command < active_threshold and pose_reward_scale > 0.0:
+            reward += pose_reward_scale * self.landing_pose_score
+        # The configured signed body-X direction is forward.  Rotation in the
+        # opposite direction is explicitly costly rather than merely unrewarded.
+        reverse_penalty = max(float(self.params.get("reverse_roll_penalty", 0.0)), 0.0)
+        if directed_x_rate < 0.0 and reverse_penalty > 0.0:
+            reward -= reverse_penalty * min(abs(directed_x_rate) / target_rate, 1.0)
 
         target_angle = 2.0 * np.pi * max(float(self.params.get("target_turns", 1.0)), 1e-6)
         # Keep the signed, unwrapped progress: a reversal cancels prior rotation.
-        self.roll_progress += x_rate * calculator.dt
+        self.roll_progress += directed_x_rate * calculator.dt
         if self.roll_progress >= target_angle:
             self.completed = True
             if elapsed <= deadline:
@@ -1333,6 +1366,41 @@ class LowHeightPenaltyComponent(RewardComponent):
         if max_penalty is not None:
             penalty = min(penalty, abs(float(max_penalty)))
         return -float(penalty)
+
+
+class PairedDOFVelocitySymmetryComponent(RewardComponent):
+    """Lightly reward equal-motion magnitudes within selected mirrored leg pairs.
+
+    It compares absolute joint velocities, so left/right joints may use opposite
+    signed coordinates while still moving symmetrically.  A motion gate returns
+    zero at rest, preventing this term from rewarding standing still.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        elapsed = calculator.step_counter * calculator.dt
+        if elapsed < float(self.params.get("start_time", 0.0)):
+            return 0.0
+        end_time = self.params.get("end_time")
+        if end_time is not None and elapsed >= float(end_time):
+            return 0.0
+        pairs = self.params.get("pairs", [])
+        if not pairs:
+            return 0.0
+        velocities = np.asarray(state.accurate_dof_vel, dtype=np.float64).reshape(-1)
+        scale = max(float(self.params.get("tracking_scale", 3.0)), 1e-6)
+        min_motion = max(float(self.params.get("minimum_pair_speed", 0.5)), 1e-6)
+        pair_scores = []
+        for pair in pairs:
+            if len(pair) != 2:
+                raise ValueError("paired_dof_velocity_symmetry pairs must contain exactly two indices")
+            first, second = (int(pair[0]), int(pair[1]))
+            if not (0 <= first < velocities.size and 0 <= second < velocities.size):
+                raise ValueError("paired_dof_velocity_symmetry pair index is out of bounds")
+            first_speed, second_speed = abs(float(velocities[first])), abs(float(velocities[second]))
+            symmetry = float(np.exp(-np.square((first_speed - second_speed) / scale)))
+            motion_gate = float(np.clip((first_speed + second_speed) / (2.0 * min_motion), 0.0, 1.0))
+            pair_scores.append(symmetry * motion_gate)
+        return float(np.mean(pair_scores))
 
 
 class DOFPositionTrackingComponent(RewardComponent):
@@ -2848,6 +2916,7 @@ COMPONENT_REGISTRY = {
     "height_tracking": HeightTrackingComponent,
     "torso_contact_penalty": TorsoContactPenaltyComponent,
     "low_height_penalty": LowHeightPenaltyComponent,
+    "paired_dof_velocity_symmetry": PairedDOFVelocitySymmetryComponent,
     "dof_position_tracking": DOFPositionTrackingComponent,
     "timed_dof_position_tracking": TimedDOFPositionTrackingComponent,
     "plateau_angular_velocity": PlateauAngularVelocityComponent,
