@@ -36,6 +36,10 @@ class TerminationStrategy(Enum):
     THREE_FEET = "three_feet"
     BALL_FALL = "ball_fall"
     BODY_CONTACT_FLOOR = "body_contact_floor"
+    REQUIRED_SUPPORT_CONTACT = "required_support_contact"
+    REQUIRED_SUPPORT_OR_BODY_CONTACT_FLOOR = "required_support_or_body_contact_floor"
+    BALLANCE_AUTO_OR_REQUIRED_SUPPORT_CONTACT = "ballance_auto_or_required_support_contact"
+    BALLANCE_AUTO_OR_REQUIRED_SUPPORT_OR_BODY_CONTACT_FLOOR = "ballance_auto_or_required_support_or_body_contact_floor"
 
 
 class TerminationChecker:
@@ -128,6 +132,9 @@ class TerminationChecker:
 
         # Will be populated by set_model() with geom IDs for the configured bodies/geoms
         self._body_contact_geom_ids = set()
+        self.required_support_geom_name_contains = list(getattr(term_cfg, "required_support_geom_name_contains", []))
+        self._required_support_geom_ids = set()
+
 
     def _setup_termination_handlers(self) -> None:
         """Set up mapping of termination strategies to their handler functions."""
@@ -146,6 +153,10 @@ class TerminationChecker:
             TerminationStrategy.THREE_FEET: self._check_three_feet,
             TerminationStrategy.BALL_FALL: self._check_ball_fall,
             TerminationStrategy.BODY_CONTACT_FLOOR: self._check_body_contact_floor,
+            TerminationStrategy.REQUIRED_SUPPORT_CONTACT: self._check_required_support_contact,
+            TerminationStrategy.REQUIRED_SUPPORT_OR_BODY_CONTACT_FLOOR: self._check_required_support_or_body_contact_floor,
+            TerminationStrategy.BALLANCE_AUTO_OR_REQUIRED_SUPPORT_CONTACT: self._check_ballance_auto_or_required_support_contact,
+            TerminationStrategy.BALLANCE_AUTO_OR_REQUIRED_SUPPORT_OR_BODY_CONTACT_FLOOR: self._check_ballance_auto_or_required_support_or_body_contact_floor,
         }
 
     def reset(self) -> None:
@@ -185,6 +196,11 @@ class TerminationChecker:
         return abs(yaw_change) > self.max_yaw_change_radians
 
     def set_model(self, model) -> None:
+        self._required_support_geom_ids = set()
+        for token in self.required_support_geom_name_contains:
+            for geom_id in range(model.ngeom):
+                if token in (model.geom(geom_id).name or ""):
+                    self._required_support_geom_ids.add(geom_id)
         """Set up body/geom name to geom ID mapping from MuJoCo model.
 
         This method should be called after the MuJoCo model is loaded to
@@ -196,7 +212,6 @@ class TerminationChecker:
         if self.terminate_on_body_contact is None and self.terminate_on_geom_contact is None:
             return
 
-        self._body_contact_geom_ids = set()
 
         # Process body names - find all geoms belonging to each body
         if self.terminate_on_body_contact is not None:
@@ -317,6 +332,31 @@ class TerminationChecker:
             )
             < self.orientation_threshold
         )
+
+    def _check_required_support_contact(self, state) -> bool:
+        if self.current_step < self.contact_grace_steps:
+            return False
+        if not self._required_support_geom_ids:
+            return True
+        contacts = set(getattr(state, "contact_floor_geoms", []) or [])
+        return not bool(self._required_support_geom_ids & contacts)
+
+    def _check_required_support_or_body_contact_floor(self, state) -> bool:
+        if self.current_step < self.contact_grace_steps:
+            return False
+        return self._check_required_support_contact(state) or self._check_body_contact_floor(state)
+
+    def _check_ballance_auto_or_required_support_contact(self, state) -> bool:
+        return self._check_ballance_auto(state) or self._check_required_support_contact(state)
+
+    def _check_ballance_auto_or_required_support_or_body_contact_floor(self, state) -> bool:
+        if self._check_ballance_auto(state):
+            return True
+        if self.current_step < self.contact_grace_steps:
+            return False
+        return (self._check_required_support_contact(state)
+                or self._check_body_contact_floor(state))
+
 
     def _check_ballance_auto_or_body_contact_floor(self, state) -> bool:
         """Terminate if balance is lost or any configured body/geom contacts floor."""

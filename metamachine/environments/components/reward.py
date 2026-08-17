@@ -1356,6 +1356,21 @@ class TorsoContactPenaltyComponent(RewardComponent):
         return -float(torso_touch_floor)
 
 
+class RequiredSupportContactRewardComponent(RewardComponent):
+    """Dense reward for maintaining one of the configured support geoms on floor."""
+
+    def calculate(self, state, calculator) -> float:
+        tokens = self.params.get("required_support_geom_name_contains", ["torso_geom"])
+        model = getattr(state, "mj_model", None)
+        if model is None:
+            return -1.0
+        for geom_id in (getattr(state, "contact_floor_geoms", []) or []):
+            name = model.geom(int(geom_id)).name or ""
+            if any(str(token) in name for token in tokens):
+                return 1.0
+        return -1.0
+
+
 class ExcessiveTorsoHeightPenaltyComponent(RewardComponent):
     """Penalize torso rises far above the episode's ground-supported reset height."""
 
@@ -1533,6 +1548,14 @@ class PlateauSpinComponent(RewardComponent):
         return _phase_fade_scale(self.params, calculator) * score
 
 
+class AbsoluteYawRateComponent(RewardComponent):
+    def calculate(self, state, calculator) -> float:
+        projected_gravity = quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
+        yaw_rate = abs(float(np.dot(-projected_gravity, state.accurate_ang_vel_body)))
+        target = max(float(self.params.get("target_speed", 0.4)), 1e-6)
+        return float(np.clip(yaw_rate / target, 0.0, 1.0))
+
+
 class PlateauHeightComponent(RewardComponent):
     """Plateau-style reward for height tracking."""
 
@@ -1547,10 +1570,15 @@ class RecoveryRewardComponent(RewardComponent):
 
     def calculate(self, state, calculator) -> float:
         tracking_sigma = self.params.get("tracking_sigma", 10.0)
+        elapsed = calculator.step_counter * calculator.dt
+        start_time = float(self.params.get("start_time", 0.0))
+        end_time = self.params.get("end_time")
+        if elapsed < start_time or (end_time is not None and elapsed >= float(end_time)):
+            return 0.0
 
         # DOF position tracking
         dof_reward = isaac_reward(
-            normalize_angle(np.array(state.default_dof_pos)),
+            normalize_angle(np.array(state.cfg.control.default_dof_pos)),
             normalize_angle(state.accurate_dof_pos),
             tracking_sigma,
         )
@@ -1610,7 +1638,7 @@ class TripodJumpComponent(RewardComponent):
 
         # DOF tracking
         dof_reward = isaac_reward(
-            normalize_angle(np.array(state.default_dof_pos)),
+            normalize_angle(np.array(state.cfg.control.default_dof_pos)),
             normalize_angle(state.accurate_dof_pos),
             10.0,
         )
@@ -3079,6 +3107,7 @@ COMPONENT_REGISTRY = {
     "orientation_reward": OrientationRewardComponent,
     "height_tracking": HeightTrackingComponent,
     "torso_contact_penalty": TorsoContactPenaltyComponent,
+    "required_support_contact": RequiredSupportContactRewardComponent,
     "excessive_torso_height_penalty": ExcessiveTorsoHeightPenaltyComponent,
     "low_height_penalty": LowHeightPenaltyComponent,
     "paired_dof_velocity_symmetry": PairedDOFVelocitySymmetryComponent,
@@ -3086,6 +3115,7 @@ COMPONENT_REGISTRY = {
     "timed_dof_position_tracking": TimedDOFPositionTrackingComponent,
     "plateau_angular_velocity": PlateauAngularVelocityComponent,
     "plateau_spin": PlateauSpinComponent,
+    "absolute_yaw_rate": AbsoluteYawRateComponent,
     "plateau_height": PlateauHeightComponent,
     "recovery_reward": RecoveryRewardComponent,
     "jump_timer": JumpTimerComponent,
