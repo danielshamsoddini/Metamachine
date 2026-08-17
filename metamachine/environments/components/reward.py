@@ -1371,6 +1371,38 @@ class RequiredSupportContactRewardComponent(RewardComponent):
         return -1.0
 
 
+class GroundedLegSpinComponent(RewardComponent):
+    """Reward yaw only while torso support and multiple leg contacts are active."""
+
+    def calculate(self, state, calculator) -> float:
+        model = getattr(state, "mj_model", None)
+        if model is None:
+            return -1.0
+        contacts = list(getattr(state, "contact_floor_geoms", []) or [])
+        names = [model.geom(int(geom_id)).name or "" for geom_id in contacts]
+        torso_tokens = self.params.get("torso_geom_name_contains", ["torso_geom"])
+        leg_tokens = self.params.get(
+            "leg_geom_name_contains", ["hip_geom", "upper_geom", "ankle_geom"]
+        )
+        torso_supported = any(
+            any(str(token) in name for token in torso_tokens) for name in names
+        )
+        leg_contacts = sum(
+            any(str(token) in name for token in leg_tokens) for name in names
+        )
+        if not torso_supported or leg_contacts < int(self.params.get("min_leg_contacts", 2)):
+            return -1.0
+        dof_speed = float(np.mean(np.abs(np.asarray(state.dof_vel, dtype=float))))
+        if dof_speed < float(self.params.get("min_leg_dof_speed", 0.15)):
+            return -0.25
+        gravity_body = quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
+        yaw_rate = float(np.dot(-gravity_body, state.accurate_ang_vel_body))
+        target_rate = max(float(self.params.get("target_rate", 0.6)), 1e-6)
+        min_signed_rate = float(self.params.get("min_signed_rate", 0.0))
+        signed_rate = float(self.params.get("direction", 1.0)) * yaw_rate
+        return float(np.tanh((signed_rate - min_signed_rate) / target_rate))
+
+
 class ExcessiveTorsoHeightPenaltyComponent(RewardComponent):
     """Penalize torso rises far above the episode's ground-supported reset height."""
 
@@ -3108,6 +3140,7 @@ COMPONENT_REGISTRY = {
     "height_tracking": HeightTrackingComponent,
     "torso_contact_penalty": TorsoContactPenaltyComponent,
     "required_support_contact": RequiredSupportContactRewardComponent,
+    "grounded_leg_spin": GroundedLegSpinComponent,
     "excessive_torso_height_penalty": ExcessiveTorsoHeightPenaltyComponent,
     "low_height_penalty": LowHeightPenaltyComponent,
     "paired_dof_velocity_symmetry": PairedDOFVelocitySymmetryComponent,
