@@ -2515,6 +2515,7 @@ class HybridDirectionLateralPenaltyComponent(RewardComponent):
     def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
         super().__init__(name, weight, **kwargs)
         self.pos_history: list[np.ndarray] = []
+        self.last_target_xy: Optional[np.ndarray] = None
 
     def _get_planar_position(self, state) -> np.ndarray:
         use_weld_cluster = self.params.get("use_weld_cluster", False)
@@ -2547,6 +2548,17 @@ class HybridDirectionLateralPenaltyComponent(RewardComponent):
         window_size = int(self.params.get("window_size", 50))
         target_xy = _resolve_hybrid_target_xy(state, self.params)
 
+        # A world-direction command change starts a new cross-track segment.
+        # Without this reset, the previous command's legitimate displacement
+        # is measured against the new direction for a full history window.
+        if (
+            bool(self.params.get("reset_on_command_change", False))
+            and self.last_target_xy is not None
+            and float(np.dot(target_xy, self.last_target_xy)) < 0.999
+        ):
+            self.pos_history = []
+        self.last_target_xy = target_xy.copy()
+
         self.pos_history.append(self._get_planar_position(state))
         if len(self.pos_history) > window_size:
             self.pos_history.pop(0)
@@ -2572,6 +2584,7 @@ class HybridDirectionLateralPenaltyComponent(RewardComponent):
 
     def reset(self) -> None:
         self.pos_history = []
+        self.last_target_xy = None
 
 
 class HybridDirectionHeadingComponent(RewardComponent):
