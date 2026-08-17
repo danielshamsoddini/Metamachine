@@ -1356,6 +1356,31 @@ class TorsoContactPenaltyComponent(RewardComponent):
         return -float(torso_touch_floor)
 
 
+class ExcessiveTorsoHeightPenaltyComponent(RewardComponent):
+    """Penalize torso rises far above the episode's ground-supported reset height."""
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.reset()
+
+    def reset(self) -> None:
+        self.initial_height = None
+
+    def calculate(self, state, calculator) -> float:
+        position = getattr(getattr(state, "accurate", None), "pos_world", None)
+        if position is None:
+            position = state.raw.pos_world
+        height = float(np.asarray(position, dtype=np.float64).reshape(-1)[2])
+        if self.initial_height is None:
+            self.initial_height = height
+            return 0.0
+        allowed_rise = max(float(self.params.get("allowed_rise", 0.25)), 0.0)
+        excess = max(height - self.initial_height - allowed_rise, 0.0)
+        scale = max(float(self.params.get("tracking_sigma", 0.15)), 1e-6)
+        max_penalty = max(float(self.params.get("max_penalty", 1.0)), 0.0)
+        return -min((excess / scale) ** 2, max_penalty)
+
+
 class LowHeightPenaltyComponent(RewardComponent):
     """Penalizes torso getting too close to the ground."""
 
@@ -2506,6 +2531,61 @@ class CommandedPlanarProgressComponent(RewardComponent):
         return float(np.clip(progress, -reverse_clip, 1.0))
 
 
+class GatedAxisRollingProgressComponent(CommandedPlanarProgressComponent):
+    """Reward commanded translation only while rotating about a directed body axis."""
+
+    def _directed_rate(self, state) -> float:
+        axis = np.asarray(self.params.get("axis", [1.0, 0.0, 0.0]), dtype=np.float64)
+        axis /= max(float(np.linalg.norm(axis)), 1e-8)
+        rate = float(np.dot(np.asarray(state.accurate_ang_vel_body, dtype=np.float64), axis))
+        return (1.0 if float(self.params.get("direction", 1.0)) >= 0.0 else -1.0) * rate
+
+    def calculate(self, state, calculator) -> float:
+        progress = super().calculate(state, calculator)
+        # Backward/no-motion costs remain active; only positive translation is
+        # conditional on rolling, so a stationary policy cannot exploit a gate.
+        if progress <= 0.0:
+            return progress
+        gate_rate = float(self.params.get("gate_rate", 1.5))
+        gate_sigma = max(float(self.params.get("gate_sigma", 0.5)), 1e-6)
+        z = np.clip((self._directed_rate(state) - gate_rate) / gate_sigma, -60.0, 60.0)
+        return float(progress / (1.0 + np.exp(-z)))
+
+
+class DirectedAxisRollRequirementComponent(RewardComponent):
+    """Cost insufficient sustained directed rolling after a short startup window."""
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.reset()
+
+    def reset(self) -> None:
+        self.accumulated_rotation = 0.0
+
+    def calculate(self, state, calculator) -> float:
+        axis = np.asarray(self.params.get("axis", [1.0, 0.0, 0.0]), dtype=np.float64)
+        axis /= max(float(np.linalg.norm(axis)), 1e-8)
+        rate = float(np.dot(np.asarray(state.accurate_ang_vel_body, dtype=np.float64), axis))
+        directed_rate = (1.0 if float(self.params.get("direction", 1.0)) >= 0.0 else -1.0) * rate
+        self.accumulated_rotation += max(directed_rate, 0.0) * calculator.dt
+        elapsed = calculator.step_counter * calculator.dt
+        if elapsed < float(self.params.get("grace_time", 0.5)):
+            return 0.0
+        minimum_rate = max(float(self.params.get("minimum_rate", 1.5)), 1e-6)
+        deficit = np.clip(
+            (minimum_rate - directed_rate) / minimum_rate,
+            0.0,
+            float(self.params.get("max_rate_deficit", 1.0)),
+        )
+        penalty = -float(deficit)
+        deadline = self.params.get("deadline_time")
+        if deadline is not None and elapsed >= float(deadline):
+            required = float(self.params.get("minimum_accumulated_rotation", 2.0 * np.pi))
+            if self.accumulated_rotation < required:
+                penalty -= float(self.params.get("deadline_extra_penalty", 0.0))
+        return penalty
+
+
 class HybridDirectionLateralPenaltyComponent(RewardComponent):
     """Penalizes off-axis motion relative to the commanded travel direction.
 
@@ -2994,6 +3074,7 @@ COMPONENT_REGISTRY = {
     "orientation_reward": OrientationRewardComponent,
     "height_tracking": HeightTrackingComponent,
     "torso_contact_penalty": TorsoContactPenaltyComponent,
+    "excessive_torso_height_penalty": ExcessiveTorsoHeightPenaltyComponent,
     "low_height_penalty": LowHeightPenaltyComponent,
     "paired_dof_velocity_symmetry": PairedDOFVelocitySymmetryComponent,
     "dof_position_tracking": DOFPositionTrackingComponent,
@@ -3028,6 +3109,8 @@ COMPONENT_REGISTRY = {
     "onehot_velocity_tracking": OneHotVelocityTrackingComponent,
     "hybrid_direction_velocity": HybridDirectionVelocityComponent,
     "commanded_planar_progress": CommandedPlanarProgressComponent,
+    "gated_axis_rolling_progress": GatedAxisRollingProgressComponent,
+    "directed_axis_roll_requirement": DirectedAxisRollRequirementComponent,
     "hybrid_direction_lateral_penalty": HybridDirectionLateralPenaltyComponent,
     "command_segment_cross_track": CommandSegmentCrossTrackPenaltyComponent,
     "hybrid_direction_heading": HybridDirectionHeadingComponent,
