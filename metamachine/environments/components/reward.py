@@ -2506,7 +2506,12 @@ class HybridDirectionVelocityComponent(RewardComponent):
         if vel_world is None:
             vel_world = getattr(state, "vel_world", np.zeros(3))
 
-        projected_vel = float(np.dot(np.asarray(vel_world)[:2], target_xy))
+        velocity_xy = np.asarray(vel_world, dtype=np.float64)[:2]
+        if bool(self.params.get("full_vector_tracking", False)):
+            # Opt-in 2D target: sideways velocity cannot earn commanded-speed reward.
+            error_sq = float(np.dot(velocity_xy - target_vel * target_xy, velocity_xy - target_vel * target_xy))
+            return np.exp(-error_sq / tracking_sigma)
+        projected_vel = float(np.dot(velocity_xy, target_xy))
         return np.exp(-np.square(target_vel - projected_vel) / tracking_sigma)
 
 
