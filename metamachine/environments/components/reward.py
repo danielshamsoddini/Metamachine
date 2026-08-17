@@ -1483,6 +1483,68 @@ class PairedDOFVelocitySymmetryComponent(RewardComponent):
         return float(np.mean(pair_scores))
 
 
+class CommandedPairDOFVelocitySymmetryComponent(PairedDOFVelocitySymmetryComponent):
+    """Command-relative symmetry across the physically appropriate leg pairs.
+
+    A fixed left/right pairing is appropriate for a forward/backward gait but
+    counterproductive for lateral travel. This component resolves the command
+    relative to the episode's initial body heading and blends longitudinal,
+    transverse, and diagonal pair scores according to that direction.
+    """
+
+    @staticmethod
+    def _pair_score(velocities: np.ndarray, pairs, scale: float, min_motion: float) -> float:
+        scores = []
+        for pair in pairs:
+            if len(pair) != 2:
+                raise ValueError("commanded_pair_dof_velocity_symmetry pairs must contain exactly two indices")
+            first, second = (int(pair[0]), int(pair[1]))
+            if not (0 <= first < velocities.size and 0 <= second < velocities.size):
+                raise ValueError("commanded_pair_dof_velocity_symmetry pair index is out of bounds")
+            first_speed, second_speed = abs(float(velocities[first])), abs(float(velocities[second]))
+            symmetry = float(np.exp(-np.square((first_speed - second_speed) / scale)))
+            motion_gate = float(np.clip((first_speed + second_speed) / (2.0 * min_motion), 0.0, 1.0))
+            scores.append(symmetry * motion_gate)
+        return float(np.mean(scores)) if scores else 0.0
+
+    def calculate(self, state, calculator) -> float:
+        elapsed = calculator.step_counter * calculator.dt
+        if elapsed < float(self.params.get("start_time", 0.0)):
+            return 0.0
+        end_time = self.params.get("end_time")
+        if end_time is not None and elapsed >= float(end_time):
+            return 0.0
+
+        velocities = np.asarray(state.accurate_dof_vel, dtype=np.float64).reshape(-1)
+        scale = max(float(self.params.get("tracking_scale", 3.0)), 1e-6)
+        min_motion = max(float(self.params.get("minimum_pair_speed", 0.5)), 1e-6)
+        longitudinal_pairs = self.params.get("longitudinal_pairs", [])
+        transverse_pairs = self.params.get("transverse_pairs", [])
+        diagonal_pairs = self.params.get("diagonal_pairs", [])
+        if not (longitudinal_pairs and transverse_pairs and diagonal_pairs):
+            return 0.0
+
+        target_xy = _resolve_hybrid_target_xy(state, self.params)
+        initial_heading = float(np.asarray(state.derived.initial_heading).reshape(-1)[0])
+        initial_forward = np.array([np.cos(initial_heading), np.sin(initial_heading)])
+        initial_lateral = np.array([-initial_forward[1], initial_forward[0]])
+        forward_component = abs(float(np.dot(target_xy, initial_forward)))
+        lateral_component = abs(float(np.dot(target_xy, initial_lateral)))
+        weights = np.array(
+            [forward_component**2, lateral_component**2, 2.0 * forward_component * lateral_component],
+            dtype=np.float64,
+        )
+        scores = np.array(
+            [
+                self._pair_score(velocities, longitudinal_pairs, scale, min_motion),
+                self._pair_score(velocities, transverse_pairs, scale, min_motion),
+                self._pair_score(velocities, diagonal_pairs, scale, min_motion),
+            ],
+            dtype=np.float64,
+        )
+        return float(np.dot(weights, scores) / max(float(np.sum(weights)), 1e-8))
+
+
 class DOFPositionTrackingComponent(RewardComponent):
     """Tracks desired DOF positions."""
 
@@ -2596,6 +2658,51 @@ class CommandedPlanarProgressComponent(RewardComponent):
         return float(np.clip(progress, -reverse_clip, 1.0))
 
 
+class CommandedSpeedFloorComponent(RewardComponent):
+    """Require useful commanded-direction speed without targeting one exact velocity.
+
+    Speeds below ``minimum_speed`` receive a signed quadratic cost. Above the
+    floor, reward grows logarithmically up to ``saturation_speed``: moving
+    faster remains useful, but the marginal incentive falls instead of
+    producing an unnatural exact-speed gait.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        target_xy = _resolve_hybrid_target_xy(state, self.params)
+        vel_world = getattr(state, "accurate_vel_world", None)
+        if vel_world is None:
+            vel_world = getattr(state, "vel_world", np.zeros(3))
+        along_speed = float(np.dot(np.asarray(vel_world, dtype=np.float64)[:2], target_xy))
+
+        minimum_speed = max(float(self.params.get("minimum_speed", 0.65)), 1e-6)
+        saturation_speed = max(
+            float(self.params.get("saturation_speed", 1.4)), minimum_speed + 1e-6
+        )
+        slow_penalty = max(float(self.params.get("slow_penalty", 1.0)), 0.0)
+        max_bonus = max(float(self.params.get("max_bonus", 1.0)), 0.0)
+
+        if along_speed < minimum_speed:
+            deficit = (minimum_speed - along_speed) / minimum_speed
+            return -slow_penalty * float(np.square(deficit))
+
+        excess = min(along_speed, saturation_speed) - minimum_speed
+        denominator = np.log1p(saturation_speed - minimum_speed)
+        bonus = np.log1p(excess) / max(float(denominator), 1e-8)
+        # A scalar speed floor must not let the policy trade large sideways
+        # velocity for commanded progress. This soft gate restores the old
+        # full-vector objective's directional preference without reintroducing
+        # an exact target speed.
+        lateral_sigma = self.params.get("lateral_speed_sigma")
+        if lateral_sigma is not None:
+            lateral_axis = np.array([-target_xy[1], target_xy[0]], dtype=np.float64)
+            lateral_speed = float(
+                np.dot(np.asarray(vel_world, dtype=np.float64)[:2], lateral_axis)
+            )
+            sigma = max(float(lateral_sigma), 1e-6)
+            bonus *= float(np.exp(-np.square(lateral_speed / sigma)))
+        return max_bonus * float(np.clip(bonus, 0.0, 1.0))
+
+
 class GatedAxisRollingProgressComponent(CommandedPlanarProgressComponent):
     """Reward commanded translation only while rotating about a directed body axis."""
 
@@ -3144,6 +3251,7 @@ COMPONENT_REGISTRY = {
     "excessive_torso_height_penalty": ExcessiveTorsoHeightPenaltyComponent,
     "low_height_penalty": LowHeightPenaltyComponent,
     "paired_dof_velocity_symmetry": PairedDOFVelocitySymmetryComponent,
+    "commanded_pair_dof_velocity_symmetry": CommandedPairDOFVelocitySymmetryComponent,
     "dof_position_tracking": DOFPositionTrackingComponent,
     "timed_dof_position_tracking": TimedDOFPositionTrackingComponent,
     "plateau_angular_velocity": PlateauAngularVelocityComponent,
@@ -3177,6 +3285,7 @@ COMPONENT_REGISTRY = {
     "onehot_velocity_tracking": OneHotVelocityTrackingComponent,
     "hybrid_direction_velocity": HybridDirectionVelocityComponent,
     "commanded_planar_progress": CommandedPlanarProgressComponent,
+    "commanded_speed_floor": CommandedSpeedFloorComponent,
     "gated_axis_rolling_progress": GatedAxisRollingProgressComponent,
     "directed_axis_roll_requirement": DirectedAxisRollRequirementComponent,
     "hybrid_direction_lateral_penalty": HybridDirectionLateralPenaltyComponent,
