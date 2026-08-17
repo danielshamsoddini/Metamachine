@@ -2432,6 +2432,9 @@ class OneHotHeadingAlignmentComponent(RewardComponent):
 
 def _resolve_hybrid_target_xy(state, params) -> np.ndarray:
     """Resolve target travel direction from cardinal one-hot or cos/sin commands."""
+    if str(params.get("target_frame", "world")) == "initial_heading":
+        heading = float(np.asarray(state.derived.initial_heading).reshape(-1)[0])
+        return np.array([np.cos(heading), np.sin(heading)], dtype=np.float64)
     command_names = params.get(
         "command_names", ["cmd_straight", "cmd_left", "cmd_right"]
     )
@@ -2585,6 +2588,33 @@ class HybridDirectionLateralPenaltyComponent(RewardComponent):
     def reset(self) -> None:
         self.pos_history = []
         self.last_target_xy = None
+
+
+class CommandSegmentCrossTrackPenaltyComponent(RewardComponent):
+    """Penalize sustained distance from the line set at each command change."""
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.segment_start = None
+        self.last_target = None
+        self.elapsed = 0
+    def calculate(self, state, calculator) -> float:
+        target = _resolve_hybrid_target_xy(state, self.params)
+        pos = np.asarray(state.accurate.pos_world if state.accurate.pos_world is not None else state.raw.pos_world, dtype=np.float64)[:2]
+        if self.last_target is None or float(np.dot(target, self.last_target)) < 0.999:
+            self.segment_start, self.last_target, self.elapsed = pos.copy(), target.copy(), 0
+        self.elapsed += 1
+        grace = int(self.params.get("grace_steps", 25))
+        if self.elapsed <= grace:
+            return 0.0
+        disp = pos - self.segment_start
+        cross_track = float(target[0] * disp[1] - target[1] * disp[0])
+        sigma = max(float(self.params.get("tracking_sigma", 0.5)), 1e-6)
+        max_penalty = float(self.params.get("max_penalty", 8.0))
+        return -min((cross_track / sigma) ** 2, max_penalty)
+    def reset(self) -> None:
+        self.segment_start = None
+        self.last_target = None
+        self.elapsed = 0
 
 
 class HybridDirectionHeadingComponent(RewardComponent):
@@ -2999,6 +3029,7 @@ COMPONENT_REGISTRY = {
     "hybrid_direction_velocity": HybridDirectionVelocityComponent,
     "commanded_planar_progress": CommandedPlanarProgressComponent,
     "hybrid_direction_lateral_penalty": HybridDirectionLateralPenaltyComponent,
+    "command_segment_cross_track": CommandSegmentCrossTrackPenaltyComponent,
     "hybrid_direction_heading": HybridDirectionHeadingComponent,
     "hybrid_direction_yaw_tracking": HybridDirectionYawTrackingComponent,
     "projected_forward_velocity": ProjectedForwardVelocityComponent,

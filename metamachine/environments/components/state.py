@@ -565,6 +565,14 @@ class State:
         "last_last_last_reward": lambda s: s.reward_history.last_last_last_reward,
         "reward_history": lambda s: s.reward_history.get_history_vector(),
         "commands": lambda s: s.commands,
+        # Normalized time since the command last changed.  Multi-command
+        # policies can use this to distinguish a fresh transition from a
+        # steady-state command without changing the command representation.
+        "command_age": lambda s: np.array([min(
+            (getattr(s.command_manager, "step_count", 0) - getattr(s.command_manager, "last_resample_step", 0)) * s.dt
+            / max(getattr(s.command_manager, "resampling_interval", 0) * s.dt, 1e-6),
+            1.0,
+        )]) if getattr(s, "command_manager", None) is not None else np.zeros(1),
         # Absolute target from an optional scripted position-reference
         # baseline. This makes residual policies phase-aware without hiding
         # the open-loop packet currently being executed.

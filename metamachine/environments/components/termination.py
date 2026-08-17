@@ -86,6 +86,11 @@ class TerminationChecker:
         )
         self._yaw_reference = None
         self._yaw_reference_command = None
+        self.cross_track_limit = getattr(term_cfg, "cross_track_limit", None)
+        self.cross_track_grace_steps = int(getattr(term_cfg, "cross_track_grace_steps", 0))
+        self._cross_track_start = None
+        self._cross_track_command = None
+        self._cross_track_elapsed = 0
 
         # Robot and observation parameters
         self.gravity_vec = np.array(cfg.observation.gravity_vec)
@@ -224,6 +229,24 @@ class TerminationChecker:
         """Increment the step counter."""
         self.current_step += 1
 
+    def _check_cross_track_limit(self, state) -> bool:
+        if self.cross_track_limit is None:
+            return False
+        target = np.array([float(state.get_command_by_name("cmd_dir_cos")), float(state.get_command_by_name("cmd_dir_sin"))], dtype=float)
+        norm = np.linalg.norm(target)
+        if norm < 1e-8:
+            return False
+        target /= norm
+        pos = np.asarray(state.accurate.pos_world if state.accurate.pos_world is not None else state.raw.pos_world, dtype=float)[:2]
+        if self._cross_track_command is None or float(np.dot(target, self._cross_track_command)) < 0.999:
+            self._cross_track_start, self._cross_track_command, self._cross_track_elapsed = pos.copy(), target.copy(), 0
+            return False
+        self._cross_track_elapsed += 1
+        if self._cross_track_elapsed <= self.cross_track_grace_steps:
+            return False
+        disp = pos - self._cross_track_start
+        return abs(float(target[0] * disp[1] - target[1] * disp[0])) > float(self.cross_track_limit)
+
     def check_done(self, state) -> bool:
         """Check if episode should terminate based on current state.
 
@@ -239,7 +262,9 @@ class TerminationChecker:
             if state.pos[2] < self.height_threshold:  # z-coordinate below threshold
                 return True
 
-        # Enforce any configured torso-yaw budget before other termination rules.
+        # Enforce configured corridor and torso-yaw budgets before other rules.
+        if self._check_cross_track_limit(state):
+            return True
         if self._check_max_yaw_change(state):
             return True
 

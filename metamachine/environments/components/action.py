@@ -364,6 +364,7 @@ class ActionProcessor:
         self.position_reference_residual_scale = float(
             reference_cfg.get("residual_scale", 1.0)
         )
+        self.position_reference_interpolate = bool(reference_cfg.get("interpolate", False))
         self._position_reference_step = 0
         self._position_reference_keyframes: list[tuple[int, np.ndarray]] = []
 
@@ -393,10 +394,15 @@ class ActionProcessor:
 
     def _reference_target_for_step(self, step: int) -> np.ndarray:
         target = self._position_reference_keyframes[0][1]
-        for start_step, candidate in self._position_reference_keyframes:
+        for index, (start_step, candidate) in enumerate(self._position_reference_keyframes):
             if step < start_step:
                 break
             target = candidate
+            if self.position_reference_interpolate and index + 1 < len(self._position_reference_keyframes):
+                next_step, next_target = self._position_reference_keyframes[index + 1]
+                if start_step < step < next_step:
+                    alpha = (step - start_step) / float(next_step - start_step)
+                    return (1.0 - alpha) * candidate + alpha * next_target
         return target.copy()
 
     def _get_default_dof(self, cfg) -> np.ndarray:
