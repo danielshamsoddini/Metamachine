@@ -1137,6 +1137,9 @@ class MetaMachine(Base, MujocoEnv):
             self.video_frames_dict = {cam["name"]: [] for cam in self.recording_cameras}
             self.trajectory_xs = []
             self.trajectory_ys = []
+            # Sampled from state on the first plotted control step. This lets
+            # reset-heading tasks opt in to an initial body-forward arrow.
+            self.trajectory_initial_heading = None
             # The actual episode command is resampled later in
             # BaseEnvironment.reset().  Capture live command segments beside
             # trajectory samples instead of retaining the prior episode's target.
@@ -1191,6 +1194,20 @@ class MetaMachine(Base, MujocoEnv):
                                 length_includes_head=True, zorder=6,
                             )
                         plt.scatter([], [], color="darkorange", marker=">", s=100, label="Command direction")
+                    if self.sim_cfg.get("plot_initial_heading_direction", False):
+                        initial_heading = getattr(self, "trajectory_initial_heading", None)
+                        if initial_heading is not None:
+                            span = max(float(np.ptp(self.trajectory_xs)), float(np.ptp(self.trajectory_ys)), 0.5)
+                            arrow_length = 0.25 * span
+                            direction = np.array([np.cos(initial_heading), np.sin(initial_heading)])
+                            plt.arrow(
+                                self.trajectory_xs[0], self.trajectory_ys[0],
+                                arrow_length * direction[0], arrow_length * direction[1],
+                                color="black", width=0.01 * arrow_length,
+                                head_width=0.06 * arrow_length,
+                                length_includes_head=True, zorder=7,
+                            )
+                            plt.scatter([], [], color="black", marker=">", s=100, label="Initial body-forward")
                     plt.title(f"Robot 2D Trajectory (Episode {self.episode_counter})")
                     plt.xlabel("X Position (meters)")
                     plt.ylabel("Y Position (meters)")
@@ -2231,6 +2248,10 @@ class MetaMachine(Base, MujocoEnv):
             pos = self.data.qpos.flat[:2]
             self.trajectory_xs.append(pos[0])
             self.trajectory_ys.append(pos[1])
+            if self.trajectory_initial_heading is None:
+                initial_heading = getattr(self.state.derived, "initial_heading", None)
+                if initial_heading is not None:
+                    self.trajectory_initial_heading = float(np.asarray(initial_heading).reshape(-1)[0])
             if self.sim_cfg.get("plot_command_direction", True):
                 command_manager = getattr(self.state, "command_manager", None)
                 if command_manager is not None:
