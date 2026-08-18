@@ -1372,12 +1372,22 @@ class RequiredSupportContactRewardComponent(RewardComponent):
 
 
 class GroundedLegSpinComponent(RewardComponent):
-    """Reward yaw only while torso support and multiple leg contacts are active."""
+    """Reward yaw while the torso is supported and legs are pushing.
+
+    Default ``soft_gate: false`` keeps the historical hard cliff: missing the
+    torso/leg contact requirement returns ``contact_fail_value`` (-1) and
+    insufficient joint motion returns ``still_value`` (-0.25).
+
+    With ``soft_gate: true``, contact and motion scale the yaw score in [0, 1]
+    instead of slamming to a penalty. Missing contact yields 0 (no spin
+    credit) rather than a large negative that can dominate the return and
+    make parking safer than turning.
+    """
 
     def calculate(self, state, calculator) -> float:
         model = getattr(state, "mj_model", None)
         if model is None:
-            return -1.0
+            return float(self.params.get("contact_fail_value", -1.0))
         contacts = list(getattr(state, "contact_floor_geoms", []) or [])
         names = [model.geom(int(geom_id)).name or "" for geom_id in contacts]
         torso_tokens = self.params.get("torso_geom_name_contains", ["torso_geom"])
@@ -1390,17 +1400,39 @@ class GroundedLegSpinComponent(RewardComponent):
         leg_contacts = sum(
             any(str(token) in name for token in leg_tokens) for name in names
         )
-        if not torso_supported or leg_contacts < int(self.params.get("min_leg_contacts", 2)):
-            return -1.0
+        min_leg = max(int(self.params.get("min_leg_contacts", 2)), 1)
+        soft_gate = bool(self.params.get("soft_gate", False))
+        if soft_gate:
+            contact_gate = (1.0 if torso_supported else 0.0) * float(
+                np.clip(leg_contacts / min_leg, 0.0, 1.0)
+            )
+        elif not torso_supported or leg_contacts < min_leg:
+            return float(self.params.get("contact_fail_value", -1.0))
+        else:
+            contact_gate = 1.0
+
         dof_speed = float(np.mean(np.abs(np.asarray(state.dof_vel, dtype=float))))
-        if dof_speed < float(self.params.get("min_leg_dof_speed", 0.15)):
-            return -0.25
+        min_dof = max(float(self.params.get("min_leg_dof_speed", 0.15)), 1e-6)
+        if soft_gate:
+            motion_gate = float(np.clip(dof_speed / min_dof, 0.0, 1.0))
+        elif dof_speed < min_dof:
+            return float(self.params.get("still_value", -0.25))
+        else:
+            motion_gate = 1.0
+
         gravity_body = quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
         yaw_rate = float(np.dot(-gravity_body, state.accurate_ang_vel_body))
-        target_rate = max(float(self.params.get("target_rate", 0.6)), 1e-6)
-        min_signed_rate = float(self.params.get("min_signed_rate", 0.0))
         signed_rate = float(self.params.get("direction", 1.0)) * yaw_rate
-        return float(np.tanh((signed_rate - min_signed_rate) / target_rate))
+        rate_mode = str(self.params.get("rate_mode", "tanh"))
+        if rate_mode == "linear":
+            rate_clip = max(float(self.params.get("rate_clip", 4.0)), 1e-6)
+            rate_scale = max(float(self.params.get("rate_scale", 1.0)), 1e-6)
+            yaw_score = float(np.clip(signed_rate, -rate_clip, rate_clip) / rate_scale)
+        else:
+            target_rate = max(float(self.params.get("target_rate", 0.6)), 1e-6)
+            min_signed_rate = float(self.params.get("min_signed_rate", 0.0))
+            yaw_score = float(np.tanh((signed_rate - min_signed_rate) / target_rate))
+        return float(contact_gate * motion_gate * yaw_score)
 
 
 class ExcessiveTorsoHeightPenaltyComponent(RewardComponent):

@@ -1200,6 +1200,47 @@ class SB3Trainer:
 # Checkpoint Loading Utilities
 # =============================================================================
 
+def disable_eval_randomization(cfg) -> None:
+    """Disable domain randomization for evaluation and rendering.
+
+    Training configs are left unchanged. Eval/render should use the nominal
+    robot, not a random mass/friction/PD/noise draw from the training recipe.
+    """
+    initialization = getattr(cfg, "initialization", None)
+    if initialization is not None:
+        initialization.noisy_init = False
+        initialization.randomize_orientation = False
+        initialization.fully_randomize_orientation = False
+        initialization.randomize_ini_vel = False
+
+    simulation = getattr(cfg, "simulation", None)
+    if simulation is not None:
+        simulation.noisy_observations = False
+        simulation.noisy_actions = False
+        if "random_latency_scheme" in simulation:
+            simulation.random_latency_scheme = False
+
+    randomization = getattr(cfg, "randomization", None)
+    if randomization is None:
+        return
+    for node in randomization.values():
+        if node is None or isinstance(node, (bool, int, float, str)):
+            continue
+        try:
+            has_enabled = "enabled" in node
+        except TypeError:
+            continue
+        if has_enabled:
+            node.enabled = False
+        rolling = node.get("rolling") if hasattr(node, "get") else None
+        if rolling is not None and not isinstance(rolling, (bool, int, float, str)):
+            try:
+                if "enabled" in rolling:
+                    rolling.enabled = False
+            except TypeError:
+                pass
+
+
 def load_from_checkpoint(
     log_dir: str,
     checkpoint: Optional[str] = None,
@@ -1207,12 +1248,13 @@ def load_from_checkpoint(
     real_robot: bool = False,
     device: str = "auto",
     cfg_real: Optional[Union[str, dict]] = None,
+    domain_randomization: bool = False,
 ) -> tuple:
     """Load environment and model from a training checkpoint directory.
     
-    This function recreates the exact environment used during training by loading
-    the saved config.yaml from the log directory, and optionally loads a model
-    checkpoint.
+    This function recreates the training environment from the saved
+    config.yaml, then disables domain randomization so eval and playback use
+    the nominal robot. Pass domain_randomization=True to keep training DR.
     
     Args:
         log_dir: Path to the training log directory (contains config.yaml)
@@ -1333,6 +1375,9 @@ def load_from_checkpoint(
         cfg.simulation.render = render_mode != "none"
         # Disable video recording during playback
         cfg.simulation.video_record_interval = 0
+        if not domain_randomization:
+            disable_eval_randomization(cfg)
+            print("[Checkpoint] Domain randomization disabled for eval/render")
     
     # Create environment
     if real_robot:
