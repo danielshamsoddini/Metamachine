@@ -241,6 +241,12 @@ class ActionFilterExp(ActionFilter):
     """Filter by way of simple exponential smoothing.
 
     y = alpha * x + (1 - alpha) * previous_y
+
+    This matches the real-robot EMA used in
+    ``real_robot_joystick_safe_guarded_flip.py``::
+
+        alpha = 1 - exp(-dt * 2 * pi * cutoff_hz)
+        y = alpha * x + (1 - alpha) * y_prev
     """
 
     def __init__(self, alpha, num_joints) -> None:
@@ -254,7 +260,7 @@ class ActionFilterExp(ActionFilter):
           num_joints: robot DOF
         """
         self.alphas = [float(x) for x in alpha]
-        logging.info("Exponential filter: alpha: %d", self.alphas)
+        logging.info("Exponential filter: alpha: %s", self.alphas)
 
         a_coeffs = []
         b_coeffs = []
@@ -266,6 +272,24 @@ class ActionFilterExp(ActionFilter):
         self.ftype = "lowpass"
 
         super().__init__(a_coeffs, b_coeffs, order, num_joints, self.ftype)
+
+    @classmethod
+    def from_cutoff_hz(cls, cutoff_hz, sampling_rate, num_joints):
+        """Build the same EMA used on the real robot from a cutoff in Hz.
+
+        Args:
+          cutoff_hz: one-pole low-pass cutoff frequency in Hz
+          sampling_rate: control rate in Hz (``1 / dt``)
+          num_joints: robot DOF
+        """
+        cutoff_hz = float(cutoff_hz)
+        sampling_rate = float(sampling_rate)
+        if cutoff_hz <= 0.0:
+            raise ValueError(f"cutoff_hz must be > 0, got {cutoff_hz}")
+        if sampling_rate <= 0.0:
+            raise ValueError(f"sampling_rate must be > 0, got {sampling_rate}")
+        alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff_hz / sampling_rate)
+        return cls(alpha=[alpha], num_joints=num_joints)
 
 
 # class ActionFilterMelter():

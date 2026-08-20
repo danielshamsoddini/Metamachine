@@ -53,7 +53,9 @@ control:
   # Action filtering
   filter:
     enabled: true          # Enable action filtering (unified structure)
-    cutoff_freq: 3.0      # Low-pass filter cutoff frequency
+    # butterworth (default) or exponential/ema (real_robot_joystick_safe_guarded_flip)
+    type: butterworth
+    cutoff_freq: 3.0      # Low-pass filter cutoff frequency (Hz)
   filter_action: true      # Keep for backward compatibility
 
   # Action melting

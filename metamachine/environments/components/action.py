@@ -19,7 +19,7 @@ from typing import Any, Optional, Union
 import numpy as np
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-from .action_filter import ActionFilterButter, ActionFilterMelter
+from .action_filter import ActionFilterButter, ActionFilterExp, ActionFilterMelter
 
 """
 Enhanced Action Processing with Flexible Frozen Joints
@@ -416,15 +416,40 @@ class ActionProcessor:
         return default
 
     def _setup_filters(self, cfg) -> None:
-        """Initialize action filters if enabled."""
-        # Butterworth filter for smoothing
+        """Initialize action filters if enabled.
+
+        ``control.filter.type`` selects the smoother:
+
+        - ``butterworth`` (default): 2nd-order Butterworth low-pass
+        - ``exponential`` / ``exp`` / ``ema``: one-pole EMA matching
+          ``real_robot_joystick_safe_guarded_flip.py``
+          (``alpha = 1 - exp(-2*pi*cutoff_hz*dt)``)
+        """
         self.use_filter = cfg.control.filter.enabled
         if self.use_filter:
-            self.smoother = ActionFilterButter(
-                sampling_rate=1 / cfg.control.dt,
-                num_joints=self._total_dofs,
-                highcut=[cfg.control.filter.cutoff_freq],
-            )
+            sampling_rate = 1.0 / float(cfg.control.dt)
+            cutoff = float(cfg.control.filter.cutoff_freq)
+            filter_type = str(
+                OmegaConf.select(cfg, "control.filter.type", default="butterworth")
+                or "butterworth"
+            ).lower()
+            if filter_type in ("exponential", "exp", "ema"):
+                self.smoother = ActionFilterExp.from_cutoff_hz(
+                    cutoff_hz=cutoff,
+                    sampling_rate=sampling_rate,
+                    num_joints=self._total_dofs,
+                )
+            elif filter_type in ("butterworth", "butter"):
+                self.smoother = ActionFilterButter(
+                    sampling_rate=sampling_rate,
+                    num_joints=self._total_dofs,
+                    highcut=[cutoff],
+                )
+            else:
+                raise ValueError(
+                    f"Unknown control.filter.type '{filter_type}'. "
+                    "Use 'butterworth' or 'exponential'."
+                )
 
         # Action melting filter
         self.use_melter = cfg.control.melter.enabled
