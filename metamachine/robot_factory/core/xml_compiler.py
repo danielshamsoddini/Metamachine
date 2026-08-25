@@ -63,7 +63,13 @@ def torque_to_position_control(root, kp=20, kd=0.5):
 
 
 def update_xml_timestep(root, timestep) -> None:
-    option = root.xpath('//option[@integrator="RK4"]')[0]
+    # Try RK4 first (legacy), fall back to any <option> element.
+    options = root.xpath('//option[@integrator="RK4"]')
+    if not options:
+        options = root.xpath("//option")
+    if not options:
+        raise IndexError("No <option> element found in XML")
+    option = options[0]
     option.attrib["timestep"] = f"{timestep}"
     return root
 

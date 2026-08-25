@@ -580,11 +580,27 @@ class ExcessiveFootHeightPenaltyComponent(RewardComponent):
 
 
 class DOFVelocityPenaltyComponent(RewardComponent):
-    """Penalizes excessive DOF velocities."""
+    """Penalizes excessive DOF velocities.
+
+    Params:
+      velocity_limit: free band (rad/s); only excess is charged
+      power: exponent on soft excess (1=linear, 2=quadratic — kills spikes)
+      spike_limit: optional harder band above which spike_power applies
+      spike_power: exponent for the hard spike band (default 2)
+    """
 
     def calculate(self, state, calculator) -> float:
-        velocity_limit = self.params.get("velocity_limit", 10.0)
-        return -np.sum((np.abs(state.dof_vel) - velocity_limit).clip(0, 1e5))
+        vel = np.abs(np.asarray(state.dof_vel, dtype=np.float64))
+        velocity_limit = float(self.params.get("velocity_limit", 10.0))
+        power = float(self.params.get("power", 1.0))
+        excess = np.clip(vel - velocity_limit, 0.0, 1e5)
+        cost = float(np.sum(np.power(excess, power)))
+        spike_limit = self.params.get("spike_limit", None)
+        if spike_limit is not None:
+            spike_power = float(self.params.get("spike_power", 2.0))
+            spike_excess = np.clip(vel - float(spike_limit), 0.0, 1e5)
+            cost += float(np.sum(np.power(spike_excess, spike_power)))
+        return -cost
 
 
 class TimedDOFVelocityPenaltyComponent(RewardComponent):

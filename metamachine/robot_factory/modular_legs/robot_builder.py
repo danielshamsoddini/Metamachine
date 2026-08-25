@@ -342,12 +342,12 @@ class RobotBuilder:
         Add option settings to the XML structure.
 
         Configures simulation options:
-        - integrator: Numerical integration method (RK4)
+        - integrator: Numerical integration method (implicitfast)
         - timestep: Simulation timestep (0.01)
         - flags: Enable contact, energy, and gravity
         """
         option = XMLBuilder.create_element(
-            self.root, "option", integrator="RK4", timestep=f"{self.sim_cfg['mj_dt']}"
+            self.root, "option", integrator="implicitfast", timestep=f"{self.sim_cfg['mj_dt']}"
         )
         XMLBuilder.create_element(
             option,

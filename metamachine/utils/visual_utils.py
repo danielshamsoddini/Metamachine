@@ -337,11 +337,13 @@ def update_xml_timestep(root: etree._Element, timestep: float) -> etree._Element
         Modified XML root element
 
     Raises:
-        IndexError: If no RK4 integrator option is found
+        IndexError: If no <option> element is found
     """
     options = root.xpath('//option[@integrator="RK4"]')
     if not options:
-        raise IndexError("No RK4 integrator option found in XML")
+        options = root.xpath("//option")
+    if not options:
+        raise IndexError("No <option> element found in XML")
 
     option = options[0]
     option.attrib["timestep"] = f"{timestep}"
@@ -393,7 +395,7 @@ def compile_xml(
             root = update_xml_timestep(root, timestep)
         except IndexError:
             print(
-                f"Warning: Could not update timestep in {xml_file} - no RK4 integrator found"
+                f"Warning: Could not update timestep in {xml_file} - no <option> element found"
             )
 
     # Convert to string
