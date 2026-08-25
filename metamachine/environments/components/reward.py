@@ -1388,11 +1388,19 @@ class RequiredSupportContactRewardComponent(RewardComponent):
 
 
 class GroundedLegSpinComponent(RewardComponent):
-    """Reward yaw while the torso is supported and legs are pushing.
+    """Reward yaw while supported and legs are pushing.
+
+    Default ``require_torso_support: true`` is the historical seated/grounded
+    mode (torso on floor + active legs).
+
+    With ``require_torso_support: false`` (standing mode), only leg floor
+    contacts gate the spin — torso may stay off the ground. Pair with a
+    torso-floor terminate and upright/height rewards so the policy cannot
+    flop onto its belly for free yaw credit.
 
     Default ``soft_gate: false`` keeps the historical hard cliff: missing the
-    torso/leg contact requirement returns ``contact_fail_value`` (-1) and
-    insufficient joint motion returns ``still_value`` (-0.25).
+    contact requirement returns ``contact_fail_value`` (-1) and insufficient
+    joint motion returns ``still_value`` (-0.25).
 
     With ``soft_gate: true``, contact and motion scale the yaw score in [0, 1]
     instead of slamming to a penalty. Missing contact yields 0 (no spin
@@ -1410,6 +1418,7 @@ class GroundedLegSpinComponent(RewardComponent):
         leg_tokens = self.params.get(
             "leg_geom_name_contains", ["hip_geom", "upper_geom", "ankle_geom"]
         )
+        require_torso = bool(self.params.get("require_torso_support", True))
         torso_supported = any(
             any(str(token) in name for token in torso_tokens) for name in names
         )
@@ -1418,11 +1427,13 @@ class GroundedLegSpinComponent(RewardComponent):
         )
         min_leg = max(int(self.params.get("min_leg_contacts", 2)), 1)
         soft_gate = bool(self.params.get("soft_gate", False))
+        support_ok = (torso_supported if require_torso else True) and leg_contacts >= min_leg
         if soft_gate:
-            contact_gate = (1.0 if torso_supported else 0.0) * float(
+            support_factor = 1.0 if (torso_supported or not require_torso) else 0.0
+            contact_gate = support_factor * float(
                 np.clip(leg_contacts / min_leg, 0.0, 1.0)
             )
-        elif not torso_supported or leg_contacts < min_leg:
+        elif not support_ok:
             return float(self.params.get("contact_fail_value", -1.0))
         else:
             contact_gate = 1.0
