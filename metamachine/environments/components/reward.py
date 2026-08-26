@@ -1980,6 +1980,37 @@ class RollPitchAngularVelocityPenaltyComponent(RewardComponent):
         return -np.square(excess) / tracking_sigma
 
 
+class ProjectedGravityLeanPenaltyComponent(RewardComponent):
+    """Penalize sustained torso lean via projected-gravity XY magnitude.
+
+    Healthy upright walk keeps ``pg ≈ [0, 0, -1]``. Hardware overdrive showed
+    pitch in ``pg`` around 0.2–0.33; this taxes sustained tilt (not just ω).
+    """
+
+    def calculate(self, state, calculator) -> float:
+        pg = np.asarray(
+            quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec),
+            dtype=np.float64,
+        ).reshape(-1)
+        mode = str(self.params.get("mode", "xy")).lower()
+        if mode == "pitch":
+            # Body-Y component of projected gravity ≈ forward/back lean.
+            lean = abs(float(pg[1])) if pg.size > 1 else 0.0
+        elif mode == "roll":
+            lean = abs(float(pg[0])) if pg.size > 0 else 0.0
+        else:
+            lean = float(np.linalg.norm(pg[:2])) if pg.size >= 2 else 0.0
+        free = abs(float(self.params.get("free_lean", 0.08)))
+        scale = max(float(self.params.get("tracking_sigma", 0.12)), 1e-6)
+        power = float(self.params.get("power", 2.0))
+        excess = max(lean - free, 0.0)
+        cost = (excess / scale) ** power
+        max_penalty = self.params.get("max_penalty", None)
+        if max_penalty is not None:
+            cost = min(cost, max(float(max_penalty), 0.0))
+        return -float(cost)
+
+
 class YawAngularVelocityPenaltyComponent(RewardComponent):
     """Penalize excess turning about gravity while allowing small corrections."""
 
@@ -3329,6 +3360,7 @@ COMPONENT_REGISTRY = {
     "contact_force_penalty": ContactForcePenaltyComponent,
     "world_z_velocity_penalty": WorldZVelocityPenaltyComponent,
     "roll_pitch_angular_velocity_penalty": RollPitchAngularVelocityPenaltyComponent,
+    "projected_gravity_lean_penalty": ProjectedGravityLeanPenaltyComponent,
     "yaw_angular_velocity_penalty": YawAngularVelocityPenaltyComponent,
     "initial_heading_stability": InitialHeadingStabilityComponent,
     "unwrapped_axis_rotation": UnwrappedAxisRotationComponent,

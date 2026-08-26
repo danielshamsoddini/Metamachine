@@ -554,6 +554,20 @@ class CommandManager:
                 f"Command '{name}' not found. Available: {self.command_names}"
             ) from e
 
+    def align_planar_command_to_heading(
+        self, heading_radians: float, offset_radians: float = 0.0
+    ) -> None:
+        """Set cmd_dir_* to travel along ``heading + offset`` in the world frame.
+
+        Used with randomized initial yaw so the commanded direction is body-
+        relative (e.g. offset=0 → forward along face, offset=+π/2 → crab).
+        """
+        cos_name = str(self.command_cfg.get("cos_command_name", "cmd_dir_cos"))
+        sin_name = str(self.command_cfg.get("sin_command_name", "cmd_dir_sin"))
+        travel = float(heading_radians) + float(offset_radians)
+        self.set_command_by_name(cos_name, float(np.cos(travel)))
+        self.set_command_by_name(sin_name, float(np.sin(travel)))
+
     def set_onehot_by_index(self, active_index: int) -> None:
         """Set commands as a one-hot vector with the specified index active.
         

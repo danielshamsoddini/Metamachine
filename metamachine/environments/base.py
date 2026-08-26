@@ -198,10 +198,48 @@ class Base(gym.Env, ABC):
 
         # Get initial observation
         self._update_state()
+        # After first state update, initial_heading is latched — optionally
+        # rewrite planar cmd_dir_* relative to that heading (forward / crab).
+        self._align_commands_to_initial_heading()
         obs = self.state.get_observation(reset=True)
 
         self.t0 = time.time()
         return obs, {}
+
+    def _align_commands_to_initial_heading(self) -> None:
+        """If enabled, set travel command from reset heading + fixed/mixture offset."""
+        command_cfg = getattr(self.command_manager, "command_cfg", {}) or {}
+        if not bool(command_cfg.get("relative_to_initial_heading", False)):
+            return
+        heading = getattr(self.state.derived, "initial_heading", None)
+        if heading is None:
+            return
+        # Optional mixture curriculum: sample one offset per episode.
+        # relative_heading_offset_choices: list[float]
+        # relative_heading_offset_probs: optional list[float] (same length; else uniform)
+        choices = command_cfg.get("relative_heading_offset_choices", None)
+        if choices is not None:
+            choices_arr = np.asarray(choices, dtype=float).reshape(-1)
+            if choices_arr.size == 0:
+                offset = float(command_cfg.get("relative_heading_offset_radians", 0.0))
+            else:
+                probs = command_cfg.get("relative_heading_offset_probs", None)
+                if probs is None:
+                    p = None
+                else:
+                    p = np.asarray(probs, dtype=float).reshape(-1)
+                    if p.size != choices_arr.size:
+                        raise ValueError(
+                            "relative_heading_offset_probs length must match "
+                            "relative_heading_offset_choices"
+                        )
+                    p = p / max(float(p.sum()), 1e-12)
+                offset = float(np.random.choice(choices_arr, p=p))
+        else:
+            offset = float(command_cfg.get("relative_heading_offset_radians", 0.0))
+        self.command_manager.align_planar_command_to_heading(
+            float(np.asarray(heading).reshape(-1)[0]), offset
+        )
 
     def _resample_commands(self):
         """Resample command targets using the modern command manager."""

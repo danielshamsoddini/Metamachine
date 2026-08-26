@@ -2245,9 +2245,10 @@ class MetaMachine(Base, MujocoEnv):
         self.render()
         
         if self.sim_cfg.get("plot_trajectory", False) and getattr(self, "recording_active", False) and hasattr(self, "trajectory_xs"):
-            pos = self.data.qpos.flat[:2]
-            self.trajectory_xs.append(pos[0])
-            self.trajectory_ys.append(pos[1])
+            # Do not reuse name `pos` — that holds joint targets for latency tracking.
+            xy = self.data.qpos.flat[:2]
+            self.trajectory_xs.append(xy[0])
+            self.trajectory_ys.append(xy[1])
             if self.trajectory_initial_heading is None:
                 initial_heading = getattr(self.state.derived, "initial_heading", None)
                 if initial_heading is not None:
@@ -2269,7 +2270,7 @@ class MetaMachine(Base, MujocoEnv):
                             direction /= norm
                             segments = self.trajectory_command_segments
                             if not segments or not np.allclose(segments[-1][2], direction, atol=1e-6):
-                                segments.append((float(pos[0]), float(pos[1]), direction.copy()))
+                                segments.append((float(xy[0]), float(xy[1]), direction.copy()))
 
         # Update latency tracking
         self._update_latency_tracking(pos, vel)
@@ -3463,8 +3464,42 @@ class MetaMachine(Base, MujocoEnv):
         # Friction randomization
         self._randomize_friction()
 
+        # Contact stiffness (floor solref/solimp) — soft slack default vs harder dig
+        self._randomize_contact_stiffness()
+
         # Per-module latency and event randomization
         self._reset_asymmetric_randomization_state()
+
+    def _randomize_contact_stiffness(self) -> None:
+        """Randomize floor contact solver refs so policies practice harder dig.
+
+        MuJoCo ``geom_solref = [timeconst, dampratio]``. Smaller timeconst →
+        stiffer contacts. Disabled by default; enable via
+        ``randomization.contact_stiffness.enabled``.
+        """
+        randomization_cfg = getattr(self.cfg, "randomization", {})
+        contact_cfg = randomization_cfg.get("contact_stiffness", {})
+        if not contact_cfg.get("enabled", False):
+            return
+        try:
+            floor = self.model.geom("floor")
+        except Exception:
+            return
+
+        timeconst_range = contact_cfg.get("solref_timeconst_range", [0.004, 0.02])
+        dampratio_range = contact_cfg.get("solref_dampratio_range", [1.0, 2.0])
+        timeconst = float(np.random.uniform(*timeconst_range))
+        dampratio = float(np.random.uniform(*dampratio_range))
+        floor.solref[:] = np.array([timeconst, dampratio], dtype=np.float64)
+
+        solimp_range = contact_cfg.get("solimp_range", None)
+        if solimp_range is not None and len(solimp_range) >= 2:
+            # Optional: blend default soft solimp toward a stiffer template.
+            soft = np.array([0.9, 0.95, 0.001, 0.5, 2.0], dtype=np.float64)
+            stiff = np.asarray(solimp_range, dtype=np.float64).reshape(-1)
+            if stiff.size == soft.size:
+                alpha = float(np.random.uniform(0.0, 1.0))
+                floor.solimp[:] = (1.0 - alpha) * soft + alpha * stiff
 
     def _randomize_friction(self) -> None:
         """Apply friction randomization."""
@@ -3561,8 +3596,20 @@ class MetaMachine(Base, MujocoEnv):
             rand_quat = self.np_random.normal(0, 1, 4)
             return rand_quat / np.linalg.norm(rand_quat)
         elif self.init_cfg.get("randomize_orientation", False):
-            # Random rotation around Z-axis
-            rotate_angle = self.np_random.uniform(0, 2 * np.pi)
+            # Random rotation around Z-axis. Optional bounded yaw curriculum:
+            #   orientation_yaw_range_radians: 0.52   → Uniform[-r, +r]
+            #   orientation_yaw_range_radians: [lo, hi]
+            # Default (unset): full circle Uniform[0, 2π].
+            yaw_range = self.init_cfg.get("orientation_yaw_range_radians", None)
+            if yaw_range is None:
+                rotate_angle = float(self.np_random.uniform(0, 2 * np.pi))
+            else:
+                if is_list_like(yaw_range):
+                    lo, hi = float(yaw_range[0]), float(yaw_range[1])
+                else:
+                    r = abs(float(yaw_range))
+                    lo, hi = -r, r
+                rotate_angle = float(self.np_random.uniform(lo, hi))
             rand_rotation = construct_quaternion([0, 0, 1], rotate_angle)
             final_quat = quaternion_multiply_alt(self.init_quat, rand_rotation)
 
