@@ -2733,6 +2733,9 @@ class CommandedPlanarProgressComponent(RewardComponent):
     Zero velocity is never a positive reward. Progress is negative below the
     minimum speed, zero at that threshold, and reaches one at target speed.
     Backwards travel is clipped to a bounded negative value.
+
+    Optional ``lateral_speed_sigma``: positive progress is scaled by
+    ``exp(-(v_lat/sigma)^2)`` so sideways speed cannot farm the progress term.
     """
 
     def calculate(self, state, calculator) -> float:
@@ -2740,12 +2743,20 @@ class CommandedPlanarProgressComponent(RewardComponent):
         vel_world = getattr(state, "accurate_vel_world", None)
         if vel_world is None:
             vel_world = getattr(state, "vel_world", np.zeros(3))
-        along_speed = float(np.dot(np.asarray(vel_world, dtype=np.float64)[:2], target_xy))
+        vel_xy = np.asarray(vel_world, dtype=np.float64)[:2]
+        along_speed = float(np.dot(vel_xy, target_xy))
         minimum_speed = max(float(self.params.get("minimum_speed", 0.20)), 1e-6)
         target_speed = max(float(self.params.get("target_speed", 0.80)), minimum_speed + 1e-6)
         reverse_clip = max(float(self.params.get("reverse_clip", 1.0)), 0.0)
         progress = (along_speed - minimum_speed) / (target_speed - minimum_speed)
-        return float(np.clip(progress, -reverse_clip, 1.0))
+        progress = float(np.clip(progress, -reverse_clip, 1.0))
+        lateral_sigma = self.params.get("lateral_speed_sigma")
+        if lateral_sigma is not None and progress > 0.0:
+            lateral_axis = np.array([-target_xy[1], target_xy[0]], dtype=np.float64)
+            lateral_speed = float(np.dot(vel_xy, lateral_axis))
+            sigma = max(float(lateral_sigma), 1e-6)
+            progress *= float(np.exp(-np.square(lateral_speed / sigma)))
+        return progress
 
 
 class CommandedSpeedFloorComponent(RewardComponent):
@@ -2952,11 +2963,61 @@ class CommandSegmentCrossTrackPenaltyComponent(RewardComponent):
         cross_track = float(target[0] * disp[1] - target[1] * disp[0])
         sigma = max(float(self.params.get("tracking_sigma", 0.5)), 1e-6)
         max_penalty = float(self.params.get("max_penalty", 8.0))
-        return -min((cross_track / sigma) ** 2, max_penalty)
+        # Optional one-sided scale: >1 on positive cross-track (left of command)
+        # when the gait has a known left bias.
+        if cross_track >= 0.0:
+            scale = float(self.params.get("positive_scale", 1.0))
+        else:
+            scale = float(self.params.get("negative_scale", 1.0))
+        return -min(scale * (cross_track / sigma) ** 2, max_penalty)
     def reset(self) -> None:
         self.segment_start = None
         self.last_target = None
         self.elapsed = 0
+
+
+class CommandedPathBearingComponent(RewardComponent):
+    """Reward windowed COM displacement direction matching the command.
+
+    Unlike instantaneous lateral velocity penalties, this scores the actual
+    path bearing over ``window_steps`` so a consistently skewed gait is
+    penalized even if step-to-step lateral speed looks small.
+    """
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.pos_history: list[np.ndarray] = []
+        self.last_target_xy: Optional[np.ndarray] = None
+
+    def calculate(self, state, calculator) -> float:
+        target = _resolve_hybrid_target_xy(state, self.params)
+        pos = np.asarray(
+            state.accurate.pos_world
+            if state.accurate.pos_world is not None
+            else state.raw.pos_world,
+            dtype=np.float64,
+        )[:2]
+        if self.last_target_xy is None or float(np.dot(target, self.last_target_xy)) < 0.999:
+            self.pos_history = []
+            self.last_target_xy = target.copy()
+        self.pos_history.append(pos.copy())
+        window = max(int(self.params.get("window_steps", 60)), 2)
+        if len(self.pos_history) > window:
+            self.pos_history = self.pos_history[-window:]
+        if len(self.pos_history) < window:
+            return 0.0
+        disp = self.pos_history[-1] - self.pos_history[0]
+        disp_n = float(np.linalg.norm(disp))
+        min_disp = float(self.params.get("min_displacement", 0.12))
+        if disp_n < min_disp:
+            return 0.0
+        bearing = float(np.clip(np.dot(disp / disp_n, target), -1.0, 1.0))
+        # Map cos∈[-1,1] → reward∈[-1,1]; perfect alignment = 1.
+        return bearing
+
+    def reset(self) -> None:
+        self.pos_history = []
+        self.last_target_xy = None
 
 
 class HybridDirectionHeadingComponent(RewardComponent):
@@ -3381,6 +3442,7 @@ COMPONENT_REGISTRY = {
     "directed_axis_roll_requirement": DirectedAxisRollRequirementComponent,
     "hybrid_direction_lateral_penalty": HybridDirectionLateralPenaltyComponent,
     "command_segment_cross_track": CommandSegmentCrossTrackPenaltyComponent,
+    "commanded_path_bearing": CommandedPathBearingComponent,
     "hybrid_direction_heading": HybridDirectionHeadingComponent,
     "hybrid_direction_yaw_tracking": HybridDirectionYawTrackingComponent,
     "projected_forward_velocity": ProjectedForwardVelocityComponent,
