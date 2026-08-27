@@ -611,6 +611,26 @@ class ActionProcessor:
         remap_type = self.cfg.control.remapping.type
         if remap_type is None:
             return action
+        elif remap_type == "signed_pair_average":
+            remapped = np.asarray(action).copy()
+            pairs = self.cfg.control.remapping.get("pairs", [])
+            for pair in pairs:
+                if len(pair) != 3:
+                    raise ValueError(
+                        "signed_pair_average pairs must be [first, second, sign]"
+                    )
+                first, second, sign = int(pair[0]), int(pair[1]), float(pair[2])
+                if not (
+                    0 <= first < remapped.shape[-1]
+                    and 0 <= second < remapped.shape[-1]
+                ):
+                    raise ValueError("signed_pair_average pair index is out of bounds")
+                canonical = 0.5 * (
+                    remapped[..., first] + sign * remapped[..., second]
+                )
+                remapped[..., first] = canonical
+                remapped[..., second] = sign * canonical
+            return remapped
         else:
             raise NotImplementedError(
                 f"Action remapping type '{remap_type}' not implemented"

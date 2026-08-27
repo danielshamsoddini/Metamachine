@@ -579,6 +579,226 @@ class ExcessiveFootHeightPenaltyComponent(RewardComponent):
         return -total_cost
 
 
+class DiagonalTrotCycleComponent(RewardComponent):
+    """Track a smooth, sustained diagonal stepping cycle in task space.
+
+    A diagonal pair travels forward relative to the torso and clears the floor
+    during swing while the opposite pair remains in stance. The pairs exchange
+    every half-cycle. This is deliberately more specific than an airtime bonus:
+    a tiny tap cannot match the clearance, fore-aft excursion, and sustained
+    stance/swing schedule simultaneously.
+    """
+
+    DEFAULT_FOOT_GEOM_NAMES = PersistentFootAirTimePenaltyComponent.DEFAULT_FOOT_GEOM_NAMES
+    DEFAULT_PHASE_OFFSETS = {
+        "front_right_ankle_geom": 0.0,
+        "rear_left_ankle_geom": 0.0,
+        "front_left_ankle_geom": np.pi,
+        "rear_right_ankle_geom": np.pi,
+    }
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.foot_geom_ids: dict[str, int] = {}
+        self.midpoint_along: dict[str, float] = {}
+        self.midpoint_lateral: dict[str, float] = {}
+        self.stance_heights: dict[str, float] = {}
+        self._model_identity: int | None = None
+
+    def _resolve_foot_geoms(self, model) -> None:
+        requested_names = tuple(
+            self.params.get("foot_geom_names", self.DEFAULT_FOOT_GEOM_NAMES)
+        )
+        available = {
+            model.geom(geom_id).name: geom_id
+            for geom_id in range(int(model.ngeom))
+            if model.geom(geom_id).name
+        }
+        missing = [name for name in requested_names if name not in available]
+        if missing:
+            raise ValueError(
+                "diagonal_trot_cycle could not find foot geoms: " + ", ".join(missing)
+            )
+        self.foot_geom_ids = {name: available[name] for name in requested_names}
+        self.midpoint_along = {}
+        self.midpoint_lateral = {}
+        self.stance_heights = {}
+        self._model_identity = id(model)
+
+    def calculate(self, state, calculator) -> float:
+        model = getattr(state, "mj_model", None)
+        data = getattr(state, "mj_data", None)
+        if model is None or data is None:
+            return 0.0
+        if not self.foot_geom_ids or self._model_identity != id(model):
+            self._resolve_foot_geoms(model)
+
+        target_xy = _resolve_hybrid_target_xy(state, self.params)
+        lateral_xy = np.array([-target_xy[1], target_xy[0]], dtype=np.float64)
+        torso_xy = np.asarray(state.accurate_pos_world, dtype=np.float64)[:2]
+        foot_positions = {
+            name: np.asarray(data.geom_xpos[geom_id], dtype=np.float64)
+            for name, geom_id in self.foot_geom_ids.items()
+        }
+        if not self.midpoint_along:
+            self.midpoint_along = {
+                name: float(np.dot(position[:2] - torso_xy, target_xy))
+                for name, position in foot_positions.items()
+            }
+            self.midpoint_lateral = {
+                name: float(np.dot(position[:2] - torso_xy, lateral_xy))
+                for name, position in foot_positions.items()
+            }
+            self.stance_heights = {
+                name: float(position[2]) for name, position in foot_positions.items()
+            }
+
+        frequency = max(float(self.params.get("frequency_hz", 1.5)), 1e-6)
+        phase = 2.0 * np.pi * frequency * calculator.step_counter * calculator.dt
+        warmup_seconds = max(float(self.params.get("warmup_seconds", 1.0)), 0.0)
+        elapsed = calculator.step_counter * calculator.dt
+        ramp = 1.0 if warmup_seconds == 0.0 else float(
+            np.clip(elapsed / warmup_seconds, 0.0, 1.0)
+        )
+        # The ant starts above the floor and settles under gravity.  Latching
+        # foot Z on the first reward call makes every later swing target refer
+        # to an airborne reset height.  Track the lowest observed foot height
+        # through the warm-up so clearance is measured from the actual stance
+        # plane instead.
+        if elapsed <= warmup_seconds:
+            for name, position in foot_positions.items():
+                self.stance_heights[name] = min(
+                    self.stance_heights[name], float(position[2])
+                )
+        half_stride = 0.5 * max(float(self.params.get("stride_length", 0.18)), 0.0) * ramp
+        clearance = max(float(self.params.get("swing_clearance", 0.055)), 0.0) * ramp
+        along_sigma = max(float(self.params.get("along_tracking_sigma", 0.075)), 1e-6)
+        lateral_sigma = max(float(self.params.get("lateral_tracking_sigma", 0.045)), 1e-6)
+        height_sigma = max(float(self.params.get("height_tracking_sigma", 0.025)), 1e-6)
+        transition = float(
+            np.clip(self.params.get("contact_transition", 0.15), 0.0, 0.95)
+        )
+        active_contacts = set(getattr(state, "contact_floor_geoms", []))
+
+        along_scores = []
+        lateral_scores = []
+        height_scores = []
+        contact_scores = []
+        phase_offsets = dict(self.DEFAULT_PHASE_OFFSETS)
+        phase_offsets.update(self.params.get("phase_offsets", {}))
+
+        for name, geom_id in self.foot_geom_ids.items():
+            foot_phase = phase + float(phase_offsets.get(name, 0.0))
+            wave = float(np.sin(foot_phase))
+            # At swing start the foot is behind the torso. It advances to the
+            # front, then returns during the stance half of the cycle.
+            phase_direction = 1.0 if float(
+                self.params.get("phase_direction", 1.0)
+            ) >= 0.0 else -1.0
+            along_phase = foot_phase + float(
+                self.params.get("along_phase_offset_radians", 0.0)
+            )
+            target_along = self.midpoint_along[name] - phase_direction * half_stride * float(
+                np.cos(along_phase)
+            )
+            actual_along = float(
+                np.dot(foot_positions[name][:2] - torso_xy, target_xy)
+            )
+            along_scores.append(
+                float(np.exp(-np.square((actual_along - target_along) / along_sigma)))
+            )
+            actual_lateral = float(
+                np.dot(foot_positions[name][:2] - torso_xy, lateral_xy)
+            )
+            lateral_scores.append(
+                float(
+                    np.exp(
+                        -np.square(
+                            (actual_lateral - self.midpoint_lateral[name]) / lateral_sigma
+                        )
+                    )
+                )
+            )
+
+            target_height = self.stance_heights[name] + clearance * max(wave, 0.0)
+            actual_height = float(foot_positions[name][2])
+            height_scores.append(
+                float(np.exp(-np.square((actual_height - target_height) / height_sigma)))
+            )
+
+            in_contact = geom_id in active_contacts
+            if wave > transition:
+                correct = float(not in_contact)
+            elif wave < -transition:
+                correct = float(in_contact)
+            else:
+                correct = 1.0
+            contact_scores.append((1.0 - ramp) + ramp * correct)
+
+        along_weight = max(float(self.params.get("along_weight", 1.0)), 0.0)
+        lateral_weight = max(float(self.params.get("lateral_weight", 1.0)), 0.0)
+        height_weight = max(float(self.params.get("height_weight", 1.0)), 0.0)
+        contact_weight = max(float(self.params.get("contact_weight", 1.5)), 0.0)
+        denominator = max(
+            along_weight + lateral_weight + height_weight + contact_weight, 1e-8
+        )
+        group_scores = np.asarray(
+            [
+                np.mean(along_scores),
+                np.mean(lateral_scores),
+                np.mean(height_scores),
+                np.mean(contact_scores),
+            ],
+            dtype=np.float64,
+        )
+        group_weights = np.asarray(
+            [along_weight, lateral_weight, height_weight, contact_weight],
+            dtype=np.float64,
+        )
+        arithmetic_score = float(np.dot(group_weights, group_scores) / denominator)
+        aggregation_mode = str(self.params.get("aggregation_mode", "arithmetic"))
+        if aggregation_mode == "arithmetic":
+            score = arithmetic_score
+        elif aggregation_mode == "gait_gated":
+            # A weighted average lets a policy compensate for no real swing
+            # clearance with easy lateral/stance scores.  Blend it with a
+            # weighted geometric mean so every part of a step cycle must be
+            # present: fore-aft excursion, clearance, and contact exchange.
+            # The arithmetic term keeps useful gradients early in training.
+            active = group_weights > 0.0
+            geometric_score = float(
+                np.exp(
+                    np.dot(
+                        group_weights[active],
+                        np.log(np.clip(group_scores[active], 1e-4, 1.0)),
+                    )
+                    / np.sum(group_weights[active])
+                )
+            )
+            geometric_weight = float(
+                np.clip(self.params.get("geometric_weight", 0.70), 0.0, 1.0)
+            )
+            score = (
+                (1.0 - geometric_weight) * arithmetic_score
+                + geometric_weight * geometric_score
+            )
+        else:
+            raise ValueError(
+                "diagonal_trot_cycle aggregation_mode must be arithmetic or gait_gated"
+            )
+        # A planted robot satisfies roughly half of the binary contact schedule
+        # and must not receive a positive gait reward merely for standing. The
+        # configured baseline converts partial/static matching into a bounded
+        # negative value while preserving +1 for complete cycle tracking.
+        score_baseline = float(np.clip(self.params.get("score_baseline", 0.60), 0.0, 0.99))
+        return float(np.clip((score - score_baseline) / (1.0 - score_baseline), -1.0, 1.0))
+
+    def reset(self) -> None:
+        self.midpoint_along = {}
+        self.midpoint_lateral = {}
+        self.stance_heights = {}
+
+
 class DOFVelocityPenaltyComponent(RewardComponent):
     """Penalizes excessive DOF velocities.
 
@@ -1915,6 +2135,36 @@ class ActionMagnitudePenaltyComponent(RewardComponent):
         return -float(np.sum(np.square(action / action_limit)))
 
 
+class PairedActionSymmetryPenaltyComponent(RewardComponent):
+    """Penalize violations of signed left/right action symmetry.
+
+    Each pair is ``[first, second, sign]`` and tracks
+    ``action[second] == sign * action[first]``. This supports mirrored hips
+    (sign -1) and same-sign ankle flexion (sign +1) without constraining the
+    gait amplitude or phase.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        action = np.asarray(state.action_history.last_action, dtype=np.float64).reshape(-1)
+        pairs = self.params.get("pairs", [])
+        if not pairs:
+            return 0.0
+        scale = max(float(self.params.get("tracking_scale", 0.20)), 1e-6)
+        max_penalty = max(float(self.params.get("max_penalty", 1.0)), 0.0)
+        costs = []
+        for pair in pairs:
+            if len(pair) != 3:
+                raise ValueError(
+                    "paired_action_symmetry_penalty pairs must be [first, second, sign]"
+                )
+            first, second, sign = int(pair[0]), int(pair[1]), float(pair[2])
+            if not (0 <= first < action.size and 0 <= second < action.size):
+                raise ValueError("paired_action_symmetry_penalty pair index is out of bounds")
+            error = float(action[second] - sign * action[first])
+            costs.append(min(float(np.square(error / scale)), max_penalty))
+        return -float(np.mean(costs))
+
+
 class ReferenceActionTrackingComponent(RewardComponent):
     """Reward a standalone policy for matching an observed position teacher."""
 
@@ -2895,6 +3145,15 @@ class HybridDirectionLateralPenaltyComponent(RewardComponent):
             vel_world = getattr(state, "vel_world", np.zeros(3))
 
         vel_xy = np.asarray(vel_world, dtype=np.float64)[:2]
+        # Signed lateral: + = left of command (target × vel).
+        lateral_signed = float(target_xy[0] * vel_xy[1] - target_xy[1] * vel_xy[0])
+        if bool(self.params.get("signed", False)):
+            # One-sided: only penalize leftward (positive) drift when known.
+            if lateral_signed >= 0.0:
+                scale = float(self.params.get("positive_scale", 1.0))
+            else:
+                scale = float(self.params.get("negative_scale", 0.25))
+            return -scale * (lateral_signed ** 2) / tracking_sigma
         lateral_vel = vel_xy - np.dot(vel_xy, target_xy) * target_xy
         lateral_speed_sq = float(np.dot(lateral_vel, lateral_vel))
         return -lateral_speed_sq / tracking_sigma
@@ -3012,8 +3271,15 @@ class CommandedPathBearingComponent(RewardComponent):
         if disp_n < min_disp:
             return 0.0
         bearing = float(np.clip(np.dot(disp / disp_n, target), -1.0, 1.0))
-        # Map cos∈[-1,1] → reward∈[-1,1]; perfect alignment = 1.
-        return bearing
+        # Default: sharp angular gaussian so ~25° bias is clearly worse than ~0°.
+        # Plain cos(25°)≈0.91 is too close to 1.0 for light weights to matter.
+        mode = str(self.params.get("score_mode", "angle_gaussian")).lower()
+        if mode in ("cos", "bearing", "raw"):
+            return bearing
+        angle = float(np.arccos(bearing))
+        sigma = float(self.params.get("angle_sigma_rad", float(np.deg2rad(12.0))))
+        sigma = max(sigma, 1e-3)
+        return float(np.exp(-0.5 * (angle / sigma) ** 2))
 
     def reset(self) -> None:
         self.pos_history = []
@@ -3376,6 +3642,7 @@ COMPONENT_REGISTRY = {
     "persistent_foot_air_time_penalty": PersistentFootAirTimePenaltyComponent,
     "foot_slip_penalty": FootSlipPenaltyComponent,
     "excessive_foot_height_penalty": ExcessiveFootHeightPenaltyComponent,
+    "diagonal_trot_cycle": DiagonalTrotCycleComponent,
     "dof_velocity_penalty": DOFVelocityPenaltyComponent,
     "timed_dof_velocity_penalty": TimedDOFVelocityPenaltyComponent,
     "dof_acceleration_penalty": DOFAccelerationPenaltyComponent,
@@ -3417,6 +3684,7 @@ COMPONENT_REGISTRY = {
     "action_rate_rate": ActionRateRateComponent,
     "action_acceleration": ActionRateRateComponent,
     "action_magnitude_penalty": ActionMagnitudePenaltyComponent,
+    "paired_action_symmetry_penalty": PairedActionSymmetryPenaltyComponent,
     "reference_action_tracking": ReferenceActionTrackingComponent,
     "contact_force_penalty": ContactForcePenaltyComponent,
     "world_z_velocity_penalty": WorldZVelocityPenaltyComponent,

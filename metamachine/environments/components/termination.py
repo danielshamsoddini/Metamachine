@@ -172,7 +172,14 @@ class TerminationChecker:
         return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
 
     def _check_max_yaw_change(self, state) -> bool:
-        """End an episode once the torso exceeds its configured yaw budget."""
+        """End an episode once policy-visible heading exceeds its yaw budget.
+
+        The heading contract used by observations and heading rewards is
+        ``state.derived.heading``.  Prefer that value here as well; the generic
+        ``accurate_quat`` can refer to a different module on modular robots and
+        previously allowed a roughly 90-degree visible reorientation to evade
+        this termination check.
+        """
         if self.max_yaw_change_radians is None:
             return False
         try:
@@ -182,7 +189,12 @@ class TerminationChecker:
             )
         except (AttributeError, KeyError):
             command = None
-        yaw = self._world_yaw(state.accurate_quat)
+        derived = getattr(state, "derived", None)
+        derived_heading = getattr(derived, "heading", None)
+        if derived_heading is not None:
+            yaw = float(np.asarray(derived_heading).reshape(-1)[0])
+        else:
+            yaw = self._world_yaw(state.accurate_quat)
         command_changed = command != self._yaw_reference_command
         if self._yaw_reference is None or (
             self.yaw_reference_resets_on_command_change and command_changed

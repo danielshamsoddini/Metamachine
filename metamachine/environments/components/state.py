@@ -573,6 +573,16 @@ class State:
             / max(getattr(s.command_manager, "resampling_interval", 0) * s.dt, 1e-6),
             1.0,
         )]) if getattr(s, "command_manager", None) is not None else np.zeros(1),
+        # Periodic, deployable locomotion clock. Policies observe this scalar
+        # through separate sin/cos transforms, so phase stays continuous at
+        # the cycle boundary and can be reproduced by the real-time policy.
+        "gait_phase": lambda s: np.array([
+            2.0
+            * np.pi
+            * float(getattr(s.cfg.observation, "gait_cycle_frequency_hz", 1.5))
+            * s.step_counter
+            * s.dt
+        ]),
         # Absolute target from an optional scripted position-reference
         # baseline. This makes residual policies phase-aware without hiding
         # the open-loop packet currently being executed.
@@ -1868,10 +1878,17 @@ class State:
         Returns:
             numpy.ndarray: Raw observation vector
         """
+        # Optional: zero world-heading channels after transform so FT can keep
+        # checkpoint obs dims while removing the compass that enables a fixed
+        # world travel direction (see straight-angle SoftYaw30 path clustering).
+        zero_gh = bool(getattr(self.cfg.observation, "zero_global_heading", False))
+        gh_names = {"global_heading", "heading", "initial_heading"}
         obs_parts = []
         for component in self.observation_components:
             data = component.get_data(self)
             flattened_data = np.asarray(data).flatten()
+            if zero_gh and component.name in gh_names:
+                flattened_data = np.zeros_like(flattened_data)
 
             # Check for NaN values in this component
             if np.any(np.isnan(flattened_data)):
