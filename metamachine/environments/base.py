@@ -201,6 +201,11 @@ class Base(gym.Env, ABC):
         # After first state update, initial_heading is latched — optionally
         # rewrite planar cmd_dir_* relative to that heading (forward / crab).
         self._align_commands_to_initial_heading()
+        # Command-relative derived observations (notably heading_error) were
+        # computed before the alignment above. Refresh them before tiling the
+        # initial history, otherwise randomized-yaw episodes begin with stale
+        # world-frame command error in every history frame.
+        self._update_state()
         obs = self.state.get_observation(reset=True)
 
         self.t0 = time.time()

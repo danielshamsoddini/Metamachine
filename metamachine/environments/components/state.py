@@ -564,7 +564,7 @@ class State:
         "last_last_reward": lambda s: s.reward_history.last_last_reward,
         "last_last_last_reward": lambda s: s.reward_history.last_last_last_reward,
         "reward_history": lambda s: s.reward_history.get_history_vector(),
-        "commands": lambda s: s.commands,
+        "commands": lambda s: s._get_observed_commands(),
         # Normalized time since the command last changed.  Multi-command
         # policies can use this to distinguish a fresh transition from a
         # steady-state command without changing the command representation.
@@ -616,7 +616,7 @@ class State:
         "heading": lambda s: s.derived.heading,
         # Explicit global-heading alias plus the target-relative heading error.
         # Both are angular scalars and are normally observed through sin/cos.
-        "global_heading": lambda s: s.derived.heading,
+        "global_heading": lambda s: s._get_observed_global_heading(),
         "heading_error": lambda s: s.derived.heading_error,
         "initial_heading": lambda s: s.derived.initial_heading,
         "speed": lambda s: s.derived.speed,
@@ -690,6 +690,21 @@ class State:
         self.forward_vec = np.array(cfg.observation.forward_vec)
         self.projected_forward_vec = np.array(cfg.observation.projected_forward_vec)
         self.dt = cfg.control.dt
+        self.heading_frame = str(
+            getattr(cfg.observation, "heading_frame", "global")
+        ).lower()
+        if self.heading_frame not in {"global", "initial_canonical"}:
+            raise ValueError(
+                "observation.heading_frame must be 'global' or "
+                f"'initial_canonical', got {self.heading_frame!r}"
+            )
+        self.canonical_initial_heading_radians = float(
+            getattr(
+                cfg.observation,
+                "canonical_initial_heading_radians",
+                np.deg2rad(95.0),
+            )
+        )
         self._setup_module_orientation_randomization(cfg)
 
         # State containers
@@ -766,6 +781,38 @@ class State:
         )
         self._resample_module_orientation_offsets()
 
+    def _canonical_world_yaw_shift(self) -> float:
+        """World-yaw rotation that maps episode start to the canonical frame."""
+        if self.heading_frame != "initial_canonical":
+            return 0.0
+        initial = float(np.asarray(self.derived.initial_heading).reshape(-1)[0])
+        return self.canonical_initial_heading_radians - initial
+
+    def _get_observed_global_heading(self) -> np.ndarray:
+        """Heading in the configured policy-visible world frame."""
+        heading = float(np.asarray(self.derived.heading).reshape(-1)[0])
+        return np.array(
+            [heading + self._canonical_world_yaw_shift()], dtype=np.float32
+        )
+
+    def _get_observed_commands(self) -> np.ndarray:
+        """Commands in the same policy-visible frame as global_heading."""
+        commands = np.asarray(self.commands, dtype=np.float32).reshape(-1)
+        if self.heading_frame != "initial_canonical":
+            return commands
+        if commands.size != 2:
+            raise ValueError(
+                "observation.heading_frame=initial_canonical requires a 2-D "
+                f"planar command, got {commands.size} values"
+            )
+        shift = self._canonical_world_yaw_shift()
+        cos_shift, sin_shift = np.cos(shift), np.sin(shift)
+        x, y = float(commands[0]), float(commands[1])
+        return np.array(
+            [x * cos_shift - y * sin_shift, y * cos_shift + x * sin_shift],
+            dtype=np.float32,
+        )
+
     def __getattr__(self, name):
         """Automatically forward attribute access to raw, derived, accurate state objects, or observable_data.
 
@@ -837,6 +884,8 @@ class State:
                 "forward_vec",
                 "projected_forward_vec",
                 "dt",
+                "heading_frame",
+                "canonical_initial_heading_radians",
                 "raw",
                 "derived",
                 "accurate",

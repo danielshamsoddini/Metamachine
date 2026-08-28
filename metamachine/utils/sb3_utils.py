@@ -35,6 +35,8 @@ from pathlib import Path
 import pdb
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Type, Union
 
+import numpy as np
+
 # Lazy imports for optional SB3 dependency
 if TYPE_CHECKING:
     from stable_baselines3.common.base_class import BaseAlgorithm
@@ -249,6 +251,52 @@ def _make_sb3_vec_render_compat(env: Any, video_cfg: dict[str, Any]) -> Any:
     return _Compat(env, video_cfg)
 
 
+def _assign_balanced_yaw_sector(cfg: Any, rank: int, n_envs: int) -> None:
+    """Restrict one VecEnv worker to its equal-width yaw sector.
+
+    Every sector receives the same number of workers, so asynchronous episode
+    lengths cannot starve difficult headings of transition coverage.
+    """
+    init = cfg.initialization
+    sector_count = int(getattr(init, "balanced_yaw_sectors", 1) or 1)
+    if sector_count == 1:
+        return
+    if sector_count <= 0 or sector_count > int(n_envs):
+        raise ValueError(
+            "initialization.balanced_yaw_sectors must be between 1 and n_envs"
+        )
+    if int(n_envs) % sector_count != 0:
+        raise ValueError(
+            f"n_envs={n_envs} must be divisible by balanced_yaw_sectors="
+            f"{sector_count} for exact coverage"
+        )
+
+    yaw_range = getattr(init, "orientation_yaw_range_radians", None)
+    if yaw_range is None:
+        lo, hi = 0.0, 2.0 * np.pi
+    elif isinstance(yaw_range, (list, tuple)) or (
+        hasattr(yaw_range, "__len__") and not isinstance(yaw_range, str)
+    ):
+        if len(yaw_range) != 2:
+            raise ValueError(
+                "orientation_yaw_range_radians must be a scalar or [lo, hi]"
+            )
+        lo, hi = float(yaw_range[0]), float(yaw_range[1])
+    else:
+        radius = abs(float(yaw_range))
+        lo, hi = -radius, radius
+    if not hi > lo:
+        raise ValueError("orientation yaw range must have positive width")
+
+    sector = int(rank) % sector_count
+    width = (hi - lo) / float(sector_count)
+    sector_lo = lo + sector * width
+    sector_hi = hi if sector == sector_count - 1 else sector_lo + width
+    init.orientation_yaw_range_radians = [sector_lo, sector_hi]
+    init.randomize_orientation = True
+    init.fully_randomize_orientation = False
+
+
 def make_metamachine_vec_env(
     config_path: str,
     exp_name: str,
@@ -267,6 +315,14 @@ def make_metamachine_vec_env(
     config_path = os.path.abspath(config_path)
     if n_envs <= 1:
         cfg = ConfigRegistry.create_from_file(config_path)
+        sector_count = int(
+            getattr(cfg.initialization, "balanced_yaw_sectors", 1) or 1
+        )
+        if sector_count != 1:
+            raise ValueError(
+                "initialization.balanced_yaw_sectors requires a vectorized "
+                "environment or the value 1"
+            )
         cfg.logging.experiment_name = exp_name
         if video_name_pattern is not None:
             cfg.simulation.video_name_pattern = video_name_pattern
@@ -277,6 +333,7 @@ def make_metamachine_vec_env(
     def make_env(rank: int) -> Callable[[], "gym.Env"]:
         def _init() -> "gym.Env":
             cfg = ConfigRegistry.create_from_file(config_path)
+            _assign_balanced_yaw_sector(cfg, rank=rank, n_envs=n_envs)
             cfg.logging.experiment_name = exp_name
             if video_name_pattern is not None:
                 cfg.simulation.video_name_pattern = video_name_pattern
