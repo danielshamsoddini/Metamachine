@@ -2135,6 +2135,29 @@ class ActionMagnitudePenaltyComponent(RewardComponent):
         return -float(np.sum(np.square(action / action_limit)))
 
 
+class ActionSaturationBarrierComponent(RewardComponent):
+    """Penalize sustained raw actions only near the actuator command limit.
+
+    Unlike an L2 action cost, this leaves ordinary cyclic gait amplitude alone
+    and rises sharply after ``free_magnitude``.  It directly targets the raw
+    action saturation seen before the hardware stall/collapse episodes.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        action = np.abs(
+            np.asarray(state.action_history.last_action, dtype=np.float64)
+        )
+        free = max(float(self.params.get("free_magnitude", 0.70)), 0.0)
+        limit = max(float(self.params.get("limit_magnitude", 0.80)), free + 1e-6)
+        power = max(float(self.params.get("power", 4.0)), 1.0)
+        normalized = np.clip((action - free) / (limit - free), 0.0, None)
+        cost = float(np.mean(np.power(normalized, power)))
+        max_penalty = self.params.get("max_penalty")
+        if max_penalty is not None:
+            cost = min(cost, max(float(max_penalty), 0.0))
+        return -cost
+
+
 class PairedActionSymmetryPenaltyComponent(RewardComponent):
     """Penalize violations of signed left/right action symmetry.
 
@@ -2259,6 +2282,49 @@ class ProjectedGravityLeanPenaltyComponent(RewardComponent):
         if max_penalty is not None:
             cost = min(cost, max(float(max_penalty), 0.0))
         return -float(cost)
+
+
+class SustainedProjectedGravityLeanPenaltyComponent(RewardComponent):
+    """Tax lean only after it persists, preserving transient weight transfer."""
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.reset()
+
+    def reset(self) -> None:
+        self.lean_time = 0.0
+
+    def calculate(self, state, calculator) -> float:
+        pg = np.asarray(
+            quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec),
+            dtype=np.float64,
+        ).reshape(-1)
+        mode = str(self.params.get("mode", "xy")).lower()
+        if mode == "pitch":
+            lean = abs(float(pg[1]))
+        elif mode == "roll":
+            lean = abs(float(pg[0]))
+        else:
+            lean = float(np.linalg.norm(pg[:2]))
+
+        free = abs(float(self.params.get("free_lean", 0.10)))
+        if lean > free:
+            self.lean_time += calculator.dt
+        else:
+            self.lean_time = max(
+                0.0,
+                self.lean_time
+                - calculator.dt * float(self.params.get("recovery_rate", 2.0)),
+            )
+        onset = max(float(self.params.get("onset_seconds", 0.35)), 0.0)
+        ramp_seconds = max(float(self.params.get("ramp_seconds", 0.20)), 1e-6)
+        duration_scale = float(
+            np.clip((self.lean_time - onset) / ramp_seconds, 0.0, 1.0)
+        )
+        scale = max(float(self.params.get("tracking_sigma", 0.20)), 1e-6)
+        power = max(float(self.params.get("power", 2.0)), 1.0)
+        cost = duration_scale * np.power(max(lean - free, 0.0) / scale, power)
+        return -float(min(cost, max(float(self.params.get("max_penalty", 6.0)), 0.0)))
 
 
 class YawAngularVelocityPenaltyComponent(RewardComponent):
@@ -3684,12 +3750,14 @@ COMPONENT_REGISTRY = {
     "action_rate_rate": ActionRateRateComponent,
     "action_acceleration": ActionRateRateComponent,
     "action_magnitude_penalty": ActionMagnitudePenaltyComponent,
+    "action_saturation_barrier": ActionSaturationBarrierComponent,
     "paired_action_symmetry_penalty": PairedActionSymmetryPenaltyComponent,
     "reference_action_tracking": ReferenceActionTrackingComponent,
     "contact_force_penalty": ContactForcePenaltyComponent,
     "world_z_velocity_penalty": WorldZVelocityPenaltyComponent,
     "roll_pitch_angular_velocity_penalty": RollPitchAngularVelocityPenaltyComponent,
     "projected_gravity_lean_penalty": ProjectedGravityLeanPenaltyComponent,
+    "sustained_projected_gravity_lean_penalty": SustainedProjectedGravityLeanPenaltyComponent,
     "yaw_angular_velocity_penalty": YawAngularVelocityPenaltyComponent,
     "initial_heading_stability": InitialHeadingStabilityComponent,
     "unwrapped_axis_rotation": UnwrappedAxisRotationComponent,

@@ -1253,6 +1253,10 @@ class MetaMachine(Base, MujocoEnv):
         # Per-module randomization events (latency, torque, control attenuation)
         self._setup_asymmetric_randomization()
 
+        # Optional hardware-calibrated servo target dynamics. This is separate
+        # from transport latency: hardware shows delay plus finite bandwidth.
+        self._setup_actuator_response_model()
+
         # Initialization parameters
         self._setup_initialization_parameters()
 
@@ -1716,6 +1720,100 @@ class MetaMachine(Base, MujocoEnv):
             self.num_joint, dtype=np.float32
         )
         self.current_module_action_scale = np.ones(self.num_joint, dtype=np.float32)
+
+    def _setup_actuator_response_model(self) -> None:
+        """Initialize an optional first-order, per-joint servo target model."""
+        randomization_cfg = self._to_plain_container(
+            getattr(self.cfg, "randomization", {}) or {}
+        )
+        response_cfg = (randomization_cfg or {}).get("actuator_response", {}) or {}
+        self._actuator_response_cfg = response_cfg if isinstance(response_cfg, dict) else {}
+        self._actuator_response_enabled = bool(
+            self._actuator_response_cfg.get("enabled", False)
+        )
+        self._actuator_response_tau = np.zeros(self.num_joint, dtype=np.float64)
+        self._actuator_response_gain = np.ones(self.num_joint, dtype=np.float64)
+        self._actuator_response_pos = np.asarray(
+            self.default_dof_pos, dtype=np.float64
+        ).copy()
+        self._actuator_response_vel = np.zeros(self.num_joint, dtype=np.float64)
+
+    @staticmethod
+    def _joint_type_mask(num_joint: int, joint_type: str) -> np.ndarray:
+        indices = np.arange(num_joint)
+        if joint_type == "hip":
+            return indices % 2 == 0
+        if joint_type == "ankle":
+            return indices % 2 == 1
+        return np.ones(num_joint, dtype=bool)
+
+    def _reset_actuator_response_model(self) -> None:
+        """Sample persistent episode servo dynamics and reset filter memory."""
+        self._actuator_response_pos = np.asarray(
+            self.init_joint_pos, dtype=np.float64
+        ).copy()
+        self._actuator_response_vel = np.zeros(self.num_joint, dtype=np.float64)
+        if not self._actuator_response_enabled:
+            return
+
+        cfg = self._actuator_response_cfg
+        tau = np.zeros(self.num_joint, dtype=np.float64)
+        gain = np.ones(self.num_joint, dtype=np.float64)
+        for joint_type in ("hip", "ankle"):
+            mask = self._joint_type_mask(self.num_joint, joint_type)
+            tau_range = cfg.get(f"{joint_type}_time_constant_seconds", [0.0, 0.0])
+            gain_range = cfg.get(f"{joint_type}_target_gain", [1.0, 1.0])
+            tau[mask] = self.np_random.uniform(
+                float(tau_range[0]), float(tau_range[1]), int(np.sum(mask))
+            )
+            gain[mask] = self.np_random.uniform(
+                float(gain_range[0]), float(gain_range[1]), int(np.sum(mask))
+            )
+
+        weak_cfg = cfg.get("weak_leg", {}) or {}
+        if bool(weak_cfg.get("enabled", False)) and self.num_joint >= 2:
+            probability = float(weak_cfg.get("probability", 1.0))
+            if self.np_random.random() < probability:
+                leg = int(self.np_random.integers(0, self.num_joint // 2))
+                joints = np.asarray([2 * leg, 2 * leg + 1], dtype=np.int64)
+                bandwidth = float(
+                    self.np_random.uniform(
+                        *weak_cfg.get("bandwidth_scale_range", [0.7, 1.0])
+                    )
+                )
+                strength = float(
+                    self.np_random.uniform(
+                        *weak_cfg.get("target_gain_scale_range", [0.9, 1.0])
+                    )
+                )
+                tau[joints] /= max(bandwidth, 1e-3)
+                gain[joints] *= strength
+
+        self._actuator_response_tau = np.maximum(tau, 0.0)
+        self._actuator_response_gain = np.clip(gain, 0.0, 1.25)
+
+    def _apply_actuator_response_model(
+        self, pos: np.ndarray, vel: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply one servo-response sample before the target enters latency history."""
+        if not self._actuator_response_enabled:
+            return pos, vel
+        dt = float(self.cfg.control.dt)
+        alpha = np.ones(self.num_joint, dtype=np.float64)
+        active = self._actuator_response_tau > 1e-9
+        alpha[active] = 1.0 - np.exp(-dt / self._actuator_response_tau[active])
+        baseline = np.asarray(self.default_dof_pos, dtype=np.float64)
+        gained_pos = baseline + self._actuator_response_gain * (
+            np.asarray(pos, dtype=np.float64) - baseline
+        )
+        self._actuator_response_pos += alpha * (gained_pos - self._actuator_response_pos)
+        self._actuator_response_vel += alpha * (
+            np.asarray(vel, dtype=np.float64) - self._actuator_response_vel
+        )
+        return (
+            self._actuator_response_pos.astype(pos.dtype, copy=True),
+            self._actuator_response_vel.astype(vel.dtype, copy=True),
+        )
 
     def _resolve_selected_joint_indices(self, spec: dict[str, Any]) -> list[int]:
         """Resolve target joints from module indices or module ids."""
@@ -2346,6 +2444,8 @@ class MetaMachine(Base, MujocoEnv):
             noise_std = self.sim_cfg.action_noise_std
             pos += self.np_random.normal(0, noise_std, size=pos.shape)
             vel += self.np_random.normal(0, noise_std, size=vel.shape)
+
+        pos, vel = self._apply_actuator_response_model(pos, vel)
 
         velocity_guard = self.cfg.control.get(
             "velocity_position_guard",
@@ -3286,6 +3386,7 @@ class MetaMachine(Base, MujocoEnv):
     def _post_reset(self) -> None:
         """Post-reset operations."""
         self._reset_goal_task()
+        self._reset_actuator_response_model()
         if getattr(self, "_source_observation_noise", None) is not None:
             # Gymnasium replaces the environment Generator when reset(seed=...)
             # is called, so keep the sensor model attached to the current RNG.
@@ -3448,14 +3549,14 @@ class MetaMachine(Base, MujocoEnv):
         percentage = pd_cfg.get("percentage")
         if percentage is not None:
             pct = float(percentage)
-            kp_scale = np.random.uniform(1.0 - pct, 1.0 + pct)
-            kd_scale = np.random.uniform(1.0 - pct, 1.0 + pct)
+            kp_scale = self.np_random.uniform(1.0 - pct, 1.0 + pct)
+            kd_scale = self.np_random.uniform(1.0 - pct, 1.0 + pct)
         elif pd_cfg.get("scale_mode", False):
-            kp_scale = np.random.uniform(*pd_cfg.get("kp_range", [1.0, 1.0]))
-            kd_scale = np.random.uniform(*pd_cfg.get("kd_range", [1.0, 1.0]))
+            kp_scale = self.np_random.uniform(*pd_cfg.get("kp_range", [1.0, 1.0]))
+            kd_scale = self.np_random.uniform(*pd_cfg.get("kd_range", [1.0, 1.0]))
         else:
-            kp_val = np.random.uniform(*pd_cfg.get("kp_range", [base_kp, base_kp]))
-            kd_val = np.random.uniform(*pd_cfg.get("kd_range", [base_kd, base_kd]))
+            kp_val = self.np_random.uniform(*pd_cfg.get("kp_range", [base_kp, base_kp]))
+            kd_val = self.np_random.uniform(*pd_cfg.get("kd_range", [base_kd, base_kd]))
             kp_scale = kp_val / base_kp if base_kp != 0 else 1.0
             kd_scale = kd_val / base_kd if base_kd != 0 else 1.0
 
@@ -3463,8 +3564,37 @@ class MetaMachine(Base, MujocoEnv):
         self.kd = base_kd * kd_scale
 
         if nominal_kps is not None:
-            self.kps = (nominal_kps * kp_scale).astype(np.float32)
-            self.kds = (nominal_kds * kd_scale).astype(np.float32)
+            kp_scales = np.full(nominal_kps.shape, kp_scale, dtype=np.float64)
+            kd_scales = np.full(nominal_kds.shape, kd_scale, dtype=np.float64)
+            independent_pct = max(float(pd_cfg.get("independent_percentage", 0.0)), 0.0)
+            if independent_pct > 0.0:
+                kp_scales *= self.np_random.uniform(
+                    1.0 - independent_pct, 1.0 + independent_pct, nominal_kps.shape
+                )
+                kd_pct = max(
+                    float(pd_cfg.get("kd_independent_percentage", independent_pct * 0.5)),
+                    0.0,
+                )
+                kd_scales *= self.np_random.uniform(
+                    1.0 - kd_pct, 1.0 + kd_pct, nominal_kds.shape
+                )
+            weak_cfg = pd_cfg.get("weak_leg", {}) or {}
+            if bool(weak_cfg.get("enabled", False)) and self.num_joint >= 2:
+                if self.np_random.random() < float(weak_cfg.get("probability", 1.0)):
+                    leg = int(self.np_random.integers(0, self.num_joint // 2))
+                    joints = np.asarray([2 * leg, 2 * leg + 1], dtype=np.int64)
+                    kp_scales[joints] *= float(
+                        self.np_random.uniform(
+                            *weak_cfg.get("kp_scale_range", [0.75, 1.0])
+                        )
+                    )
+                    kd_scales[joints] *= float(
+                        self.np_random.uniform(
+                            *weak_cfg.get("kd_scale_range", [0.85, 1.0])
+                        )
+                    )
+            self.kps = (nominal_kps * kp_scales).astype(np.float32)
+            self.kds = (nominal_kds * kd_scales).astype(np.float32)
             if self.joint_control_modes is not None:
                 for i, mode in enumerate(self.joint_control_modes):
                     if mode == "velocity":
@@ -3487,7 +3617,20 @@ class MetaMachine(Base, MujocoEnv):
 
         # Latency randomization
         if self.sim_cfg.get("random_latency_scheme", False):
-            self.sim_cfg.latency_scheme = np.random.randint(0, 2)
+            latency_choices = self.sim_cfg.get(
+                "random_latency_scheme_choices", None
+            )
+            if latency_choices is None:
+                # Backward-compatible historical behavior: schemes 0 and 1.
+                self.sim_cfg.latency_scheme = int(self.np_random.integers(0, 2))
+            else:
+                choices = np.asarray(latency_choices, dtype=np.int32).reshape(-1)
+                if choices.size == 0 or not np.all(np.isin(choices, [-1, 0, 1])):
+                    raise ValueError(
+                        "simulation.random_latency_scheme_choices must contain "
+                        "one or more of -1, 0, 1"
+                    )
+                self.sim_cfg.latency_scheme = int(self.np_random.choice(choices))
 
         # Friction randomization
         self._randomize_friction()
