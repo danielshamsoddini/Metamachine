@@ -86,6 +86,7 @@ from ..utils.math_utils import (
 from ..utils.rendering import add_ground_disc_marker, add_ground_line_marker
 from ..utils.validation import is_list_like, is_number
 from .base import Base
+from .components.observation_noise import SourceAwareObservationNoise
 from .gym.mujoco_env import MujocoEnv
 
 # Try to get CONTROLLER_ROOT_DIR from environment or use default
@@ -1259,6 +1260,7 @@ class MetaMachine(Base, MujocoEnv):
         self._passive_viewer = None
         self._viewer_context_manager = None
         self._setup_goal_task_state()
+        self._source_observation_noise = None
 
     def _setup_goal_task_state(self) -> None:
         """Initialize optional forward goal-reaching task state."""
@@ -3111,11 +3113,32 @@ class MetaMachine(Base, MujocoEnv):
         for key, value in base_data.items():
             extended[f"accurate_{key}"] = copy.deepcopy(value)
 
-            # Add observation noise if enabled
-            if self.sim_cfg.get("noisy_observations", False) and isinstance(
-                value, np.ndarray
-            ):
-                noise_std = self.sim_cfg.obs_noise_std
+        if not self.sim_cfg.get("noisy_observations", False):
+            return extended
+
+        noise_cfg = self.sim_cfg.get("observation_noise", None)
+        noise_cfg = self._to_plain_container(noise_cfg) if noise_cfg else {}
+        noise_mode = str(noise_cfg.get("mode", "legacy_scalar")).lower()
+        if noise_mode == "source_aware":
+            if getattr(self, "_source_observation_noise", None) is None:
+                self._source_observation_noise = SourceAwareObservationNoise(
+                    noise_cfg,
+                    num_dof=self.num_act,
+                    dt=self.dt,
+                    rng=self.np_random,
+                )
+            extended.update(self._source_observation_noise.apply(base_data))
+            return extended
+        if noise_mode not in {"legacy_scalar", "scalar"}:
+            raise ValueError(
+                "simulation.observation_noise.mode must be 'source_aware' or "
+                f"'legacy_scalar', got {noise_mode!r}"
+            )
+
+        # Backward-compatible scalar noise for existing configs.
+        noise_std = self.sim_cfg.obs_noise_std
+        for key, value in base_data.items():
+            if isinstance(value, np.ndarray):
                 extended[key] = value + self.np_random.normal(
                     0, noise_std, size=value.shape
                 )
@@ -3263,6 +3286,11 @@ class MetaMachine(Base, MujocoEnv):
     def _post_reset(self) -> None:
         """Post-reset operations."""
         self._reset_goal_task()
+        if getattr(self, "_source_observation_noise", None) is not None:
+            # Gymnasium replaces the environment Generator when reset(seed=...)
+            # is called, so keep the sensor model attached to the current RNG.
+            self._source_observation_noise.rng = self.np_random
+            self._source_observation_noise.reset()
 
     def _post_done(self) -> None:
         """Post-done operations after an episode ends."""

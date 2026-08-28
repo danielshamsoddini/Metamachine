@@ -171,6 +171,9 @@ class Base(gym.Env, ABC):
             tuple: (observation, info)
         """
         if seed is not None:
+            # Seed Gymnasium's per-environment Generator, which is used by
+            # sensor noise and other environment-local randomization paths.
+            gym.Env.reset(self, seed=seed)
             np.random.seed(seed)
 
         # Reset all components
