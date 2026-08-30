@@ -297,6 +297,43 @@ def _assign_balanced_yaw_sector(cfg: Any, rank: int, n_envs: int) -> None:
     init.fully_randomize_orientation = False
 
 
+def _assign_balanced_relative_heading_offset(
+    cfg: Any, rank: int, n_envs: int
+) -> None:
+    """Assign one persistent body-relative command direction per worker.
+
+    This gives exact transition coverage when episode lengths differ: with
+    256 workers and four offsets, every direction owns exactly 64 workers.
+    The selected command is still converted to a world vector after reset by
+    ``relative_to_initial_heading``; only the actor-visible command frame is
+    configured separately in the observation block.
+    """
+    task = getattr(cfg, "task", None)
+    commands = getattr(task, "commands", None) if task is not None else None
+    if commands is None:
+        return
+    offsets_cfg = getattr(commands, "balanced_relative_heading_offsets", None)
+    if offsets_cfg is None:
+        return
+    offsets = np.asarray(offsets_cfg, dtype=np.float64).reshape(-1)
+    count = int(offsets.size)
+    if count <= 0 or count > int(n_envs):
+        raise ValueError(
+            "task.commands.balanced_relative_heading_offsets must contain "
+            "between 1 and n_envs values"
+        )
+    if int(n_envs) % count != 0:
+        raise ValueError(
+            f"n_envs={n_envs} must be divisible by balanced command count="
+            f"{count} for exact coverage"
+        )
+    offset = float(offsets[int(rank) % count])
+    commands.relative_to_initial_heading = True
+    commands.relative_heading_offset_radians = offset
+    commands.relative_heading_offset_choices = [offset]
+    commands.relative_heading_offset_probs = [1.0]
+
+
 def make_metamachine_vec_env(
     config_path: str,
     exp_name: str,
@@ -334,6 +371,9 @@ def make_metamachine_vec_env(
         def _init() -> "gym.Env":
             cfg = ConfigRegistry.create_from_file(config_path)
             _assign_balanced_yaw_sector(cfg, rank=rank, n_envs=n_envs)
+            _assign_balanced_relative_heading_offset(
+                cfg, rank=rank, n_envs=n_envs
+            )
             cfg.logging.experiment_name = exp_name
             if video_name_pattern is not None:
                 cfg.simulation.video_name_pattern = video_name_pattern

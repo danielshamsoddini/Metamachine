@@ -706,6 +706,19 @@ class State:
                 "observation.heading_frame must be 'global' or "
                 f"'initial_canonical', got {self.heading_frame!r}"
             )
+        self.command_frame = str(
+            getattr(cfg.observation, "command_frame", "heading_frame")
+        ).lower()
+        if self.command_frame not in {
+            "heading_frame",
+            "global",
+            "initial_heading_relative",
+        }:
+            raise ValueError(
+                "observation.command_frame must be 'heading_frame', 'global', "
+                "or 'initial_heading_relative', got "
+                f"{self.command_frame!r}"
+            )
         self.canonical_initial_heading_radians = float(
             getattr(
                 cfg.observation,
@@ -804,16 +817,37 @@ class State:
         )
 
     def _get_observed_commands(self) -> np.ndarray:
-        """Commands in the same policy-visible frame as global_heading."""
+        """Return planar commands in the configured deployable frame.
+
+        ``initial_heading_relative`` removes episode-start world yaw without
+        exposing OptiTrack/root velocity or absolute compass heading.  It is
+        useful for one physical-joint-frame actor shared across body-relative
+        directions.  Legacy configs retain the former heading-frame behavior.
+        """
         commands = np.asarray(self.commands, dtype=np.float32).reshape(-1)
-        if self.heading_frame != "initial_canonical":
+        if self.command_frame == "global":
             return commands
         if commands.size != 2:
             raise ValueError(
-                "observation.heading_frame=initial_canonical requires a 2-D "
+                "non-global command framing requires a 2-D "
                 f"planar command, got {commands.size} values"
             )
-        shift = self._canonical_world_yaw_shift()
+        if self.command_frame == "initial_heading_relative":
+            initial = float(
+                np.asarray(self.derived.initial_heading).reshape(-1)[0]
+            )
+            # ``initial_heading`` is the world angle of ``forward_vec``.  Add
+            # that vector's native body-frame angle so identity orientation
+            # observes forward as the configured body vector (normally +Y),
+            # rather than silently redefining forward as +X.
+            body_forward_angle = float(
+                np.arctan2(self.forward_vec[1], self.forward_vec[0])
+            )
+            shift = body_forward_angle - initial
+        elif self.heading_frame == "initial_canonical":
+            shift = self._canonical_world_yaw_shift()
+        else:
+            return commands
         cos_shift, sin_shift = np.cos(shift), np.sin(shift)
         x, y = float(commands[0]), float(commands[1])
         return np.array(
@@ -893,6 +927,7 @@ class State:
                 "projected_forward_vec",
                 "dt",
                 "heading_frame",
+                "command_frame",
                 "canonical_initial_heading_radians",
                 "raw",
                 "derived",
