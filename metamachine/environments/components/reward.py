@@ -2327,6 +2327,54 @@ class SustainedProjectedGravityLeanPenaltyComponent(RewardComponent):
         return -float(min(cost, max(float(self.params.get("max_penalty", 6.0)), 0.0)))
 
 
+class RollingRMSProjectedGravityLeanPenaltyComponent(RewardComponent):
+    """Penalize cyclic lean energy over a fixed time window.
+
+    Unlike the duration counter above, this component does not forget a dive
+    merely because projected gravity briefly crosses below the free threshold
+    between gait phases.  It therefore targets periodic torso bob while still
+    allowing individual transient weight transfers.
+    """
+
+    def __init__(self, name: str, weight: float = 1.0, **kwargs) -> None:
+        super().__init__(name, weight, **kwargs)
+        self.reset()
+
+    def reset(self) -> None:
+        self.lean_squared_history: list[float] = []
+
+    def calculate(self, state, calculator) -> float:
+        pg = np.asarray(
+            quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec),
+            dtype=np.float64,
+        ).reshape(-1)
+        mode = str(self.params.get("mode", "xy")).lower()
+        if mode == "pitch":
+            lean = abs(float(pg[1])) if pg.size > 1 else 0.0
+        elif mode == "roll":
+            lean = abs(float(pg[0])) if pg.size > 0 else 0.0
+        else:
+            lean = float(np.linalg.norm(pg[:2])) if pg.size >= 2 else 0.0
+
+        window_seconds = max(float(self.params.get("window_seconds", 0.60)), calculator.dt)
+        window_steps = max(1, int(round(window_seconds / calculator.dt)))
+        self.lean_squared_history.append(lean * lean)
+        if len(self.lean_squared_history) > window_steps:
+            del self.lean_squared_history[: len(self.lean_squared_history) - window_steps]
+        if bool(self.params.get("require_full_window", True)) and len(
+            self.lean_squared_history
+        ) < window_steps:
+            return 0.0
+
+        rms_lean = float(np.sqrt(np.mean(self.lean_squared_history)))
+        free = abs(float(self.params.get("free_lean", 0.08)))
+        scale = max(float(self.params.get("tracking_sigma", 0.12)), 1e-6)
+        power = max(float(self.params.get("power", 2.0)), 1.0)
+        cost = np.power(max(rms_lean - free, 0.0) / scale, power)
+        max_penalty = max(float(self.params.get("max_penalty", 6.0)), 0.0)
+        return -float(min(cost, max_penalty))
+
+
 class YawAngularVelocityPenaltyComponent(RewardComponent):
     """Penalize excess turning about gravity while allowing small corrections."""
 
@@ -3758,6 +3806,7 @@ COMPONENT_REGISTRY = {
     "roll_pitch_angular_velocity_penalty": RollPitchAngularVelocityPenaltyComponent,
     "projected_gravity_lean_penalty": ProjectedGravityLeanPenaltyComponent,
     "sustained_projected_gravity_lean_penalty": SustainedProjectedGravityLeanPenaltyComponent,
+    "rolling_rms_projected_gravity_lean_penalty": RollingRMSProjectedGravityLeanPenaltyComponent,
     "yaw_angular_velocity_penalty": YawAngularVelocityPenaltyComponent,
     "initial_heading_stability": InitialHeadingStabilityComponent,
     "unwrapped_axis_rotation": UnwrappedAxisRotationComponent,

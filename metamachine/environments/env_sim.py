@@ -1770,6 +1770,49 @@ class MetaMachine(Base, MujocoEnv):
                 float(gain_range[0]), float(gain_range[1]), int(np.sum(mask))
             )
 
+        # Optional exact per-joint values are useful for deterministic
+        # hardware gates. Persistent independent scaling is used in training
+        # to prevent specialization around one favorable leg pair.
+        per_joint_tau = cfg.get("per_joint_time_constant_seconds")
+        per_joint_gain = cfg.get("per_joint_target_gain")
+        if per_joint_tau is not None:
+            values = np.asarray(per_joint_tau, dtype=np.float64)
+            if values.shape != (self.num_joint,):
+                raise ValueError(
+                    "actuator_response.per_joint_time_constant_seconds must "
+                    f"have {self.num_joint} values, got {values.shape}"
+                )
+            tau = values.copy()
+        if per_joint_gain is not None:
+            values = np.asarray(per_joint_gain, dtype=np.float64)
+            if values.shape != (self.num_joint,):
+                raise ValueError(
+                    "actuator_response.per_joint_target_gain must have "
+                    f"{self.num_joint} values, got {values.shape}"
+                )
+            gain = values.copy()
+
+        independent_cfg = cfg.get("independent_joints", {}) or {}
+        if bool(independent_cfg.get("enabled", False)):
+            bandwidth_range = independent_cfg.get(
+                "bandwidth_scale_range", [1.0, 1.0]
+            )
+            gain_scale_range = independent_cfg.get(
+                "target_gain_scale_range", [1.0, 1.0]
+            )
+            bandwidth = self.np_random.uniform(
+                float(bandwidth_range[0]),
+                float(bandwidth_range[1]),
+                self.num_joint,
+            )
+            gain_scale = self.np_random.uniform(
+                float(gain_scale_range[0]),
+                float(gain_scale_range[1]),
+                self.num_joint,
+            )
+            tau /= np.maximum(bandwidth, 1e-3)
+            gain *= gain_scale
+
         weak_cfg = cfg.get("weak_leg", {}) or {}
         if bool(weak_cfg.get("enabled", False)) and self.num_joint >= 2:
             probability = float(weak_cfg.get("probability", 1.0))

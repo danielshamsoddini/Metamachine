@@ -69,6 +69,8 @@ class RawState:
     dof_pos: np.ndarray = field(default_factory=lambda: np.zeros(1))  # Will be resized
     dof_vel: np.ndarray = field(default_factory=lambda: np.zeros(1))  # Will be resized
     dof_torque: np.ndarray = field(default_factory=lambda: np.zeros(1))  # Will be resized
+    filtered_target: np.ndarray = field(default_factory=lambda: np.zeros(1))
+    tracking_error: np.ndarray = field(default_factory=lambda: np.zeros(1))
 
     # Sensor data
     gyros: Optional[np.ndarray] = None
@@ -108,6 +110,8 @@ class RawState:
         self.dof_pos = np.zeros(num_dof)
         self.dof_vel = np.zeros(num_dof)
         self.dof_torque = np.zeros(num_dof)
+        self.filtered_target = np.zeros(num_dof)
+        self.tracking_error = np.zeros(num_dof)
         self.gyros = np.zeros((num_dof, 3))
         self.accs = np.zeros((num_dof, 3))
         self.goal_distances = np.ones(num_dof)*-1.0
@@ -552,6 +556,8 @@ class State:
         "dof_pos": lambda s: s.raw.dof_pos,
         "dof_vel": lambda s: s.raw.dof_vel,
         "dof_torque": lambda s: s.raw.dof_torque,
+        "filtered_target": lambda s: s.raw.filtered_target,
+        "tracking_error": lambda s: s.raw.tracking_error,
         # Masked joint observations (for robots with wheels or partial encoders)
         "masked_dof_pos": lambda s: s.masked_dof_pos,
         "masked_dof_vel": lambda s: s.masked_dof_vel,
@@ -649,6 +655,8 @@ class State:
         "dof_pos": lambda s: s.raw.dof_pos,
         "dof_vel": lambda s: s.raw.dof_vel,
         "dof_torque": lambda s: s.raw.dof_torque,
+        "filtered_target": lambda s: s.raw.filtered_target,
+        "tracking_error": lambda s: s.raw.tracking_error,
         # Masked joint observations (for robots with wheels or partial encoders)
         "masked_dof_pos": lambda s: s.masked_dof_pos,
         "masked_dof_vel": lambda s: s.masked_dof_vel,
@@ -1687,6 +1695,8 @@ class State:
                 "heading": self.derived.heading,
                 "dof_pos": self.raw.dof_pos,
                 "dof_vel": self.raw.dof_vel,
+                "filtered_target": self.raw.filtered_target,
+                "tracking_error": self.raw.tracking_error,
             }
         )
 

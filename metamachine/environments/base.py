@@ -120,6 +120,7 @@ class Base(gym.Env, ABC):
         # Action tracking (adjusted for frozen joints)
         total_joints = self.cfg.control.num_actions
         self.last_action_flat = np.zeros(total_joints * self.cfg.environment.num_envs)
+        self.filtered_target_flat = None
         self.last_reward = 0
 
     def _initialize_state(self) -> None:
@@ -151,10 +152,19 @@ class Base(gym.Env, ABC):
     def _update_state(self) -> None:
         """Update state with current observations and commands."""
         obs_data = self._get_observable_data()
+        observed_pos = np.asarray(obs_data["dof_pos"], dtype=np.float64)
+        filtered_target = self.filtered_target_flat
+        if filtered_target is None:
+            filtered_target = observed_pos.copy()
+        filtered_target = np.asarray(filtered_target, dtype=np.float64).reshape(
+            observed_pos.shape
+        )
         obs_data.update(
             {
                 "last_action": self.last_action_flat,
                 "last_reward": self.last_reward,
+                "filtered_target": filtered_target,
+                "tracking_error": filtered_target - observed_pos,
                 # "commands": self.commands
             }
         )
@@ -179,6 +189,7 @@ class Base(gym.Env, ABC):
         # Reset all components
         self._reset_robot()
         self.action_processor.reset(self.state)
+        self.filtered_target_flat = None
         self.state.reset()
         self.state.position_reference_target = (
             self.action_processor.current_position_reference.copy()
@@ -299,6 +310,10 @@ class Base(gym.Env, ABC):
         """
         # Process action
         processed_action = self.action_processor.process(action)
+        # This is the clean logical target after scaling, default pose, and
+        # filtering. Motor-command noise and actuator-response DR are applied
+        # later by the simulation environment.
+        self.filtered_target_flat = np.asarray(processed_action).copy()
         self.last_action_flat = self.action_processor.last_action_flat
         self.state.position_reference_target = (
             self.action_processor.current_position_reference.copy()
