@@ -181,14 +181,19 @@ class XMLCompiler:
             geom.set("fromto", vec2string(points))
 
     def update_damping(self, armature, damping) -> None:
-        # joints = self.root.find('default').findall('joint')
-        # for joint in joints:
-        #     joint.set('armature', str(armature))
-        #     joint.set('damping', str(damping))
-        for joint in self.root.xpath('//joint[starts-with(@name, "joint")]'):
+        """Update actuated joints regardless of naming; preserve legacy joints.
+
+        Do not modify defaults, free roots, or unrelated passive joints.
+        """
+        driven = {a.get('joint') for a in self.root.xpath('./actuator/*[@joint]')}
+        for joint in self.root.xpath('./worldbody//joint[@name]'):
+            name = joint.get('name')
+            if joint.get('type', 'hinge') == 'free':
+                continue
+            if name not in driven and not name.startswith('joint'):
+                continue
             joint.set("armature", str(armature))
             joint.set("damping", str(damping))
-            # print(f"Updated damping and armature of {joint.get('name')} to {damping} and {armature}")
 
     def add_walls(self, transparent=False, angle=0):
         world_body = self.root.findall("./worldbody")[0]
