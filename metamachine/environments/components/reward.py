@@ -23,6 +23,7 @@ from omegaconf import OmegaConf
 
 from ...utils.curves import isaac_reward, plateau
 from ...utils.math_utils import normalize_angle, quat_apply, quat_rotate_inverse
+from ...utils.command_gait import CommandLeanWindow, capsule_floor_clearance
 
 
 class RewardComponent(ABC):
@@ -1894,6 +1895,38 @@ class PlateauAngularVelocityComponent(RewardComponent):
         return plateau(ang_vel_forward, target_velocity)
 
 
+class ControlledYawSpinComponent(RewardComponent):
+    """Signed rate tracking, with no positive spin credit without task support.
+
+    Zero rate earns zero; target earns one; twice target earns zero; faster
+    or reversed rotation is negative. Support gating never masks overspeed.
+    This is reward shaping, not a hardware velocity limiter.
+    """
+
+    def calculate(self, state, calculator) -> float:
+        target = float(self.params['target_rate'])
+        if abs(target) < 1e-6:
+            raise ValueError('controlled_yaw_spin requires a nonzero target')
+        gravity = quat_rotate_inverse(state.accurate_quat, calculator.gravity_vec)
+        yaw = float(np.dot(-gravity, state.accurate_ang_vel_body))
+        score = float(np.clip(1.0 - ((yaw-target)/abs(target))**2, -4.0, 1.0))
+        excess = max(abs(yaw)/abs(target)-1.25, 0.0)
+        overspeed = min(excess**2, 4.0)
+        model = state.mj_model
+        names = [model.geom(int(g)).name or '' for g in state.contact_floor_geoms]
+        torso = any('torso_geom' in n for n in names)
+        legs = sum(any(t in n for t in ['ankle_geom','upper_geom']) for n in names)
+        mode = self.params.get('support_mode', 'standing')
+        if mode == 'standing': supported = not torso and legs >= 2
+        elif mode == 'leg_assisted': supported = torso and legs >= 2
+        elif mode == 'torso':
+            tucked = calculator.step_counter * calculator.dt >= float(self.params.get('tuck_time',1.5))
+            appendages = any(any(t in n for t in ['hip_geom','upper_geom','ankle_geom']) for n in names)
+            supported = torso and (not tucked or not appendages)
+        else: raise ValueError(f'Unknown support mode: {mode}')
+        return (score if supported else min(score,0.0)) - overspeed
+
+
 class PlateauSpinComponent(RewardComponent):
     """Plateau-style reward for spinning around gravity axis."""
 
@@ -2375,6 +2408,77 @@ class RollingRMSProjectedGravityLeanPenaltyComponent(RewardComponent):
         return -float(min(cost, max_penalty))
 
 
+class CommandFrameSustainedLeanComponent(RewardComponent):
+    """Penalize two-second signed mean lean away from commanded travel."""
+    def reset(self):
+        self.window = None
+        self.last_angle_deg = None
+
+    def calculate(self, state, calculator):
+        if getattr(self, 'window', None) is None:
+            self.window = CommandLeanWindow(calculator.dt, self.params.get('window_seconds', 2.0))
+        up = quat_apply(state.accurate_quat, np.array([0., 0., 1.]))
+        cmd = _resolve_hybrid_target_xy(state, self.params)
+        self.last_angle_deg = self.window.update(up, cmd)
+        if self.last_angle_deg is None:
+            return 0.0
+        excess = max(0., self.last_angle_deg - float(self.params.get('free_degrees', 10.)))
+        return -min((excess / float(self.params.get('scale_degrees', 10.)))**2,
+                    float(self.params.get('max_penalty', 6.)))
+
+
+class DeliberateFootCycleComponent(RewardComponent):
+    """Charge short contact intervals and low-clearance completed swings.
+
+    No clock-driven reference gait. The first censored interval after reset is
+    excluded; thresholds are set from accepted reference traces in the new
+    scratch workflow. Foot geometry distances assume the flat test floor.
+    """
+    def reset(self):
+        self.previous_contact = None
+        self.elapsed = np.zeros(4)
+        self.peak_clearance = np.zeros(4)
+        self.seen_transition = np.zeros(4, dtype=bool)
+
+    def calculate(self, state, calculator):
+        if not hasattr(self, 'previous_contact'):
+            self.reset()
+        model, data = state.mj_model, state.mj_data
+        ids = [model.geom(n).id for n in PersistentFootAirTimePenaltyComponent.DEFAULT_FOOT_GEOM_NAMES]
+        active = set(state.contact_floor_geoms)
+        contact = np.array([g in active for g in ids])
+        clearance = capsule_floor_clearance(model, data, ids)
+        if self.previous_contact is None:
+            self.previous_contact = contact.copy()
+            return 0.0
+        self.elapsed += calculator.dt
+        self.peak_clearance = np.maximum(self.peak_clearance, clearance)
+        changed = contact != self.previous_contact
+        complete = changed & self.seen_transition
+        minimum = float(self.params.get('minimum_interval_seconds', .12))
+        cost = np.sum(np.maximum(0., 1. - self.elapsed[complete] / minimum))
+        landed = complete & contact
+        clear = float(self.params.get('minimum_clearance_m', .015))
+        cost += np.sum(np.maximum(0., 1. - self.peak_clearance[landed] / clear))
+        self.elapsed[changed] = 0.
+        self.peak_clearance[changed] = 0.
+        self.seen_transition[changed] = True
+        self.previous_contact = contact.copy()
+        return -float(cost)
+
+
+class ActuatorLoadComponent(RewardComponent):
+    """Smooth cost above rated torque, with stronger cost near configured limit."""
+    def calculate(self, state, calculator):
+        model, data = state.mj_model, state.mj_data
+        dofs = model.jnt_dofadr[model.actuator_trnid[:, 0]]
+        torque = np.abs(data.qfrc_actuator[dofs])
+        rated = float(self.params.get('rated_nm', 4.))
+        limit = float(self.params.get('limit_nm', 8.))
+        return -float(np.mean(np.maximum(0., torque / rated - 1.)**2)
+                      + np.mean(np.maximum(0., torque / limit - .9)**2) * 10.)
+
+
 class YawAngularVelocityPenaltyComponent(RewardComponent):
     """Penalize excess turning about gravity while allowing small corrections."""
 
@@ -2542,6 +2646,38 @@ class JumpPeakRecoveryComponent(RewardComponent):
                 reward += float(self.params.get("success_bonus", 10.0))
                 self._success_bonus_paid = True
         return reward
+
+class WindowedJointExcursionComponent(RewardComponent):
+    """Bounded penalty for insufficient measured, smoothed ankle excursion.
+
+    Uses joint motion, not action magnitude. Smoothing rejects high-frequency
+    chatter; extra speed never earns reward. Intended for rolling tasks only.
+    """
+
+    def reset(self):
+        self._history = []
+        self._filtered = None
+
+    def calculate(self, state, calculator):
+        model, data = getattr(state, 'mj_model', None), getattr(state, 'mj_data', None)
+        if model is None or data is None:
+            return 0.0
+        if not hasattr(self, '_history'):
+            self.reset()
+        names = self.params.get('joint_names', [f'ankle_{i}' for i in range(1, 5)])
+        q = np.array([data.qpos[model.joint(n).qposadr[0]] for n in names])
+        dt = float(calculator.dt)
+        alpha = 1 - np.exp(-dt / max(float(self.params.get('smoothing_seconds', .08)), 1e-6))
+        self._filtered = q.copy() if self._filtered is None else self._filtered + alpha * (q-self._filtered)
+        self._history.append(self._filtered.copy())
+        window = max(2, int(round(float(self.params.get('window_seconds', 1.0))/dt)))
+        self._history = self._history[-window:]
+        if len(self._history) < window:
+            return 0.0
+        span = np.ptp(np.asarray(self._history), axis=0)
+        target = max(float(self.params.get('target_range_radians', .6)), 1e-6)
+        return -float(np.mean(np.square(np.clip(1-span/target, 0, 1))))
+
 
 class ContactForcePenaltyComponent(RewardComponent):
     """Penalize excessive clipped floor-contact force without punishing stance."""
@@ -3746,6 +3882,10 @@ class StateCoveringIntrinsicRewardComponent(RewardComponent):
 
 # Component registry for easy lookup
 COMPONENT_REGISTRY = {
+    "command_frame_sustained_lean": CommandFrameSustainedLeanComponent,
+    "deliberate_foot_cycle": DeliberateFootCycleComponent,
+    "actuator_load": ActuatorLoadComponent,
+    "controlled_yaw_spin": ControlledYawSpinComponent,
     "linear_velocity_tracking": LinearVelocityTrackingComponent,
     "angular_velocity_tracking": AngularVelocityTrackingComponent,
     "commanded_axis_angular_velocity": CommandedAxisAngularVelocityComponent,
@@ -3802,6 +3942,7 @@ COMPONENT_REGISTRY = {
     "paired_action_symmetry_penalty": PairedActionSymmetryPenaltyComponent,
     "reference_action_tracking": ReferenceActionTrackingComponent,
     "contact_force_penalty": ContactForcePenaltyComponent,
+    "windowed_joint_excursion": WindowedJointExcursionComponent,
     "world_z_velocity_penalty": WorldZVelocityPenaltyComponent,
     "roll_pitch_angular_velocity_penalty": RollPitchAngularVelocityPenaltyComponent,
     "projected_gravity_lean_penalty": ProjectedGravityLeanPenaltyComponent,

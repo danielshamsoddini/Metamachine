@@ -460,6 +460,7 @@ class ActionProcessor:
 
     def reset(self, state=None) -> None:
         """Reset processor state including action history and filters."""
+        self._limited_target = np.asarray(state.dof_pos if state is not None else self.default_dof_pos, dtype=float).copy()
         self.last_action.fill(0)
         self.last_action_full.fill(0)
         self.last_action_flat.fill(0)
@@ -518,6 +519,15 @@ class ActionProcessor:
 
         # Apply processing pipeline
         processed = self._apply_processing_pipeline(action_full)
+
+        rate = self.cfg.control.get("target_rate_limit_rad_s", None)
+        if rate is not None:
+            if self.control_mode != "position" or not np.isfinite(rate) or rate <= 0:
+                raise ValueError("target rate limit requires position mode and a positive finite rate")
+            previous = getattr(self, "_limited_target", self.default_dof_pos)
+            delta = float(rate) * self.cfg.control.dt
+            processed = previous + np.clip(processed - previous, -delta, delta)
+            self._limited_target = processed.copy()
 
         # Update frozen joints processor
         self.frozen_processor.step()

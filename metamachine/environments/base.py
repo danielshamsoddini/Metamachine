@@ -220,6 +220,9 @@ class Base(gym.Env, ABC):
         # initial history, otherwise randomized-yaw episodes begin with stale
         # world-frame command error in every history frame.
         self._update_state()
+        if self.cfg.control.get("target_rate_limit_rad_s", None) is not None:
+            # Seed both filter and limiter from this reset pose, not stale state.
+            self.action_processor.reset(self.state)
         obs = self.state.get_observation(reset=True)
 
         self.t0 = time.time()

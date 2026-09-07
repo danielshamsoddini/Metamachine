@@ -2887,6 +2887,16 @@ class MetaMachine(Base, MujocoEnv):
         if vel_desired is None:
             vel_desired = np.zeros_like(pos_desired)
 
+        # Opt-in onboard-servo approximation. Normally this method holds one
+        # computed torque across the whole latency block; the physical motor
+        # instead keeps closing its PD loop while a position target is held.
+        # Reuse the complete one-step path so coupling, limits, release and
+        # position actuators retain their existing semantics.
+        if self.sim_cfg.get("pd_update_each_substep", False) and int(frame_skip) > 1:
+            for _ in range(int(frame_skip)):
+                self._pd_control(pos_desired, 1, vel_desired)
+            return
+
         # Get current joint states
         dof_pos = self.data.qpos[self.model.jnt_qposadr[self.joint_idx]]
         dof_vel = self.data.qvel[self.model.jnt_dofadr[self.joint_idx]]
@@ -3392,6 +3402,10 @@ class MetaMachine(Base, MujocoEnv):
 
         # Initialize rendering filter
         self.render_lookat_filter = AverageFilter(10)
+        settled = self.init_cfg.get("settled_start", {})
+        if settled.get("enabled", False):
+            from ..utils.settled_start import settle_start
+            settle_start(self, settled)
 
     def reset_model(self) -> np.ndarray:
         """Reset MuJoCo model with comprehensive domain randomization."""
@@ -3657,6 +3671,20 @@ class MetaMachine(Base, MujocoEnv):
         pd_cfg = randomization_cfg.get("pd_controller", {})
         if pd_cfg.get("enabled", False):
             self._randomize_pd_gains(pd_cfg)
+
+        # Opt-in position-control contract, applied after all multiplicative
+        # and weak-leg gain draws. Existing tasks retain their exact behavior.
+        kp_floor = pd_cfg.get("minimum_kp")
+        if kp_floor is not None:
+            floor = float(kp_floor)
+            if not np.isfinite(floor) or floor < 0:
+                raise ValueError('minimum_kp must be finite and nonnegative')
+            if self.joint_control_modes is not None and any(
+                mode == 'velocity' for mode in self.joint_control_modes
+            ):
+                raise ValueError('minimum_kp is only supported for position control')
+            self.kps = np.maximum(self.kps, floor).astype(np.float32)
+            self.kp = max(self.kp, floor)
 
         # Latency randomization
         if self.sim_cfg.get("random_latency_scheme", False):
