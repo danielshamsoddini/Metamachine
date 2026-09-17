@@ -19,7 +19,8 @@ from enum import Enum
 import numpy as np
 from omegaconf import OmegaConf
 
-from ...utils.math_utils import quat_rotate_inverse
+from ...utils.math_utils import quat_rotate_inverse, quat_apply
+from ...utils.command_gait import CommandLeanWindow
 
 
 class TerminationStrategy(Enum):
@@ -78,6 +79,23 @@ class TerminationChecker:
 
         # Height threshold termination
         self.height_threshold = getattr(term_cfg, "height_threshold", None)
+        # Opt in to torso-world height; old configs retain their original path.
+        self.height_position_source = getattr(term_cfg, "height_position_source", "legacy")
+        if self.height_position_source not in {"legacy", "torso_world"}:
+            raise ValueError("height_position_source must be legacy or torso_world")
+        self.height_grace_seconds = float(getattr(term_cfg, "height_grace_seconds", 0.0))
+        self.height_minimum_duration_seconds = float(getattr(term_cfg, "height_minimum_duration_seconds", 0.0))
+        self.height_emergency_threshold = getattr(term_cfg, "height_emergency_threshold", None)
+        if self.height_position_source == "torso_world":
+            for value in (self.height_threshold, self.height_emergency_threshold):
+                if value is not None and (not np.isfinite(float(value)) or float(value) <= 0):
+                    raise ValueError("torso height thresholds must be positive and finite")
+            if self.height_emergency_threshold is not None and self.height_threshold is not None and float(self.height_emergency_threshold) > float(self.height_threshold):
+                raise ValueError("emergency height must not exceed sustained cutoff")
+        self._height_dt = float(cfg.control.dt)
+        if not np.isfinite([self.height_grace_seconds, self.height_minimum_duration_seconds, self._height_dt]).all() or min(self.height_grace_seconds, self.height_minimum_duration_seconds) < 0 or self._height_dt <= 0:
+            raise ValueError("height timing requires nonnegative finite durations and positive dt")
+        self._low_height_steps = 0
         self.contact_grace_steps = int(getattr(term_cfg, "contact_grace_steps", 0))
         self.max_yaw_change_radians = getattr(term_cfg, "max_yaw_change_radians", None)
         if self.max_yaw_change_radians is not None:
@@ -88,8 +106,19 @@ class TerminationChecker:
         self.yaw_reference_resets_on_command_change = bool(
             getattr(term_cfg, "yaw_reference_resets_on_command_change", True)
         )
+        self.yaw_reference_use_initial_heading = bool(getattr(term_cfg, "yaw_reference_use_initial_heading", False))
         self._yaw_reference = None
         self._yaw_reference_command = None
+        self.max_sustained_tilt_degrees = getattr(term_cfg, "max_sustained_tilt_degrees", None)
+        self._sustained_tilt_window = None
+        if self.max_sustained_tilt_degrees is not None:
+            limit = float(self.max_sustained_tilt_degrees)
+            if not np.isfinite(limit) or not 0 < limit < 90:
+                raise ValueError("max_sustained_tilt_degrees must be between 0 and 90")
+            self.max_sustained_tilt_degrees = limit
+            self._sustained_tilt_window = CommandLeanWindow(
+                float(cfg.control.dt), float(getattr(term_cfg, "sustained_tilt_window_seconds", 2.0)),
+                include_forward=True)
         self.cross_track_limit = getattr(term_cfg, "cross_track_limit", None)
         self.cross_track_grace_steps = int(getattr(term_cfg, "cross_track_grace_steps", 0))
         self._cross_track_start = None
@@ -161,6 +190,9 @@ class TerminationChecker:
 
     def reset(self) -> None:
         """Reset the termination checker for a new episode."""
+        self._low_height_steps = 0
+        if self._sustained_tilt_window is not None:
+            self._sustained_tilt_window.reset()
         self.current_step = 0
         self._yaw_reference = None
         self._yaw_reference_command = None
@@ -199,9 +231,10 @@ class TerminationChecker:
         if self._yaw_reference is None or (
             self.yaw_reference_resets_on_command_change and command_changed
         ):
-            self._yaw_reference = yaw
+            self._yaw_reference = float(np.asarray(derived.initial_heading).reshape(-1)[0]) if self.yaw_reference_use_initial_heading else yaw
             self._yaw_reference_command = command
-            return False
+            if not self.yaw_reference_use_initial_heading:
+                return False
         yaw_change = float(np.arctan2(
             np.sin(yaw - self._yaw_reference), np.cos(yaw - self._yaw_reference)
         ))
@@ -285,8 +318,22 @@ class TerminationChecker:
         """
 
         # Check height threshold
-        if self.height_threshold is not None and hasattr(state, "pos"):
-            if state.pos[2] < self.height_threshold:  # z-coordinate below threshold
+        if self.height_position_source == "torso_world":
+            height = float(state.accurate_pos_world[2])
+            if not np.isfinite(height):
+                raise ValueError("non-finite torso height")
+            # Emergency collapse protection also applies during startup grace.
+            if self.height_emergency_threshold is not None and height < float(self.height_emergency_threshold):
+                return True
+            if self.current_step * self._height_dt < self.height_grace_seconds:
+                self._low_height_steps = 0
+            elif self.height_threshold is not None:
+                self._low_height_steps = self._low_height_steps + 1 if height < float(self.height_threshold) else 0
+                required = max(1, int(np.ceil(self.height_minimum_duration_seconds / self._height_dt - 1e-10)))
+                if self._low_height_steps >= required:
+                    return True
+        elif self.height_threshold is not None and hasattr(state, "pos"):
+            if state.pos[2] < self.height_threshold:
                 return True
 
         # Enforce configured corridor and torso-yaw budgets before other rules.
@@ -294,6 +341,12 @@ class TerminationChecker:
             return True
         if self._check_max_yaw_change(state):
             return True
+        if self._sustained_tilt_window is not None:
+            # Total world-horizontal lean is independent of heading and command.
+            up = quat_apply(state.accurate_quat, np.array([0., 0., 1.]))
+            angle = self._sustained_tilt_window.update(up, [1., 0.])
+            if angle is not None and angle > self.max_sustained_tilt_degrees + 1e-8:
+                return True
 
         # Check strategy-specific termination
         if self.termination_strategy is None:

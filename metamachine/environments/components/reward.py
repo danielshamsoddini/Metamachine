@@ -554,7 +554,17 @@ class ExcessiveFootHeightPenaltyComponent(RewardComponent):
             foot_name: float(data.geom_xpos[geom_id][2])
             for foot_name, geom_id in self.foot_geom_ids.items()
         }
+        if reference_mode == "floor_clearance":
+            # Measure the capsule bottom, matching the gait-analysis traces.
+            clearances = capsule_floor_clearance(
+                model, data, list(self.foot_geom_ids.values())
+            )
+            foot_heights = dict(zip(self.foot_geom_ids, map(float, clearances)))
+        contact_geoms = set(getattr(state, "contact_floor_geoms", ()))
         for foot_name, height_world in foot_heights.items():
+            if (self.params.get("swing_only", False)
+                    and self.foot_geom_ids[foot_name] in contact_geoms):
+                continue
             if reference_mode == "median_other_feet":
                 other_heights = [
                     other_height
@@ -566,10 +576,12 @@ class ExcessiveFootHeightPenaltyComponent(RewardComponent):
                 height = height_world - float(state.accurate_pos_world[2])
             elif reference_mode == "floor":
                 height = height_world - floor_height
+            elif reference_mode == "floor_clearance":
+                height = height_world
             else:
                 raise ValueError(
                     "excessive_foot_height_penalty reference_mode must be "
-                    "floor, torso, or median_other_feet"
+                    "floor, floor_clearance, torso, or median_other_feet"
                 )
             normalized_excess = np.clip(
                 (height - free_height) / height_scale,
@@ -2182,6 +2194,17 @@ class ActionSaturationBarrierComponent(RewardComponent):
         )
         free = max(float(self.params.get("free_magnitude", 0.70)), 0.0)
         limit = max(float(self.params.get("limit_magnitude", 0.80)), free + 1e-6)
+        joint_free = self.params.get("per_joint_free_magnitude")
+        joint_limit = self.params.get("per_joint_limit_magnitude")
+        if joint_free is not None or joint_limit is not None:
+            if joint_free is None or joint_limit is None:
+                raise ValueError("both per-joint saturation thresholds are required")
+            free = np.asarray(joint_free, dtype=np.float64)
+            limit = np.asarray(joint_limit, dtype=np.float64)
+            if (free.shape != action.shape or limit.shape != action.shape
+                    or not np.isfinite(free).all() or not np.isfinite(limit).all()
+                    or np.any(free < 0) or np.any(limit <= free)):
+                raise ValueError("invalid per-joint saturation thresholds")
         power = max(float(self.params.get("power", 4.0)), 1.0)
         normalized = np.clip((action - free) / (limit - free), 0.0, None)
         cost = float(np.mean(np.power(normalized, power)))
@@ -2416,7 +2439,9 @@ class CommandFrameSustainedLeanComponent(RewardComponent):
 
     def calculate(self, state, calculator):
         if getattr(self, 'window', None) is None:
-            self.window = CommandLeanWindow(calculator.dt, self.params.get('window_seconds', 2.0))
+            self.window = CommandLeanWindow(calculator.dt, self.params.get('window_seconds', 2.0),
+                                            include_forward=self.params.get('include_forward', False),
+                                            reset_on_command_change=self.params.get('reset_on_command_change', True))
         up = quat_apply(state.accurate_quat, np.array([0., 0., 1.]))
         cmd = _resolve_hybrid_target_xy(state, self.params)
         self.last_angle_deg = self.window.update(up, cmd)
@@ -2439,6 +2464,7 @@ class DeliberateFootCycleComponent(RewardComponent):
         self.elapsed = np.zeros(4)
         self.peak_clearance = np.zeros(4)
         self.seen_transition = np.zeros(4, dtype=bool)
+        self.swing_start_along = np.zeros(4)
 
     def calculate(self, state, calculator):
         if not hasattr(self, 'previous_contact'):
@@ -2460,6 +2486,27 @@ class DeliberateFootCycleComponent(RewardComponent):
         landed = complete & contact
         clear = float(self.params.get('minimum_clearance_m', .015))
         cost += np.sum(np.maximum(0., 1. - self.peak_clearance[landed] / clear))
+        # Opt-in stride quality: measure capsule-centre excursion relative to
+        # the torso in the commanded world direction, not torso yaw. Only
+        # complete swings are scored, so reset-censored intervals are omitted.
+        swing_min = float(self.params.get('minimum_swing_seconds', 0.))
+        excursion_min = float(self.params.get('minimum_swing_excursion_m', 0.))
+        if swing_min > 0.:
+            cost += np.sum(np.maximum(0., 1. - self.elapsed[landed] / swing_min))
+        if excursion_min > 0.:
+            target = _resolve_hybrid_target_xy(state, self.params)
+            torso = np.asarray(state.accurate.pos_world)[:2]
+            along = (data.geom_xpos[ids, :2] - torso) @ target
+            cost += np.sum(np.maximum(0., 1. - (along[landed] - self.swing_start_along[landed]) / excursion_min))
+            lifted = changed & ~contact
+            self.swing_start_along[lifted] = along[lifted]
+        # Prevent a permanently planted/skimming foot avoiding completed-swing
+        # costs. Integrated in seconds so changing control rate does not make
+        # this per-interval cost stronger.
+        max_stance = float(self.params.get('maximum_stance_seconds', 0.))
+        if max_stance > 0.:
+            cost += float(calculator.dt) * np.sum(np.clip(
+                (self.elapsed[contact] - max_stance) / max_stance, 0., 2.))
         self.elapsed[changed] = 0.
         self.peak_clearance[changed] = 0.
         self.seen_transition[changed] = True
@@ -2505,8 +2552,11 @@ class InitialHeadingStabilityComponent(RewardComponent):
     def calculate(self, state, calculator) -> float:
         heading = float(np.asarray(state.derived.heading).reshape(-1)[0])
         if self.initial_heading is None:
-            self.initial_heading = heading
-            return 0.0
+            if self.params.get("reference_reset_heading", False):
+                self.initial_heading = float(np.asarray(state.derived.initial_heading).reshape(-1)[0])
+            else:
+                self.initial_heading = heading
+                return 0.0
         error = float(np.arctan2(np.sin(heading - self.initial_heading), np.cos(heading - self.initial_heading)))
         free = abs(float(self.params.get("free_deviation_radians", 0.0)))
         scale = max(float(self.params.get("tracking_sigma", 0.25)), 1e-6)
@@ -3436,15 +3486,43 @@ class HybridDirectionLateralPenaltyComponent(RewardComponent):
         lateral_drift_sq = float(np.dot(lateral_disp, lateral_disp))
         return -lateral_drift_sq / tracking_sigma
 
+    def _windowed_velocity_penalty(self, state, calculator) -> float:
+        """Cost mean lateral speed over a physical-time window, not lane offset.
+
+        Uses privileged world position only inside the training reward. No
+        estimator or observation is introduced. A full window avoids treating
+        individual gait sway or a partial reset interval as persistent drift.
+        """
+        dt = float(calculator.dt)
+        seconds = float(self.params.get('window_seconds', .6))
+        scale = float(self.params.get('velocity_scale_mps', .1))
+        if not (np.isfinite(dt) and np.isfinite(seconds) and np.isfinite(scale)
+                and dt > 0 and seconds > 0 and scale > 0):
+            raise ValueError('windowed velocity requires positive finite dt/window/scale')
+        target = _resolve_hybrid_target_xy(state, self.params)
+        if self.last_target_xy is None or np.dot(target, self.last_target_xy) < .999:
+            self.pos_history = []
+        self.last_target_xy = target.copy()
+        self.pos_history.append(self._get_planar_position(state).copy())
+        count = max(2, int(round(seconds / dt)) + 1)
+        self.pos_history = self.pos_history[-count:]
+        if len(self.pos_history) < count:
+            return 0.
+        velocity = (self.pos_history[-1] - self.pos_history[0]) / ((count-1)*dt)
+        lateral = float(target[0]*velocity[1] - target[1]*velocity[0])
+        return -float((lateral/scale)**2)
+
     def calculate(self, state, calculator) -> float:
         mode = str(self.params.get("mode", "windowed_displacement")).lower()
+        if mode == "windowed_velocity":
+            return self._windowed_velocity_penalty(state, calculator)
         if mode == "velocity":
             return self._lateral_velocity_penalty(state)
         if mode == "windowed_displacement":
             return self._windowed_displacement_penalty(state, calculator)
         raise ValueError(
             f"Unknown hybrid_direction_lateral_penalty mode '{mode}'. "
-            "Use 'windowed_displacement' or 'velocity'."
+            "Use 'windowed_displacement', 'windowed_velocity', or 'velocity'."
         )
 
     def reset(self) -> None:

@@ -98,6 +98,19 @@ class Base(gym.Env, ABC):
         # Action space (adjusted for frozen joints)
         action_limit = self.cfg.control.symmetric_limit
         effective_action_size = self.action_processor.effective_action_size
+        # Opt in for fresh policies; legacy checkpoints keep their scalar Box.
+        if self.cfg.control.get("action_space_from_joint_limits", False):
+            bounds = self.action_processor.get_action_bounds_for_active_joints()
+            limits = bounds.custom_limits
+            if limits is None:
+                limits = np.full(effective_action_size, bounds.symmetric_limit)
+            scale = float(self.cfg.control.action_scale)
+            limits = np.asarray(limits, dtype=np.float32)
+            if (limits.shape != (effective_action_size,) or
+                    not np.isfinite(limits).all() or np.any(limits <= 0) or
+                    not np.isfinite(scale) or scale <= 0):
+                raise ValueError("joint action-space bounds and action_scale must be positive and finite")
+            action_limit = limits / scale
         self.action_space = Box(
             low=-action_limit,
             high=action_limit,
@@ -233,9 +246,24 @@ class Base(gym.Env, ABC):
         command_cfg = getattr(self.command_manager, "command_cfg", {}) or {}
         if not bool(command_cfg.get("relative_to_initial_heading", False)):
             return
-        heading = getattr(self.state.derived, "initial_heading", None)
-        if heading is None:
-            return
+        reference = str(command_cfg.get("initial_heading_source", "observed"))
+        if reference == "observed":
+            heading = getattr(self.state.derived, "initial_heading", None)
+            if heading is None:
+                return
+        elif reference == "simulation_true":
+            # Training/evaluation truth is used only to anchor the world command.
+            # Do not overwrite noisy state headings or actor observation history.
+            if not hasattr(self, "model") or not hasattr(self, "data"):
+                raise ValueError("simulation_true heading requires a simulator")
+            torso_name = str(self.cfg.observation.get("torso_body_name", "ant0"))
+            rotation = self.data.xmat[self.model.body(torso_name).id].reshape(3, 3)
+            forward = rotation @ np.asarray(self.cfg.observation.projected_forward_vec, dtype=float)
+            if not np.isfinite(forward).all() or np.linalg.norm(forward[:2]) < 1e-8:
+                raise ValueError("true initial heading has no finite horizontal projection")
+            heading = np.array([np.arctan2(forward[1], forward[0])])
+        else:
+            raise ValueError(f"unknown initial_heading_source: {reference}")
         # Optional mixture curriculum: sample one offset per episode.
         # relative_heading_offset_choices: list[float]
         # relative_heading_offset_probs: optional list[float] (same length; else uniform)

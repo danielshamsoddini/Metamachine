@@ -3537,22 +3537,17 @@ class MetaMachine(Base, MujocoEnv):
             }
             self.xml_compiler.update_mass(mass_dict)
 
-        # Each ankle is sampled independently, matching mass randomization.
+        # Sample absolute lengths from cached nominal ranges, never last reset.
         ankle_length_cfg = randomization_cfg.get("ankle_length", {})
         if (
             ankle_length_cfg.get("enabled", False)
             and hasattr(self, "ankle_length_range")
             and hasattr(self, "xml_compiler")
         ):
-            ankle_length_offset = ankle_length_cfg.get("offset", 0)
-            ankle_length_dict = {
-                key: np.random.uniform(*value) + ankle_length_offset
-                for key, value in self.ankle_length_range.items()
-            }
-            if any(length <= 0 for length in ankle_length_dict.values()):
-                raise ValueError(
-                    "randomization.ankle_length produced a non-positive geom length"
-                )
+            from metamachine.utils.ankle_randomization import sample_ankle_lengths
+            ankle_length_dict, self.ankle_length_diagnostics = sample_ankle_lengths(
+                self.ankle_length_range, ankle_length_cfg
+            )
             self.xml_compiler.update_geom_length(ankle_length_dict)
 
         # Damping randomization
@@ -3825,6 +3820,11 @@ class MetaMachine(Base, MujocoEnv):
         qpos = self._apply_initial_noise()
         qvel = self._get_initial_velocities()
 
+        ground_start = self.init_cfg.get('symmetric_ground_start', {})
+        if ground_start.get('enabled', False):
+            from ..utils.symmetric_ground_start import symmetric_ground_start
+            qpos, qvel = symmetric_ground_start(self, qpos, qvel, ground_start)
+
         # Set MuJoCo state
         self.set_state(qpos, qvel)
 
@@ -3965,6 +3965,10 @@ class MetaMachine(Base, MujocoEnv):
             width=self.render_size[0],
             height=self.render_size[1],
         )
+
+        # Model reload otherwise replaces the policy Box with torque bounds.
+        if self.cfg.control.get("action_space_from_joint_limits", False):
+            self._setup_spaces()
 
         # Restore render settings
         self.render_mode = saved_render_mode

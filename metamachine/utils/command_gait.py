@@ -16,18 +16,24 @@ def capsule_floor_clearance(model, data, ids):
 
 
 class CommandLeanWindow:
-    """Signed mean torso-up vector; forward lean is free, lateral/backward is not.
+    """Signed mean torso-up vector; optionally include forward lean.
+
+    The default preserves the original lateral/backward-only measurement.
 
     Inputs are world-frame vectors. Yaw does not rotate the command frame.
     Clear the window when the command changes, so old commands cannot cancel
     new-command lean. Each update represents one completed control interval.
     """
-    def __init__(self, dt, seconds=2.0):
+    def __init__(self, dt, seconds=2.0, include_forward=False, reset_on_command_change=True):
         if not np.isfinite([dt, seconds]).all() or dt <= 0 or seconds <= 0:
             raise ValueError('positive finite window and dt required')
         self.size = int(np.ceil(seconds / dt - 1e-10))
         self.history = deque(maxlen=self.size)
         self.command = None
+        self.include_forward = bool(include_forward)
+        self.reset_on_command_change = bool(reset_on_command_change)
+        if not self.reset_on_command_change and not self.include_forward:
+            raise ValueError('continuous lean windows require total tilt (include_forward=True)')
 
     def reset(self):
         self.history.clear()
@@ -41,7 +47,7 @@ class CommandLeanWindow:
         if np.linalg.norm(cmd) < 1e-8 or np.linalg.norm(up) < 1e-8:
             raise ValueError('nonzero vectors required')
         cmd = cmd / np.linalg.norm(cmd)
-        if self.command is not None and np.dot(cmd, self.command) < 1 - 1e-8:
+        if self.reset_on_command_change and self.command is not None and np.dot(cmd, self.command) < 1 - 1e-8:
             self.reset()
         self.command = cmd.copy()
         self.history.append(up / np.linalg.norm(up))
@@ -49,7 +55,8 @@ class CommandLeanWindow:
             return None
         mean = np.mean(self.history, axis=0)
         lateral = np.dot(mean[:2], [-cmd[1], cmd[0]])
-        backward = min(float(np.dot(mean[:2], cmd)), 0.0)
+        along = float(np.dot(mean[:2], cmd))
+        backward = along if self.include_forward else min(along, 0.0)
         return float(np.degrees(np.arctan2(np.hypot(lateral, backward), mean[2])))
 
 
@@ -74,6 +81,9 @@ def gait_summary(time, position, up, command, qvel, torque, contacts, clearance)
     window = CommandLeanWindow(dt)
     lean = [window.update(u, c) for u, c in zip(up[1:], command[1:])]
     valid = np.array([v for v in lean if v is not None])
+    total_window = CommandLeanWindow(dt, include_forward=True)
+    total_lean = [total_window.update(u, [1., 0.]) for u in up[1:]]
+    total_valid = np.array([v for v in total_lean if v is not None])
     delta = np.diff(position[:, :2], axis=0)
     cmd = command[1:] / np.linalg.norm(command[1:], axis=1)[:, None]
     along = np.sum(delta * cmd, axis=1)
@@ -94,6 +104,8 @@ def gait_summary(time, position, up, command, qvel, torque, contacts, clearance)
                 path_error_deg=float(np.degrees(np.arctan2(abs(lateral.sum()), along.sum()))),
                 sustained_away_lean_max_deg=float(valid.max()) if len(valid) else None,
                 sustained_away_lean_pass=bool(len(valid) and np.all(valid <= 10.0 + 1e-8)),
+                sustained_total_tilt_max_deg=float(total_valid.max()) if len(total_valid) else None,
+                sustained_total_tilt_pass=bool(len(total_valid) and np.all(total_valid <= 10.0 + 1e-8)),
                 joint_velocity_rms_rad_s=float(np.sqrt(np.mean(qvel**2))),
                 joint_acceleration_rms_rad_s2=float(np.sqrt(np.mean(acceleration**2))),
                 touchdown_hz_per_foot=(touchdowns/duration).tolist(),
