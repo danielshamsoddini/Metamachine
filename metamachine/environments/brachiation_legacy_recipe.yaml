@@ -1,0 +1,140 @@
+# Frozen original task semantics, expanded visibly for archived v0 run YAMLs.
+# Order below IS the per-frame policy input order. Disabled entries add no values.
+# Component scalars or per-element lists are accepted for scale/noise_std.
+observation:
+  include_history_steps: 1       # 5 would give 5 * 42 = 210 inputs with these components
+  history_order: oldest_first    # oldest_first | newest_first
+  history_reset: repeat          # repeat initial frame | zeros (current frame still filled)
+  clip_observations: null        # null = no clipping; otherwise symmetric +/- limit
+  components:
+    - name: projected_gravity    # 3: world down [0,0,-1], expressed in torso frame
+      enabled: true
+      scale: 1.0
+      noise_std: 0.0
+      params: {}
+    - name: lin_vel_body         # 3: torso linear velocity in torso frame, m/s
+      enabled: true
+      scale: 1.0
+      noise_std: 0.0
+      params: {}
+    - name: ang_vel_body         # 3: torso angular velocity in torso frame, rad/s
+      enabled: true
+      scale: 1.0
+      noise_std: 0.0
+      params: {}
+    - name: dof_pos              # 6: joint angles, rad; XML actuator order
+      enabled: true
+      scale: 1.0
+      noise_std: 0.0
+      params: {}
+    - name: dof_vel              # 6: joint velocities, rad/s
+      enabled: true
+      scale: 1.0
+      noise_std: 0.0
+      params: {}
+    - name: hand_positions       # 6: left/right grip-site positions minus torso position
+      enabled: true
+      scale: 1.0
+      noise_std: 0.0
+      params: {frame: body}      # body | world (both relative to torso)
+    - name: target_bar_positions # 3 * count: target bar, then upcoming bars
+      enabled: true
+      scale: 1.0
+      noise_std: 0.0
+      params: {count: 3, frame: body}  # final bar repeated when preview extends past course
+    - name: last_action          # 6: previous normalized PD target commands
+      enabled: true
+      scale: 1.0
+      noise_std: 0.0
+      params: {}
+    - name: hook_contacts        # optional 2: left/right hook touching ANY bar (0 or 1)
+      enabled: false
+      scale: 1.0
+      noise_std: 0.0
+      params: {}
+    - name: torso_height         # optional 1: world height, m
+      enabled: false
+      scale: 1.0
+      noise_std: 0.0
+      params: {}
+    - name: pd_target            # optional 6: previous PD target joint angles, rad
+      enabled: false
+      scale: 1.0
+      noise_std: 0.0
+      params: {}
+    - name: tracking_error       # optional 6: previous PD target minus measured angle
+      enabled: false
+      scale: 1.0
+      noise_std: 0.0
+      params: {}
+task:
+  schema_version: 1
+  start: hanging
+  remove_cart: true
+  # Sequential target starts at bar 1; both hooks initially hang on bar 0.
+  distance_metric: bar_axis      # bar_axis | bar_center; nearest of the two grip sites
+  target_tolerance: 0.075        # m; must be inside this radius for contact_steps
+  require_hook_contact: true     # false allows distance-only completion
+  contact_distance: 0.0         # contact.dist < this value counts as touching, m
+  contact_steps: 3              # consecutive policy samples, currently 60 ms
+  fall_height: 0.26             # torso world z below this value, m
+  lateral_limit: 0.65           # absolute torso world y above this value, m
+  terminate_on_fall: true
+  terminate_on_success: true    # reaching final bar; course completion awarded only once
+  nonfinite_reward: -2.0        # invalid physics always terminates and overrides total reward
+  reward_clip: null             # null | [min, max], applied AFTER summing weighted terms
+  # Crown underside supports the bar at hand-frame z ~0.0576 m.
+  initial_bar_to_hand_z: 0.0536
+
+  # total = sum(weight * raw_term * (control_dt if scale_by_dt else 1)).
+  # All listed raw penalties are NONNEGATIVE: use a NEGATIVE weight to penalize.
+  # Each enabled term is logged as reward_raw/<name> and reward_weighted/<name>.
+  reward_components:
+    - name: forward_progress
+      type: forward_progress    # dot(torso_after - torso_before, direction), m
+      enabled: true
+      weight: 3.0
+      scale_by_dt: false        # displacement is already per-step, not velocity
+      params: {direction: [1.0, 0.0, 0.0]}
+    - name: target_distance
+      type: target_distance     # distance_before - distance_after to SAME target, m
+      enabled: true
+      weight: 0.5
+      scale_by_dt: false
+      params: {metric: bar_axis}
+    - name: next_bar
+      type: bar_reached         # 1 once when the sequential target is reached, else 0
+      enabled: true
+      weight: 5.0
+      scale_by_dt: false
+      params: {}
+    - name: action_cost
+      type: action_l2           # sum(normalized position-target actions squared); NOT energy
+      enabled: true
+      weight: -0.002
+      scale_by_dt: true
+      params: {}
+    - name: action_rate_cost
+      type: action_rate         # sum((action - previous_action)^2)
+      enabled: true
+      weight: -0.005
+      scale_by_dt: false
+      params: {}
+    - name: fall
+      type: fall                # 1 when height/lateral criterion is met, even if termination disabled
+      enabled: true
+      weight: -2.0
+      scale_by_dt: false
+      params: {}
+    - name: torque_cost
+      type: torque_l2           # mean substep sum(applied joint torques^2), Nm^2
+      enabled: false
+      weight: -0.0001
+      scale_by_dt: true
+      params: {}
+    - name: power_cost
+      type: power_l1            # mean substep sum(abs(torque * joint_velocity)), W
+      enabled: false
+      weight: -0.001
+      scale_by_dt: true
+      params: {}

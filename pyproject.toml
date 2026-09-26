@@ -210,6 +210,7 @@ exclude = ["tests*", "debug*", "logs*", "*.egg-info*", "*__pycache__*"]
 metamachine = [
     "assets/**/*",
     "environments/configs/default_configs/*.yaml",
+    "environments/brachiation_legacy_recipe.yaml",
     "py.typed",  # PEP 561 - package supports typing
 ]
 
