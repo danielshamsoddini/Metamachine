@@ -93,6 +93,15 @@ def initial_info(env, data):
                 reach_best=reach_potential(env, data, jp.array(1), jp.array(-1)))
 
 
+def potential_context(env, before, after, info, next_target, next_hand, complete):
+    """Use consecutive task states, including target and eligible-hand switches."""
+    return dict(
+        potential_before=jp.where(info["course_complete"], 0.,
+            reach_potential(env, before, info["target"], info["last_transfer_hand"])),
+        potential_after=jp.where(complete, 0.,
+            reach_potential(env, after, next_target, next_hand)))
+
+
 def advance(env, info, distances, loads, touching, seated, unsafe):
     """Same-hand loaded hold, other hand released, alternation, and failure gating."""
     c = env.cfg.task.cart_task

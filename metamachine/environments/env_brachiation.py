@@ -162,7 +162,8 @@ class BrachiationMJX(MJXMetaMachine):
         for term in self.spec.rewards:
             raw = REWARD_FUNCTIONS[term["type"]](self, context, term["params"])
             raw = jp.where(context["finite"], raw, 0.)
-            if self.spec.cart_task and float(term["weight"]) > 0:
+            # Keep the potential debit on failure; dropping it rewards failed reaches.
+            if self.spec.cart_task and float(term["weight"]) > 0 and term["type"] != "reach_potential":
                 raw = jp.where(context["fall"], 0., raw)
             contribution = float(term["weight"]) * raw * (self.dt if term["scale_by_dt"] else 1.)
             metrics["reward_raw/" + term["name"]] = raw
@@ -227,10 +228,16 @@ class BrachiationMJX(MJXMetaMachine):
         if self.spec.cart_task:
             guard_info["reach_best"] = jp.where(reached,
                 cart_task.reach_potential(self, data, next_target, guard_info["last_transfer_hand"]), guard_info["reach_best"])
-        context = {"before": state.pipeline_state, "after": data, "target": target,
+        done = ((fall & bool(self.cfg.task.terminate_on_fall))
+                | (success & bool(self.cfg.task.terminate_on_success)) | ~finite)
+        context = {"terminal": done, "before": state.pipeline_state, "after": data, "target": target,
                    "action": action, "last_action": state.info["last_action"], "reached": reached,
                    "fall": fall, "finite": finite, "reach_improvement": reach_improvement, "mean_torque_l2": torque_sum / self._n_substeps,
                    "mean_power_l1": power_sum / self._n_substeps}
+        if self.spec.potential_shaping:
+            context.update(cart_task.potential_context(
+                self, state.pipeline_state, data, state.info, next_target,
+                guard_info["last_transfer_hand"], state.info["course_complete"] | success))
         reward, reward_metrics = self._reward(context)
         info = dict(state.info, target=next_target, last_action=action,
                     contact_steps=jp.where(reached, 0, count), course_complete=state.info["course_complete"] | success)
@@ -242,8 +249,6 @@ class BrachiationMJX(MJXMetaMachine):
         metrics.update(progress=jp.where(finite, pos[0] - state.pipeline_state.xpos[self.torso, 0], 0.),
                        bars_reached=reached.astype(jp.float32), fall=fall.astype(jp.float32),
                        success=success.astype(jp.float32))
-        done = ((fall & bool(self.cfg.task.terminate_on_fall))
-                | (success & bool(self.cfg.task.terminate_on_success)) | ~finite)
         return state.replace(pipeline_state=data, obs=obs, reward=reward, done=done.astype(jp.float32),
                              metrics=metrics, info=info)
 

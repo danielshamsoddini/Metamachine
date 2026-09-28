@@ -33,6 +33,8 @@ REWARDS = {
     "target_distance": ("distance_before - distance_after to the SAME target bar; nearest hand", {"metric": ("bar_axis", "bar_center")}),
     "bar_reached": ("1 on sequential bar-completion event, otherwise 0", {}),
     "reach_improvement": ("increase in best eligible-hand proximity this target; bounded total <= 1 per target", {}),
+    "reach_potential": ("training.discounting * Phi(next task state) - Phi(current task state); Phi=eligible-hand proximity, zero on task termination/completion; retained on truncation", {}),
+    "unfinished_step": ("1 on nonterminal task steps, 0 on task termination; time-limit truncation is nonterminal", {}),
     "action_l2": ("sum(normalized_action ** 2); NOT torque", {}),
     "action_rate": ("sum((normalized_action - previous_action) ** 2)", {}),
     "fall": ("1 on task failure (height/lateral; cart_task also forbidden support, escape, hook-loss or stall), otherwise 0", {}),
@@ -220,12 +222,23 @@ class TaskSpec:
             _finite(term["weight"], name + ".weight")
             _params(term["params"], REWARDS[kind][1], name + ".params")
             if term["enabled"]:
-                if kind == "reach_improvement" and not self.cart_task:
-                    raise ValueError("reach_improvement requires task.cart_task")
+                if kind in ("reach_improvement", "reach_potential", "unfinished_step") and not self.cart_task:
+                    raise ValueError(f"{kind} requires task.cart_task")
                 if self.cart_task and kind in ("forward_progress", "target_distance"):
                     raise ValueError("cart_task uses bounded reach_improvement, not unrestricted progress rewards")
                 self.rewards.append(term)
         self.effort_metrics = any(c["type"] in ("torque_l2", "power_l1") for c in self.rewards)
+
+        self.potential_shaping = any(c["type"] == "reach_potential" for c in self.rewards)
+        if self.potential_shaping:
+            gamma = raw["training"]["discounting"]
+            _finite(gamma, "training.discounting")
+            if not 0 < gamma < 1:
+                raise ValueError("reach_potential requires 0 < training.discounting < 1")
+            if self.reward_clip is not None:
+                raise ValueError("reach_potential requires reward_clip: null to preserve telescoping")
+            if any(c["type"] == "reach_improvement" for c in self.rewards):
+                raise ValueError("Do not mix reach_potential and reach_improvement")
 
     def manifest(self):
         frames = []
@@ -248,7 +261,8 @@ class TaskSpec:
             "policy_dt": float(self.cfg.simulation.control_dt),
             "physics_dt": float(self.cfg.simulation.timestep),
             "rewards": [dict(deepcopy(c), formula=REWARDS[c["type"]][0]) for c in self.rewards],
-            "reward_aggregation": "sum(weight * raw_term * (control_dt if scale_by_dt else 1)); cart_task suppresses positive-weight terms on failure; optional total clip; non-finite physics overrides total",
+            "reward_aggregation": "sum(weight * raw_term * (control_dt if scale_by_dt else 1)); cart_task suppresses positive-weight terms on failure except reach_potential terminal debit; optional total clip; non-finite physics overrides total",
+            "shaping_discount": float(self.cfg.training.discounting) if self.potential_shaping else None,
             "task_rules": {k: v for k, v in OmegaConf.to_container(self.cfg.task, resolve=True).items() if k != "reward_components"},
             "available_observations": {k: {"size": v[0], "meaning": v[1], "parameters": v[2]} for k, v in OBSERVATIONS.items()},
             "available_reward_types": {k: {"formula": v[0], "parameters": v[1]} for k, v in REWARDS.items()},

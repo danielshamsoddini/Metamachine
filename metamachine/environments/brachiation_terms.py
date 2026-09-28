@@ -109,6 +109,16 @@ def reward_reach_improvement(env, ctx, params):
     return ctx["reach_improvement"]
 
 
+def reward_reach_potential(env, ctx, params):
+    # Terminal Phi is zero; truncations retain Phi for value bootstrapping.
+    after = jp.where(ctx["terminal"], 0., ctx["potential_after"])
+    return float(env.cfg.training.discounting) * after - ctx["potential_before"]
+
+
+def reward_unfinished_step(env, ctx, params):
+    return (~ctx["terminal"]).astype(jp.float32)
+
+
 def reward_action_l2(env, ctx, params):
     return jp.sum(ctx["action"] ** 2)
 
@@ -135,6 +145,6 @@ def reward_joint_velocity_l2(env, ctx, params):
 
 REWARD_FUNCTIONS = {
     name: globals()["reward_" + name] for name in (
-        "forward_progress", "target_distance", "bar_reached", "reach_improvement", "action_l2",
+        "forward_progress", "target_distance", "bar_reached", "reach_improvement", "reach_potential", "unfinished_step", "action_l2",
         "action_rate", "fall", "torque_l2", "power_l1", "joint_velocity_l2")
 }
