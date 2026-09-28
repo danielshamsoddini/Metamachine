@@ -201,3 +201,8 @@ For the modular legs implementation, please also cite:
 ## License
 
 This project is licensed under the Apache-2.0 License - see the LICENSE file for details.
+
+### Experimental Newton backend
+
+An optional Featherstone backend is available for simple rigid-body tasks. See
+[setup, supported scope, and validation](NEWTON_BACKEND.md). MuJoCo and MJX remain available.

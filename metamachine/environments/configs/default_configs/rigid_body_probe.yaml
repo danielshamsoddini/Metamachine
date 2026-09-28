@@ -1,0 +1,48 @@
+# Minimal backend validation task; inherits existing MetaMachine task semantics.
+_base: basic_quadruped
+environment:
+  mode: newton
+morphology:
+  asset_file: rigid_body_probe.xml
+  configuration: null
+control:
+  dt: 0.01
+  num_actions: 1
+  default_dof_pos: [0.0]
+  kp: 1.0
+  kd: 0.1
+  filter:
+    enabled: false
+  filter_action: false
+observation:
+  torso_body_name: torso
+  projected_forward_vec: [1, 0, 0]
+  projected_upward_vec: [0, 0, 1]
+simulation:
+  mj_dt: 0.001
+  render: false
+  render_mode: none
+  newton_device: cpu
+  tn_constraint: false
+initialization:
+  init_pos: [0, 0, 2]
+  init_quat: [1, 0, 0, 0]
+  init_joint_pos: [0.0]
+  noisy_init: false
+  randomize_orientation: false
+  randomize_ini_vel: false
+randomization:
+  friction:
+    enabled: false
+  init_joint_pos:
+    enabled: false
+task:
+  termination_conditions:
+    termination_strategy: null
+    height_position_source: torso_world
+    height_threshold: 0.3
+    max_episode_steps: 100
+logging:
+  create_log_dir: true
+  data_dir: ./runs
+  experiment_name: rigid_body_probe

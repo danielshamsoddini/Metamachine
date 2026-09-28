@@ -64,7 +64,8 @@ class ConfigRegistry:
         The current config's values take precedence over base values.
         """
         if "_base" in config:
-            base_name = config.pop("_base")
+            base_name = config["_base"]
+            config = {key: value for key, value in config.items() if key != "_base"}
             base_config = cls.get_schema(base_name)
             # Convert to OmegaConf for proper merging
             base_conf = OmegaConf.create(base_config)

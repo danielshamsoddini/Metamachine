@@ -6,6 +6,7 @@ This module provides simulation and real robot environments for the MetaMachine 
 Core Classes:
     - MetaMachine: Main CPU-based simulation environment (env_sim.py)
     - MJXMetaMachine: GPU-accelerated MJX simulation environment (env_mjx.py)
+    - NewtonMetaMachine: Optional Featherstone rigid-body simulation (env_newton.py)
     - RealMetaMachine: Real robot environment using capybarish (env_real.py)
     - CyberGearRealMetaMachine: Real robot environment using CyberGearDriver CAN transport
     - RayVecMetaMachine: Vectorized environment using Ray for parallel execution (vec_env.py)
@@ -70,6 +71,7 @@ def make_env(cfg, **kwargs):
     This function checks `cfg.environment.mode` and creates either:
     - MetaMachine (CPU simulation) if mode == "sim" or not specified
     - MJXMetaMachine (GPU-accelerated simulation) if mode == "mjx"
+    - NewtonMetaMachine (experimental Featherstone simulation) if mode == "newton"
     - RealMetaMachine (real robot) if mode == "real"
     
     Args:
@@ -115,6 +117,11 @@ def make_env(cfg, **kwargs):
             )
         return MJXMetaMachine(cfg, **kwargs)
     
+    elif mode == "newton":
+        from .env_newton import NewtonMetaMachine
+
+        return NewtonMetaMachine(cfg, **kwargs)
+
     elif mode == "real":
         real_backend = cfg.get("real", {}).get("backend", "capybarish").lower()
         if real_backend == "cybergear":
@@ -133,7 +140,7 @@ def make_env(cfg, **kwargs):
     else:
         raise ValueError(
             f"Unknown environment mode: '{mode}'. "
-            f"Use 'sim' for CPU simulation, 'mjx' for GPU simulation, "
+            f"Use 'sim' for CPU simulation, 'mjx' for GPU simulation, 'newton' for Featherstone, "
             f"or 'real' for real robot."
         )
 

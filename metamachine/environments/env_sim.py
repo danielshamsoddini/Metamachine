@@ -4199,9 +4199,10 @@ class MetaMachine(Base, MujocoEnv):
         """
         Step over the MuJoCo simulation (standard implementation).
         """
-        self.data.ctrl[:] = ctrl
-        mujoco.mj_step(self.model, self.data, nstep=n_frames)
+        from .backends import MuJoCoBackend
 
-        # As of MuJoCo 2.0, force-related quantities like cacc are not computed
-        # unless there's a force sensor in the model.
-        mujoco.mj_rnePostConstraint(self.model, self.data)
+        # Rebind after legacy morphology/domain-randomization model reloads.
+        if (not hasattr(self, "physics") or self.physics.model is not self.model
+                or self.physics.data is not self.data):
+            self.physics = MuJoCoBackend(self.model, self.data)
+        self.physics.step(ctrl, n_frames)
