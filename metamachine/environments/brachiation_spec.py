@@ -154,7 +154,7 @@ class TaskSpec:
                 offset += dim
         if offset == 0:
             raise ValueError("Enable at least one observation component")
-        if cfg.bars.get("layout", "parallel") == "spatial":
+        if cfg.bars.get("layout", "parallel") in ("spatial", "grid"):
             if not any(c["name"] == "target_bar_axes" for c in self.observations):
                 raise ValueError("Spatial courses require target_bar_axes observations")
         self.frame_size, self.observation_size = offset, offset * self.history_steps

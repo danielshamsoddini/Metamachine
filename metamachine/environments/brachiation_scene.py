@@ -8,7 +8,7 @@ import numpy as np
 
 def build_scene(cfg, source_path):
     bars = cfg.bars
-    from .brachiation_courses import validate_course, is_spatial
+    from .brachiation_courses import validate_course, is_spatial, bar_half_lengths
     validate_course(cfg)
     if int(bars.count) < 2:
         raise ValueError("At least two bars are required")
@@ -50,15 +50,15 @@ def build_scene(cfg, source_path):
     poses = None
     if is_spatial(cfg):
         import jax
-        from .brachiation_courses import sample_spatial
-        centers, quats, _ = sample_spatial(jax.random.PRNGKey(int(bars.spatial.preview_seed)), cfg, first_height)
+        from .brachiation_courses import sample_course
+        centers, quats, _ = sample_course(jax.random.PRNGKey(int(bars.get("spatial", {}).get("preview_seed", 314))), cfg, first_height)
         poses = np.asarray(centers), np.asarray(quats)
-    for i in range(int(bars.count)):
+    for i, half_length in enumerate(bar_half_lengths(cfg)):
         # Mocap poses are dynamic MJX data: different courses share one model.
         body = ET.SubElement(world, "body", name=f"course_bar_{i}", mocap="true",
                              pos=f"{i * np.mean(bars.spacing)} 0 {first_height if in_cart and i == 0 else first_height + np.mean(bars.height)}")
         geom = ET.SubElement(body, "geom", name=f"course_bar_geom_{i}",
-                      type=str(bars.geometry), size=f"{bars.radius} {bars.half_length}",
+                      type=str(bars.geometry), size=f"{bars.radius} {half_length}",
                       quat="0.7071067811865476 0.7071067811865476 0 0",
                       material="bar_mat")
         if poses is not None:

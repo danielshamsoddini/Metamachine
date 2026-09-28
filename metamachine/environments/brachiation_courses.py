@@ -5,13 +5,13 @@ import numpy as np
 
 
 def is_spatial(cfg):
-    return cfg.bars.get('layout', 'parallel') == 'spatial'
+    return cfg.bars.get('layout', 'parallel') in ('spatial', 'grid')
 
 
 def validate_course(cfg):
     layout = cfg.bars.get('layout', 'parallel')
-    if layout not in ('parallel', 'spatial'):
-        raise ValueError('bars.layout must be parallel or spatial')
+    if layout not in ('parallel', 'spatial', 'grid'):
+        raise ValueError('bars.layout must be parallel, spatial or grid')
     if layout == 'parallel':
         if 'spatial' in cfg.bars:
             raise ValueError('bars.spatial requires bars.layout: spatial')
@@ -20,6 +20,37 @@ def validate_course(cfg):
         raise ValueError('This spatial variant retains the cart-supported start')
     if cfg.bars.geometry != 'capsule':
         raise ValueError('Spatial courses require capsule bars')
+    if layout == 'grid':
+        c = cfg.bars.get('grid', {})
+        if not {'lateral_lines', 'levels', 'level_spacing'} <= set(c) or set(c) - {'lateral_lines', 'levels', 'level_spacing', 'variation'}:
+            raise ValueError('bars.grid requires lateral_lines, levels and level_spacing')
+        for name, minimum in (('lateral_lines', 2), ('levels', 1)):
+            if isinstance(c[name], bool) or not isinstance(c[name], int) or not minimum <= c[name] <= (64 if name == 'lateral_lines' else 16):
+                raise ValueError(f'grid {name} is outside its supported integer range')
+        if not np.isfinite(c.level_spacing) or c.level_spacing <= 2 * cfg.bars.radius:
+            raise ValueError('grid level_spacing must exceed the bar diameter')
+        if cfg.bars.spacing[0] != cfg.bars.spacing[1] or not np.isfinite(cfg.bars.spacing[0]):
+            raise ValueError('grid requires one fixed longitudinal spacing')
+        if not np.isfinite(cfg.bars.half_length) or 2 * cfg.bars.half_length / (c.lateral_lines-1) <= 2 * cfg.bars.radius:
+            raise ValueError('grid lateral spacing must exceed the bar diameter')
+        if any(list(cfg.bars[name]) != [0, 0] for name in ('height', 'height_offset', 'lateral_offset')) or 'spatial' in cfg.bars:
+            raise ValueError('grid uses aligned nodes: remove spatial settings and set offsets to zero')
+        if 'variation' in c:
+            v = c.variation
+            if c.levels != 1 or set(v) != {'seed', 'endpoint_jitter', 'shear'}:
+                raise ValueError('grid variation requires one layer and seed, endpoint_jitter, shear')
+            if isinstance(v.seed, bool) or not isinstance(v.seed, int) or not 0 <= v.seed < 2**32:
+                raise ValueError('grid variation seed must be a uint32 integer')
+            for name in ('endpoint_jitter', 'shear'):
+                if isinstance(v[name], bool) or not isinstance(v[name], (int, float)) or not np.isfinite(v[name]) or v[name] < 0:
+                    raise ValueError('grid variation ' + name + ' must be finite and nonnegative')
+            # Endpoint ordering guarantees no same-family crossings anywhere in the square.
+            for n, step in ((int(cfg.bars.count), float(cfg.bars.spacing[0])),
+                            (int(c.lateral_lines), 2*float(cfg.bars.half_length)/(c.lateral_lines-1))):
+                minimum_gap = step - 2*v.endpoint_jitter - 2*np.pi*v.shear/(n-1)
+                if minimum_gap <= 2*cfg.bars.radius:
+                    raise ValueError('grid variation is too large to preserve separated ordered rails')
+        return
     c = cfg.bars.get('spatial', {})
     fields = {'yaw_degrees', 'tilt_degrees', 'intersection_probability', 'intersection_margin',
               'start_clearance', 'candidates', 'preview_seed'}
@@ -70,7 +101,7 @@ def segment_distances(points, center, axis, half_length):
 
 def hand_distances(env, data, target):
     return segment_distances(data.site_xpos[env.hands], data.mocap_pos[target],
-                             axis_from_quat(data.mocap_quat[target]), float(env.cfg.bars.half_length))
+                             axis_from_quat(data.mocap_quat[target]), jp.asarray(bar_half_lengths(env.cfg))[target])
 
 
 def sample_spatial(key, cfg, start_height):
@@ -136,3 +167,81 @@ def sample_spatial(key, cfg, start_height):
     centers = jp.concatenate([initial_pos[None], centers])
     axes = jp.concatenate([initial_axis[None], axes])
     return centers, quat_from_axis(axes), jp.concatenate([jp.array([False]), links])
+
+
+def grid_geometry(cfg):
+    """Regular or mildly perturbed grid; first count bars are the forward route.
+
+    Continuous rails meet at every node. Structural rails are also grippable,
+    but do not add mandatory targets above the cart-supported route.
+    Coordinates here are relative to the fixed starting-bar height.
+    """
+    b, g = cfg.bars, cfg.bars.grid
+    xs = np.arange(int(b.count)) * float(b.spacing[0])
+    ys = np.linspace(-float(b.half_length), float(b.half_length), int(g.lateral_lines))
+    if 'variation' in g:
+        return irregular_grid_geometry(cfg, xs, ys)
+    zs = np.arange(int(g.levels)) * float(g.level_spacing)
+    centers, axes, lengths = [], [], []
+    def rail(center, axis, half):
+        centers.append(center); axes.append(axis); lengths.append(half)
+    # Keep all bottom crossbars first for the existing sequential task contract.
+    for z in zs:
+        for x in xs:
+            rail([x, 0, z], [0, 1, 0], float(b.half_length))
+    for z in zs:
+        for y in ys:
+            rail([xs[-1]/2, y, z], [1, 0, 0], xs[-1]/2)
+    if len(zs) > 1:
+        for x in xs:
+            for y in ys:
+                rail([x, y, zs[-1]/2], [0, 0, 1], zs[-1]/2)
+    return np.array(centers), np.array(axes), np.array(lengths)
+
+
+def bar_half_lengths(cfg):
+    if cfg.bars.get('layout') == 'grid':
+        return grid_geometry(cfg)[2]
+    return np.full(int(cfg.bars.count), float(cfg.bars.half_length))
+
+
+def bar_count(cfg):
+    return len(bar_half_lengths(cfg))
+
+
+def sample_course(key, cfg, start_height):
+    if cfg.bars.get('layout') != 'grid':
+        return sample_spatial(key, cfg, start_height)
+    centers, axes, lengths = grid_geometry(cfg)
+    centers = jp.asarray(centers).at[:, 2].add(start_height)
+    return centers, quat_from_axis(jp.asarray(axes)), jp.zeros(len(lengths), dtype=bool)
+
+
+def irregular_grid_geometry(cfg, xs, ys):
+    """Fixed-seed straight rails spanning the same rectangular perimeter.
+
+    Perturb ordered endpoints, not independent centers/angles: crossings between
+    the two families remain, but rails in the same family cannot cross. The
+    sinusoidal shear introduces gentle angle changes without destroying the grid.
+    Static lengths allow the variant to share the ordinary MJX physics path.
+    """
+    v = cfg.bars.grid.variation
+    rng = np.random.default_rng(int(v.seed))
+    def endpoints(values, pin_middle=False):
+        wave = float(v.shear) * np.sin(np.linspace(0, 2*np.pi, len(values)))
+        noise = rng.uniform(-float(v.endpoint_jitter), float(v.endpoint_jitter), (2,len(values)))
+        pair = np.stack([values + wave, values - wave]) + noise
+        pair[:,0] = values[0]; pair[:,-1] = values[-1]
+        if pin_middle and len(values) % 2:
+            pair[:,len(values)//2] = values[len(values)//2]
+        return pair
+    cross = endpoints(xs)
+    along = endpoints(ys, pin_middle=True)
+    zeros_x, zeros_y = np.zeros(len(xs)), np.zeros(len(ys))
+    a = np.concatenate([np.stack([cross[0], np.full(len(xs),ys[0]), zeros_x],axis=1),
+                        np.stack([np.full(len(ys),xs[0]), along[0], zeros_y],axis=1)])
+    b = np.concatenate([np.stack([cross[1], np.full(len(xs),ys[-1]), zeros_x],axis=1),
+                        np.stack([np.full(len(ys),xs[-1]), along[1], zeros_y],axis=1)])
+    delta = b-a
+    lengths = np.linalg.norm(delta,axis=1)
+    return (a+b)/2, delta/lengths[:,None], lengths/2

@@ -41,7 +41,7 @@ class BrachiationMJX(MJXMetaMachine):
         self.root_v = int(self._mj_model.joint("root").dofadr[0])
         self.torso = self._mj_model.body("torso").id
         self.hands = jp.array([self._mj_model.site(f"{s}_grip_site").id for s in ("left", "right")])
-        self.bar_geoms = jp.array([self._mj_model.geom(f"course_bar_geom_{i}").id for i in range(int(cfg.bars.count))])
+        self.bar_geoms = jp.array([self._mj_model.geom(f"course_bar_geom_{i}").id for i in range(courses.bar_count(cfg))])
         self.hook_geoms = jp.array([[self._mj_model.geom(f"{side}_hook_{i}").id for i in range(1, 8)]
                                    for side in ("left", "right")])
         if self.spec.cart_task:
@@ -66,7 +66,7 @@ class BrachiationMJX(MJXMetaMachine):
 
     def _course(self, key):
         if courses.is_spatial(self.cfg):
-            return courses.sample_spatial(key, self.cfg, self._cart_bar_height)[0]
+            return courses.sample_course(key, self.cfg, self._cart_bar_height)[0]
         b = self.cfg.bars
         keys = jax.random.split(key, 4)
         n = int(b.count)
@@ -92,7 +92,7 @@ class BrachiationMJX(MJXMetaMachine):
     def reset(self, rng):
         rng, course_key = jax.random.split(rng)
         if courses.is_spatial(self.cfg):
-            bars, quats, _ = courses.sample_spatial(course_key, self.cfg, self._cart_bar_height)
+            bars, quats, _ = courses.sample_course(course_key, self.cfg, self._cart_bar_height)
         else:
             bars, quats = self._course(course_key), self._template.mocap_quat
         qpos = self._hanging_offset.at[self.root_q:self.root_q + 3].add(bars[0])
