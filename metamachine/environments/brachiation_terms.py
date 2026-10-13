@@ -74,7 +74,13 @@ def obs_torso_height(env, data, info, params):
     return data.xpos[env.torso, 2:3]
 
 
+def obs_filtered_action(env, data, info, params):
+    return info["filtered_action"]
+
+
 def obs_pd_target(env, data, info, params):
+    if env.controller.stateful:
+        return info["pd_target"]
     return env.controller.targets(info["last_action"], xp=jp)
 
 
@@ -87,7 +93,7 @@ OBSERVATION_FUNCTIONS = {
         "projected_gravity", "lin_vel_body", "ang_vel_body", "dof_pos", "dof_vel",
         "hand_positions", "target_bar_positions", "target_bar_axes", "last_action", "hook_contacts",
         "cart_relative_position", "cart_relative_velocity", "cart_projected_gravity",
-        "torso_height", "pd_target", "tracking_error")
+        "torso_height", "pd_target", "tracking_error", "filtered_action")
 }
 
 

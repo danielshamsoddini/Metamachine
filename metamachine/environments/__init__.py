@@ -118,6 +118,19 @@ def make_env(cfg, **kwargs):
         return MJXMetaMachine(cfg, **kwargs)
     
     elif mode == "newton":
+        execution = cfg.simulation.get("newton_mode", "compat")
+        if execution == "native":
+            if "cart_task" in cfg.get("task", {}) and "schema_version" in cfg.task:
+                from .env_brachiation_newton import BrachiationNewton
+
+                kwargs.setdefault("source_path", cfg.simulation.source_xml)
+                kwargs.setdefault("device", cfg.simulation.get("newton_device", "cuda:0"))
+                return BrachiationNewton(cfg, **kwargs)
+            from .env_newton_native import NativeNewtonMetaMachine
+
+            return NativeNewtonMetaMachine(cfg, **kwargs)
+        if execution != "compat":
+            raise ValueError("simulation.newton_mode must be 'compat' or 'native'")
         from .env_newton import NewtonMetaMachine
 
         return NewtonMetaMachine(cfg, **kwargs)

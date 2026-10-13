@@ -33,6 +33,9 @@ class BrachiationMJX(MJXMetaMachine):
         self._mj_model = mujoco.MjModel.from_xml_string(self._xml_string)
         self.spec = TaskSpec(cfg, self._mj_model)
         self.controller = BrachiationController(cfg, self._mj_model)
+        if self.controller.stateful:
+            self.reset_info_keys = self.reset_info_keys + ("filtered_action", "pd_target")
+        self.contact_diagnostics = bool(cfg.task.get("contact_diagnostics", False))
         self._setup_mjx_model()
         self._num_actions = self._mj_model.nu
         q, v = joint_indices(self._mj_model)
@@ -50,6 +53,10 @@ class BrachiationMJX(MJXMetaMachine):
         self._hanging_offset = jp.array(hanging_qpos(self._mj_model, cfg, [0, 0, 0]))
         self._cart_bar_height = float(self._mj_model.body("course_bar_0").pos[2])
         self._template = mjx.make_data(self._mj_model)
+        self._reset_bank = None
+        if "reset_bank" in cfg.task:
+            from .brachiation_reset_bank import load_bank
+            self._reset_bank = {k: jp.asarray(v) for k, v in load_bank(self, source_path).items()}
         self._setup_rendering(cfg)
 
     @property
@@ -84,6 +91,8 @@ class BrachiationMJX(MJXMetaMachine):
         result = {k: jp.array(0.) for k in ("progress", "bars_reached", "fall", "success", "reward_adjustment")}
         if self.spec.cart_task:
             result.update({k: jp.array(0.) for k in ("robot_floor", "limb_cart", "nonhook_bar", "cart_escape", "stalled", "no_hook_failure", "cart_seated")})
+        if self.contact_diagnostics:
+            result.update({"contact/" + name: jp.array(0.) for name in cart_task.CONTACT_LABELS})
         for term in self.spec.rewards:
             result["reward_raw/" + term["name"]] = jp.array(0.)
             result["reward_weighted/" + term["name"]] = jp.array(0.)
@@ -96,13 +105,24 @@ class BrachiationMJX(MJXMetaMachine):
         else:
             bars, quats = self._course(course_key), self._template.mocap_quat
         qpos = self._hanging_offset.at[self.root_q:self.root_q + 3].add(bars[0])
-        data = self._template.replace(qpos=qpos, mocap_pos=bars, mocap_quat=quats)
+        qvel = self._template.qvel
+        last_action = jp.zeros(self.action_size)
+        if self._reset_bank is not None:
+            rng, choose_key, index_key = jax.random.split(rng, 3)
+            use_bank = jax.random.uniform(choose_key) >= float(self.cfg.task.reset_bank.nominal_probability)
+            index = jax.random.randint(index_key, (), 0, self._reset_bank["qpos"].shape[0])
+            qpos = jp.where(use_bank, self._reset_bank["qpos"][index], qpos)
+            qvel = jp.where(use_bank, self._reset_bank["qvel"][index], qvel)
+            last_action = jp.where(use_bank, self._reset_bank["last_action"][index], last_action)
+        data = self._template.replace(qpos=qpos, qvel=qvel, mocap_pos=bars, mocap_quat=quats)
         data = mjx.forward(self._mjx_model, data)
         info = {"rng": rng, "target": jp.array(1, dtype=jp.int32),
                 "contact_steps": jp.array(0, dtype=jp.int32), "course_complete": jp.array(False),
-                "last_action": jp.zeros(self.action_size)}
+                "last_action": last_action}
         if self.spec.cart_task:
             info.update(cart_task.initial_info(self, data))
+        if self.controller.stateful:
+            info.update(filtered_action=jp.zeros(self.action_size), pd_target=jp.clip(qpos[self.qids], jp.asarray(self.controller.target_lower), jp.asarray(self.controller.target_upper)))
         obs, info = self._observation(data, info, reset=True)
         return State(data, obs, jp.array(0.), jp.array(0.), self._metrics(), info)
 
@@ -178,9 +198,12 @@ class BrachiationMJX(MJXMetaMachine):
 
     def step(self, state, action):
         action = jp.clip(action, -1., 1.)
+        filtered, target_angles = (None, None)
+        if self.controller.stateful:
+            filtered, target_angles = self.controller.prepare_step(state.pipeline_state.qpos, action, state.info["filtered_action"], xp=jp)
         def physics_step(_, carry):
-            data, torque_sum, power_sum, forbidden = carry
-            ctrl = self.controller.controls(data.qpos, data.qvel, action, xp=jp)
+            data, torque_sum, power_sum, forbidden, detail = carry
+            ctrl = self.controller.controls(data.qpos, data.qvel, action, xp=jp, targets=target_angles)
             updated = mjx.step(self._mjx_model, data.replace(ctrl=ctrl))
             if self.spec.effort_metrics:
                 torque = updated.qfrc_actuator[self.vids]
@@ -190,11 +213,13 @@ class BrachiationMJX(MJXMetaMachine):
                 contact = updated._impl.contact
                 flags = cart_task.contact_flags(self, contact.geom, contact.dist)
                 forbidden |= jp.concatenate([flags[:3], cart_task.outside_cart(self, updated)[None]])
-            return updated, torque_sum, power_sum, forbidden
+                if self.contact_diagnostics:
+                    detail = jp.maximum(detail, cart_task.contact_details(self, contact.geom, contact.dist))
+            return updated, torque_sum, power_sum, forbidden, detail
 
-        data, torque_sum, power_sum, forbidden = jax.lax.fori_loop(
+        data, torque_sum, power_sum, forbidden, detail = jax.lax.fori_loop(
             0, self._n_substeps, physics_step,
-            (state.pipeline_state, jp.array(0.), jp.array(0.), jp.zeros(4, dtype=bool)))
+            (state.pipeline_state, jp.array(0.), jp.array(0.), jp.zeros(4, dtype=bool), jp.zeros(len(cart_task.CONTACT_LABELS) if self.contact_diagnostics else 0)))
         target = state.info["target"]
         pos = data.xpos[self.torso]
         fall = (pos[2] < float(self.cfg.task.fall_height)) | (jp.abs(pos[1]) > float(self.cfg.task.lateral_limit))
@@ -242,10 +267,14 @@ class BrachiationMJX(MJXMetaMachine):
         info = dict(state.info, target=next_target, last_action=action,
                     contact_steps=jp.where(reached, 0, count), course_complete=state.info["course_complete"] | success)
         info.update(guard_info)
+        if self.controller.stateful:
+            info.update(filtered_action=filtered, pd_target=target_angles)
         obs, info = self._observation(data, info)
         metrics = dict(state.metrics)  # preserve metrics added by Brax evaluation wrappers
         metrics.update(reward_metrics)
         metrics.update(guard_metrics)
+        if self.contact_diagnostics:
+            metrics.update({"contact/" + name: detail[i] for i, name in enumerate(cart_task.CONTACT_LABELS)})
         metrics.update(progress=jp.where(finite, pos[0] - state.pipeline_state.xpos[self.torso, 0], 0.),
                        bars_reached=reached.astype(jp.float32), fall=fall.astype(jp.float32),
                        success=success.astype(jp.float32))

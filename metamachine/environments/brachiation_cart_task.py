@@ -82,7 +82,8 @@ def hand_distances(env, data, target):
 
 def reach_potential(env, data, target, last_hand):
     distances = hand_distances(env, data, target)
-    eligible = (last_hand < 0) | (jp.arange(2) != last_hand)
+    eligible = ((last_hand < 0) | (jp.arange(2) != last_hand)
+                | (env.cfg.task.cart_task.get("transfer_style", "alternating") == "any_hand"))
     distance = jp.min(jp.where(eligible, distances, jp.inf))
     return jp.clip(1. - distance / float(env.cfg.task.cart_task.reach_radius), 0., 1.)
 
@@ -113,6 +114,12 @@ def advance(env, info, distances, loads, touching, seated, unsafe):
     valid = ((loads[:, info["target"]] >= float(c.min_hook_force)) &
              (distances < float(env.cfg.task.target_tolerance)) & ~touching[::-1] & eligible & seated &
              ~failure & ~info["course_complete"])
+    if c.get("transfer_style", "alternating") == "any_hand":
+        # Task outcome only: either/both hands may catch, with no loaded support on other bars.
+        other_support = jp.any((loads > 0) & (jp.arange(loads.shape[1]) != info["target"])[None, :])
+        valid = ((loads[:, info["target"]] >= float(c.min_hook_force)) &
+                 (distances < float(env.cfg.task.target_tolerance)) & seated &
+                 ~other_support & ~failure & ~info["course_complete"])
     if courses.is_spatial(env.cfg):
         # An intersecting junction touching two loaded bars is not a new grasp.
         other_bar_loaded = jp.any((loads > 0) & (jp.arange(loads.shape[1]) != info["target"]), axis=1)
@@ -126,3 +133,20 @@ def advance(env, info, distances, loads, touching, seated, unsafe):
     return reached, failure, dict(transfer_counts=jp.where(reached | failure, 0, counts),
                                  last_transfer_hand=hand, no_hook_steps=no_hook,
                                  no_transfer_steps=jp.where(reached, 0, elapsed)), stalled
+
+
+CONTACT_PARTS = ("torso_geom", "left_upper_arm_geom", "left_forearm_geom", "left_hand_palm",
+                 "right_upper_arm_geom", "right_forearm_geom", "right_hand_palm")
+CONTACT_LABELS = CONTACT_PARTS + ("start_bar", "target_bar", "max_penetration_m")
+
+
+def contact_details(env, geom, dist):
+    """Non-hook/bar contact identities and penetration, including transient substep contacts."""
+    a, b = geom[:, 0], geom[:, 1]
+    nonhook = env.robot_geom_mask & ~env.hook_geom_mask
+    active = (dist < 0) & (a >= 0) & (b >= 0)
+    hit = active & ((nonhook[a] & env.bar_geom_mask[b]) | (nonhook[b] & env.bar_geom_mask[a]))
+    ids = [env.mj_model.geom(name).id for name in CONTACT_PARTS]
+    parts = [jp.any(hit & ((a == g) | (b == g))).astype(jp.float32) for g in ids]
+    bars = [jp.any(hit & ((a == g) | (b == g))).astype(jp.float32) for g in env.bar_geoms[:2]]
+    return jp.stack(parts + bars + [jp.max(jp.where(hit, -dist, 0.), initial=0.)])

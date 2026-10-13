@@ -10,6 +10,17 @@ class BrachiationController:
         self.mode = str(cfg.control.mode)
         if self.mode not in ("torque", "pd"):
             raise ValueError("control.mode must be torque or pd")
+        self.target_reference = str(cfg.control.get("target_reference", "default"))
+        self.filter_alpha = float(cfg.control.get("filter_alpha", 1.0))
+        self.relative = self.target_reference == "current"
+        self.stateful = self.relative or self.filter_alpha != 1.0
+        if self.target_reference not in ("default", "current") or not np.isfinite(self.filter_alpha) or not 0 < self.filter_alpha <= 1:
+            raise ValueError("Invalid target_reference or filter_alpha")
+        if self.stateful and self.mode != "pd":
+            raise ValueError("Relative/filtered control requires PD mode")
+        self.delta_scale = np.asarray(cfg.control.get("delta_scale", [0.25] * model.nu), dtype=float)
+        if self.relative and (self.delta_scale.shape != (model.nu,) or not np.isfinite(self.delta_scale).all() or np.any(self.delta_scale <= 0)):
+            raise ValueError("delta_scale must have one positive finite radian value per actuator")
         self.qids, self.vids = joint_indices(model)
         self.action_scale = float(cfg.control.get("action_scale", 1.0))
         if self.mode == "torque":
@@ -40,18 +51,29 @@ class BrachiationController:
         if np.any(self.torque_limits > available):
             raise ValueError("PD torque_limits exceed the XML motor control limits")
 
-    def targets(self, action, xp=np):
+    def prepare_step(self, qpos, action, previous_filtered, xp=np):
+        filtered = (1 - self.filter_alpha) * previous_filtered + self.filter_alpha * xp.clip(action, -1., 1.)
+        return filtered, self.targets(filtered, xp=xp, qpos=qpos)
+
+    def targets(self, action, xp=np, qpos=None):
         action = xp.clip(action, -1., 1.)
+        if self.relative:
+            if qpos is None:
+                raise ValueError("Current-relative targets require the policy-step starting qpos")
+            return xp.clip(qpos[self.qids] + action * xp.asarray(self.delta_scale), xp.asarray(self.target_lower), xp.asarray(self.target_upper))
         center = xp.asarray(self.default_joint_pos)
         span = xp.where(action >= 0, xp.asarray(self.target_upper) - center,
                         center - xp.asarray(self.target_lower))
         return center + action * span
 
-    def controls(self, qpos, qvel, action, xp=np):
+    def controls(self, qpos, qvel, action, xp=np, targets=None):
         if self.mode == "torque":
             return xp.clip(action, -1., 1.) * self.action_scale
+        if self.stateful and targets is None:
+            raise ValueError("Filtered/relative control requires targets frozen at the policy-step boundary")
+        target = self.targets(action, xp) if targets is None else targets
         # Targets are held during a policy step; feedback is recomputed every substep.
-        torque = (xp.asarray(self.kp) * (self.targets(action, xp) - qpos[self.qids])
+        torque = (xp.asarray(self.kp) * (target - qpos[self.qids])
                   - xp.asarray(self.kd) * qvel[self.vids])
         limits = xp.asarray(self.torque_limits)
         return xp.clip(torque, -limits, limits) / xp.asarray(self.gear)

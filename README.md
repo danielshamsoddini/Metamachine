@@ -204,5 +204,7 @@ This project is licensed under the Apache-2.0 License - see the LICENSE file for
 
 ### Experimental Newton backend
 
-An optional Featherstone backend is available for simple rigid-body tasks. See
-[setup, supported scope, and validation](NEWTON_BACKEND.md). MuJoCo and MJX remain available.
+An optional Featherstone backend provides a legacy compatibility mode and a
+native Warp path for batched GPU simulation, device task outputs, and CUDA graph
+replay. See [setup, supported scope, benchmarks, and validation](NEWTON_BACKEND.md).
+MuJoCo and MJX remain available.

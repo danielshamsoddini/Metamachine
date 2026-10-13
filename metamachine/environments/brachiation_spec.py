@@ -19,6 +19,7 @@ OBSERVATIONS = {
     "hand_positions": ("6", "left/right grip-site offsets from torso, m", {"frame": ("body", "world")}),
     "target_bar_positions": ("3*count", "target and following bar centers minus torso position, m; final bar repeated at course end", {"count": "positive_int", "frame": ("body", "world")}),
     "target_bar_axes": ("3*count", "unit directions of target and following finite bars; canonical body +Y axis", {"count": "positive_int", "frame": ("body", "world")}),
+    "filtered_action": ("nu", "previous filtered normalized action; relative/filtered PD mode", {}),
     "last_action": ("nu", "previous clipped normalized action", {}),
     "hook_contacts": ("2", "left/right hook contact with any bar, 0 or 1", {}),
     "cart_relative_position": ("3", "cart origin minus torso position, torso frame, m", {}),
@@ -159,6 +160,14 @@ class TaskSpec:
         if cfg.bars.get("layout", "parallel") in ("spatial", "grid"):
             if not any(c["name"] == "target_bar_axes" for c in self.observations):
                 raise ValueError("Spatial courses require target_bar_axes observations")
+        stateful_control = cfg.control.get("target_reference", "default") != "default" or cfg.control.get("filter_alpha", 1.) != 1.
+        if stateful_control:
+            if cfg.environment.mode != "mjx":
+                raise ValueError("Relative/filtered control is MJX only")
+            if not any(c["name"] == "filtered_action" for c in self.observations):
+                raise ValueError("Relative/filtered control requires filtered_action observation")
+        elif any(c["name"] == "filtered_action" for c in self.observations):
+            raise ValueError("filtered_action requires relative/filtered control")
         self.frame_size, self.observation_size = offset, offset * self.history_steps
         self.noisy = any(np.any(np.asarray(c["noise_std"]) != 0) for c in self.observations)
         t = raw["task"]
@@ -166,13 +175,18 @@ class TaskSpec:
                     "target_tolerance", "contact_steps", "initial_bar_to_hand_z", "distance_metric",
                     "require_hook_contact", "contact_distance", "terminate_on_fall", "terminate_on_success",
                     "nonfinite_reward", "reward_clip", "reward_components")
-        _keys(t, required, ("cart_task",), "task")
+        _keys(t, required, ("cart_task", "reset_bank", "contact_diagnostics"), "task")
+        _bool(t.get("contact_diagnostics", False), "task.contact_diagnostics")
         self.cart_task = "cart_task" in t
+        if t.get("contact_diagnostics", False) and (not self.cart_task or cfg.environment.mode != "mjx"):
+            raise ValueError("contact_diagnostics requires the MJX cart task")
         if self.cart_task:
             c = t["cart_task"]
             positive_ints = ("transfer_steps", "max_no_hook_steps", "max_no_transfer_steps")
             positive_floats = ("min_hook_force", "containment_margin", "max_torso_lift", "cart_tilt_limit", "reach_radius")
-            _keys(c, positive_ints + positive_floats, (), "task.cart_task")
+            _keys(c, positive_ints + positive_floats, ("transfer_style",), "task.cart_task")
+            if c.get("transfer_style", "alternating") not in ("alternating", "any_hand"):
+                raise ValueError("transfer_style must be alternating or any_hand")
             for key in positive_ints:
                 _positive_int(c[key], "task.cart_task." + key)
             for key in positive_floats:
@@ -187,6 +201,22 @@ class TaskSpec:
                 raise ValueError("cart_task requires cart start, retained cart, hook contact, and fall termination")
             if "cradle" not in raw.get("cart", {}):
                 raise ValueError("cart_task requires a passive cart.cradle")
+        if "reset_bank" in t:
+            b = t["reset_bank"]
+            _keys(b, ("path", "nominal_probability"), (), "task.reset_bank")
+            if not self.cart_task or int(cfg.bars.count) != 2 or cfg.bars.get("layout", "parallel") != "parallel":
+                raise ValueError("reset_bank requires a two-bar parallel cart task")
+            if not isinstance(b["path"], str) or not b["path"]:
+                raise ValueError("reset_bank.path must be a nonempty path")
+            _finite(b["nominal_probability"], "reset_bank.nominal_probability")
+            if not 0 <= b["nominal_probability"] <= 1:
+                raise ValueError("reset_bank.nominal_probability must be in [0,1]")
+            for key in ("spacing", "height", "height_offset", "lateral_offset"):
+                if cfg.bars[key][0] != cfg.bars[key][1]:
+                    raise ValueError("reset_bank requires fixed bar geometry matching its scene")
+        # Native backend reset/transfer support must be implemented explicitly, never silently ignored.
+        if cfg.environment.mode == "newton" and ("reset_bank" in t or t.get("cart_task", {}).get("transfer_style", "alternating") != "alternating"):
+            raise ValueError("Discovery reset_bank/any_hand task currently supports MJX only")
         for component in self.observations:
             if component["name"].startswith("cart_") and not self.cart_task:
                 raise ValueError("Cart observations require task.cart_task")
@@ -247,6 +277,7 @@ class TaskSpec:
             frames.append({"age_in_policy_steps": age, "start": i * self.frame_size,
                            "stop": (i + 1) * self.frame_size})
         return {
+            "reset_bank_metadata": getattr(self, "reset_bank_metadata", None),
             "observation_size": self.observation_size, "frame_size": self.frame_size,
             "components": deepcopy(self.layout), "history_frames": frames,
             "history_reset": self.history_reset, "clip_observations": self.clip,
